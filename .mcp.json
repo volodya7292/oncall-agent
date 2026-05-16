@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "oncall": {
+      "command": "uv",
+      "args": ["run", "oncall", "mcp"],
+      "env": {
+        "ONCALL_PORT": "8765",
+        "ONCALL_TOKEN": "dev",
+        "ONCALL_SESSION_ID": "dev"
+      }
+    }
+  }
+}

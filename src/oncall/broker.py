@@ -1,0 +1,247 @@
+"""The permission broker.
+
+This is the orchestrator-side half of the permission chokepoint. The MCP server
+process's `approve` tool is a thin loopback proxy; the actual decision-making
+lives here.
+
+Inputs come from a `claude` CLI subprocess via the MCP `approve` tool: a tool
+name, an input dict, and the CLI's per-call `tool_use_id`. The broker:
+
+  1. Deduplicates on `(session_id, tool_use_id)` so `--resume` after an
+     orchestrator crash doesn't re-prompt the user.
+  2. Runs the deterministic classifier.
+  3. Auto-allows read-only; auto-denies catastrophic (defense in depth).
+  4. For mutating: persists a pending approval row, publishes an event, and
+     awaits the `ApprovalClient` (which is either a test stub or the
+     HTTP long-poll Future resolved by the FastAPI handler).
+  5. Enforces a consecutive-denial backstop so a misbehaving model can't
+     burn through repeated approvals.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Awaitable, Callable
+from uuid import UUID
+
+from .approval_client import (
+    ApprovalClient,
+    generate_challenge_phrase,
+    phrases_match,
+)
+from .audit import broker_log, fmt
+from .classifier import classify
+from .db import Database
+from .models import (
+    ApprovalRequest,
+    ApprovalResult,
+    ClassifierVerdict,
+    PermissionResult,
+    new_uuid,
+    utcnow,
+)
+
+
+log = logging.getLogger(__name__)
+
+MAX_CONSECUTIVE_DENIALS = 3
+
+
+EventPublisher = Callable[[UUID, str, dict[str, Any]], Awaitable[None]]
+
+
+class Broker:
+    def __init__(
+        self,
+        db: Database,
+        approval_client: ApprovalClient,
+        publish_event: EventPublisher,
+        *,
+        max_consecutive_denials: int = MAX_CONSECUTIVE_DENIALS,
+    ) -> None:
+        self._db = db
+        self._client = approval_client
+        self._publish = publish_event
+        self._max_denials = max_consecutive_denials
+
+    async def decide(
+        self,
+        session_id: str,
+        tool_use_id: str,
+        tool_name: str,
+        tool_input: dict[str, Any],
+    ) -> PermissionResult:
+        """Single entrypoint called by the MCP `approve` tool (via loopback HTTP)."""
+        # 1. Dedup: if --resume re-issues the same call, reuse the stored result.
+        cached = await self._db.get_resolved_approval(session_id, tool_use_id)
+        if cached is not None:
+            req, result = cached
+            broker_log.info("decide " + fmt(
+                event="dedup_hit", session=session_id, tool_use=tool_use_id,
+                tool=tool_name, decision=result.behavior,
+            ))
+            return self._to_permission_result(result, tool_input)
+
+        # 2. Classify (deterministic, model-free).
+        verdict = classify(tool_name, tool_input)
+        task = await self._db.get_task_by_session(session_id)
+        if task is None:
+            broker_log.warning("decide " + fmt(
+                event="unknown_session", session=session_id, tool=tool_name,
+            ))
+            return PermissionResult(behavior="deny", message="unknown session")
+
+        # 3. Auto paths.
+        req_id = new_uuid()
+        challenge = (
+            None
+            if verdict.kind != ClassifierVerdict.MUTATING
+            else generate_challenge_phrase()
+        )
+        req = ApprovalRequest(
+            id=req_id,
+            task_id=task.id,
+            session_id=session_id,
+            tool_use_id=tool_use_id,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            classifier_verdict=verdict.kind,
+            canonical_command=verdict.canonical,
+            blast_radius=verdict.blast_radius,
+            challenge_phrase=challenge,
+        )
+
+        if verdict.kind == ClassifierVerdict.READONLY:
+            await self._db.record_auto_approval(req, "allow", "auto:readonly")
+            await self._publish(task.id, "approval.resolved", {
+                "approval_id": str(req_id),
+                "auto": True,
+                "decision": "allow",
+                "tool_name": tool_name,
+                "canonical": verdict.canonical,
+            })
+            broker_log.info("decide " + fmt(
+                event="auto_allow", task=str(task.id), tool=tool_name,
+                verdict="readonly", canonical=verdict.canonical,
+            ))
+            return PermissionResult(behavior="allow", updatedInput=tool_input)
+
+        if verdict.kind == ClassifierVerdict.CATASTROPHIC:
+            await self._db.record_auto_approval(req, "deny", verdict.reason or "catastrophic")
+            await self._publish(task.id, "approval.resolved", {
+                "approval_id": str(req_id),
+                "auto": True,
+                "decision": "deny",
+                "reason": verdict.reason,
+                "canonical": verdict.canonical,
+            })
+            broker_log.warning("decide " + fmt(
+                event="auto_deny_catastrophic", task=str(task.id), tool=tool_name,
+                reason=verdict.reason, canonical=verdict.canonical,
+            ))
+            return PermissionResult(
+                behavior="deny",
+                message=f"BLOCKED (catastrophic): {verdict.reason or 'irreversible'}",
+            )
+
+        # 4. Mutating — check the denial backstop, then escalate.
+        if task.consecutive_denials >= self._max_denials:
+            broker_log.warning("decide " + fmt(
+                event="halt_denial_loop", task=str(task.id),
+                denials=task.consecutive_denials,
+            ))
+            return PermissionResult(
+                behavior="deny",
+                message=f"Agent halted — {task.consecutive_denials} consecutive denials.",
+            )
+
+        await self._db.create_pending_approval(req)
+        await self._publish(task.id, "approval.requested", {
+            "approval_id": str(req_id),
+            "tool_name": tool_name,
+            "canonical_command": verdict.canonical,
+            "blast_radius": verdict.blast_radius,
+            "challenge_phrase": challenge,
+        })
+        broker_log.info("decide " + fmt(
+            event="escalate", task=str(task.id), tool=tool_name,
+            verdict="mutating", approval=str(req_id),
+            canonical=verdict.canonical, phrase=challenge,
+        ))
+
+        result = await self._client.request_approval(req)
+        await self._db.append_approval_response(req_id, result)
+        await self._publish(task.id, "approval.resolved", {
+            "approval_id": str(req_id),
+            "auto": False,
+            "decision": result.behavior,
+            "challenge_matched": result.challenge_matched,
+            "canonical": verdict.canonical,
+        })
+        broker_log.info("decide " + fmt(
+            event="resolved", task=str(task.id), approval=str(req_id),
+            decision=result.behavior, matched=result.challenge_matched,
+        ))
+
+        if result.behavior == "deny":
+            await self._db.increment_consecutive_denials(task.id)
+            return PermissionResult(
+                behavior="deny",
+                message=result.message or "User denied.",
+            )
+
+        await self._db.reset_consecutive_denials(task.id)
+        return PermissionResult(behavior="allow", updatedInput=tool_input)
+
+    # ---- helpers for the HTTP `/approvals/{id}/respond` endpoint ----
+
+    async def submit_response(
+        self,
+        approval_id: UUID,
+        decision: str,
+        challenge_phrase_supplied: str,
+        message: str | None = None,
+    ) -> tuple[bool, bool]:
+        """Validate the challenge phrase and resolve the awaiting Future.
+
+        Returns (approved, challenge_matched). If the supplied phrase doesn't match,
+        the decision is coerced to 'deny' regardless of what the caller said.
+        """
+        req = await self._db.get_pending_approval(approval_id)
+        if req is None or req.challenge_phrase is None:
+            return False, False
+        matched = phrases_match(req.challenge_phrase, challenge_phrase_supplied)
+        behavior = "allow" if (matched and decision == "allow") else "deny"
+        result_message = (
+            message
+            if matched
+            else "Challenge phrase mismatch — coerced to deny."
+        )
+        result = ApprovalResult(
+            request_id=approval_id,
+            behavior=behavior,  # type: ignore[arg-type]
+            challenge_phrase_supplied=challenge_phrase_supplied,
+            challenge_matched=matched,
+            message=result_message,
+            responded_at=utcnow(),
+        )
+        # Resolve the in-memory future; the broker's own decide() will handle
+        # the DB write + denial counters when the await returns.
+        # We need the HttpLongPollApprovalClient instance to call .resolve().
+        # That's wired in via the public attribute exposed by the orchestrator.
+        from .approval_client import HttpLongPollApprovalClient
+
+        if isinstance(self._client, HttpLongPollApprovalClient):
+            self._client.resolve(approval_id, result)
+        return behavior == "allow", matched
+
+    # ---- internals ----
+
+    @staticmethod
+    def _to_permission_result(
+        result: ApprovalResult,
+        tool_input: dict[str, Any],
+    ) -> PermissionResult:
+        if result.behavior == "allow":
+            return PermissionResult(behavior="allow", updatedInput=tool_input)
+        return PermissionResult(behavior="deny", message=result.message or "denied")
