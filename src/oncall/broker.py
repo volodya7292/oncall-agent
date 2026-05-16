@@ -58,11 +58,15 @@ class Broker:
         publish_event: EventPublisher,
         *,
         max_consecutive_denials: int = MAX_CONSECUTIVE_DENIALS,
+        approval_timeout_seconds: int | None = None,
     ) -> None:
         self._db = db
         self._client = approval_client
         self._publish = publish_event
         self._max_denials = max_consecutive_denials
+        # None → use the ApprovalRequest model's own default. In production
+        # api.py passes settings.oncall_approval_timeout_seconds.
+        self._approval_timeout_seconds = approval_timeout_seconds
 
     async def decide(
         self,
@@ -72,7 +76,8 @@ class Broker:
         tool_input: dict[str, Any],
     ) -> PermissionResult:
         """Single entrypoint called by the MCP `approve` tool (via loopback HTTP)."""
-        # 1. Dedup: if --resume re-issues the same call, reuse the stored result.
+        # 1a. Dedup (resolved): if --resume re-issues the same call after the
+        # user already responded (or the timeout deny fired) — return cached.
         cached = await self._db.get_resolved_approval(session_id, tool_use_id)
         if cached is not None:
             req, result = cached
@@ -81,6 +86,29 @@ class Broker:
                 tool=tool_name, decision=result.behavior,
             ))
             return self._to_permission_result(result, tool_input)
+
+        # 1b. Dedup (pending): if --resume re-issues the same call but the
+        # user never responded before the crash, RE-ATTACH to the existing
+        # pending row. A fresh INSERT would violate UNIQUE(session, tool_use_id)
+        # and crash the broker. Re-publishing approval.requested makes the
+        # bot's button UI resurface so the user can finish responding.
+        pending = await self._db.get_pending_by_session_and_tool(session_id, tool_use_id)
+        if pending is not None:
+            task_for_pending = await self._db.get_task_by_session(session_id)
+            if task_for_pending is not None:
+                await self._publish(task_for_pending.id, "approval.requested", {
+                    "approval_id": str(pending.id),
+                    "tool_name": pending.tool_name,
+                    "canonical_command": pending.canonical_command,
+                    "blast_radius": pending.blast_radius,
+                    "challenge_phrase": pending.challenge_phrase,
+                    "reattach": True,
+                })
+            broker_log.info("decide " + fmt(
+                event="reattach_pending", session=session_id, tool_use=tool_use_id,
+                approval=str(pending.id),
+            ))
+            return await self._await_pending_resolution(pending, tool_input)
 
         # 2. Classify (deterministic, model-free).
         verdict = classify(tool_name, tool_input)
@@ -98,7 +126,7 @@ class Broker:
             if verdict.kind != ClassifierVerdict.MUTATING
             else generate_challenge_phrase()
         )
-        req = ApprovalRequest(
+        req_kwargs: dict[str, Any] = dict(
             id=req_id,
             task_id=task.id,
             session_id=session_id,
@@ -110,6 +138,9 @@ class Broker:
             blast_radius=verdict.blast_radius,
             challenge_phrase=challenge,
         )
+        if self._approval_timeout_seconds is not None:
+            req_kwargs["timeout_seconds"] = self._approval_timeout_seconds
+        req = ApprovalRequest(**req_kwargs)
 
         if verdict.kind == ClassifierVerdict.READONLY:
             await self._db.record_auto_approval(req, "allow", "auto:readonly")
@@ -168,29 +199,35 @@ class Broker:
             verdict="mutating", approval=str(req_id),
             canonical=verdict.canonical, phrase=challenge,
         ))
+        return await self._await_pending_resolution(req, tool_input)
 
+    async def _await_pending_resolution(
+        self, req: ApprovalRequest, tool_input: dict[str, Any],
+    ) -> PermissionResult:
+        """Block on the approval_client's Future until the user (or timeout)
+        resolves the pending row, persist the response, fire the resolved
+        event, update the denial counter. Shared between the first-time path
+        and the resume re-attach path."""
         result = await self._client.request_approval(req)
-        await self._db.append_approval_response(req_id, result)
-        await self._publish(task.id, "approval.resolved", {
-            "approval_id": str(req_id),
+        await self._db.append_approval_response(req.id, result)
+        await self._publish(req.task_id, "approval.resolved", {
+            "approval_id": str(req.id),
             "auto": False,
             "decision": result.behavior,
             "challenge_matched": result.challenge_matched,
-            "canonical": verdict.canonical,
+            "canonical": req.canonical_command,
         })
         broker_log.info("decide " + fmt(
-            event="resolved", task=str(task.id), approval=str(req_id),
+            event="resolved", task=str(req.task_id), approval=str(req.id),
             decision=result.behavior, matched=result.challenge_matched,
         ))
-
         if result.behavior == "deny":
-            await self._db.increment_consecutive_denials(task.id)
+            await self._db.increment_consecutive_denials(req.task_id)
             return PermissionResult(
                 behavior="deny",
                 message=result.message or "User denied.",
             )
-
-        await self._db.reset_consecutive_denials(task.id)
+        await self._db.reset_consecutive_denials(req.task_id)
         return PermissionResult(behavior="allow", updatedInput=tool_input)
 
     # ---- helpers for the HTTP `/approvals/{id}/respond` endpoint ----

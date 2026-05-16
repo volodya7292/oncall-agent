@@ -12,6 +12,7 @@ still can't bypass the gate.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from .broker import Broker
 from .config import Paths, Settings
 from .db import Database
 from .lifecycle import Lifecycle
+from .local_claude import ClaudeCliRunner, OneShotRunner
 from .models import TaskState
 from .operator_memory import OperatorMemory
 from .telegram_service import TelegramService
@@ -266,6 +268,71 @@ OPERATOR_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "read_chat",
+            "description": (
+                "Fetch the last N messages of a specific Telegram chat — BOTH "
+                "sides of the conversation. Use when the user asks 'what did "
+                "X say?' or 'show me the last messages from Y'. Distinct from "
+                "read_chat_style which only returns the user's own outgoing "
+                "messages (for voice mimicking)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chat_id": {"type": "string"},
+                    "limit": {"type": "integer", "default": 10},
+                },
+                "required": ["chat_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_messages",
+            "description": (
+                "Full-text search messages WITHIN one chat (server-side). Use "
+                "for 'did we talk about X with Y' — first resolve Y's chat_id "
+                "via search_chats, then search_messages(chat_id, query). "
+                "Returns matching messages in the same shape as read_chat. "
+                "Distinct from search_chats which finds the chat itself."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chat_id": {"type": "string"},
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "default": 20},
+                },
+                "required": ["chat_id", "query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_chats",
+            "description": (
+                "Search the user's recent Telegram dialogs by case-insensitive "
+                "substring against display name or @username. Use when the user "
+                "names someone WITHOUT a chat_id ('check messages from alex'). "
+                "Returns rows with chat_id you can pass to read_chat / "
+                "read_chat_style / send. If multiple match, present them to the "
+                "user to disambiguate — do not pick silently."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "default": 20},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "mark_inbox_read",
             "description": (
                 "Mark ONE inbox row read in the local DB. LOCAL-ONLY: this does "
@@ -338,6 +405,27 @@ class OperatorTurnResult:
     tool_calls_made: list[dict[str, Any]]
 
 
+AUTO_PING_PREFIX = "[system note: "
+
+
+COMPRESSION_SYSTEM_PROMPT = """\
+You are summarizing the history of an on-call agent's chat with its user, so
+the conversation fits in a smaller context window.
+
+Preserve:
+- Every task ID (UUID or short form) the operator dispatched, and what the user wanted from each.
+- User preferences, durable decisions, and constraints they stated.
+- Open threads: things the operator owes the user, questions awaiting an answer.
+
+Drop:
+- Verbose tool outputs — the operator can re-query the database by task ID for current state.
+- Resolved small talk.
+- Redundant information.
+
+Output: a single block of plain prose, third-person ("the user asked...", "the operator dispatched..."), under 400 words. No headers, no bullets, no markdown. End with a blank line.
+"""
+
+
 class Operator:
     def __init__(
         self,
@@ -352,6 +440,7 @@ class Operator:
         memory: OperatorMemory | None = None,
         max_history: int = 60,
         max_tool_rounds: int = 6,
+        runner: OneShotRunner | None = None,
     ) -> None:
         self._db = db
         self._lifecycle = lifecycle
@@ -363,7 +452,21 @@ class Operator:
         self._memory = memory or OperatorMemory(settings.oncall_memory_path)
         self._max_history = max_history
         self._max_tool_rounds = max_tool_rounds
+        # One-shot Claude CLI runner for summarization (both chat compression
+        # and task result summaries). Injectable for tests.
+        self._runner: OneShotRunner = runner or ClaudeCliRunner()
         self._system_prompt_base = paths.operator_prompt.read_text(encoding="utf-8")
+        # One lock per chat session. Serializes user-initiated chat_turn calls
+        # against auto-ping calls so chat_messages append in a consistent order
+        # and the LLM never sees an interleaved state.
+        self._session_locks: dict[str, asyncio.Lock] = {}
+
+    def _lock_for(self, session_id: str) -> asyncio.Lock:
+        lock = self._session_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[session_id] = lock
+        return lock
 
     def _build_system_prompt(self) -> str:
         """Static prompt + live memory snapshot. Rebuilt every turn so newly
@@ -379,14 +482,55 @@ class Operator:
             f"{self._memory.for_prompt()}"
         )
 
-    async def chat_turn(self, session_id: str, user_text: str) -> OperatorTurnResult:
+    async def chat_turn(
+        self, session_id: str, user_text: str, *, language: str | None = None,
+    ) -> OperatorTurnResult:
+        async with self._lock_for(session_id):
+            return await self._run_turn(session_id, user_text, language=language)
+
+    async def auto_ping(self, session_id: str, note: str) -> OperatorTurnResult:
+        """Inject a synthetic '[system note: ...]' turn into a chat session.
+        Used by the background task that re-engages the operator when a task
+        the user dispatched reaches a terminal state. No-op if the session
+        has no history (we don't manufacture context for nobody)."""
+        history = await self._db.load_chat_history(session_id, limit=1)
+        if not history:
+            return OperatorTurnResult(text="", tool_calls_made=[])
+        async with self._lock_for(session_id):
+            return await self._run_turn(session_id, f"{AUTO_PING_PREFIX}{note}]")
+
+    async def _run_turn(
+        self, session_id: str, user_text: str, *, language: str | None = None,
+    ) -> OperatorTurnResult:
         await self._db.ensure_chat_session(session_id)
         await self._db.append_chat_message(session_id, "user", user_text)
 
-        # Build the message history fed to the model. System prompt is rebuilt
-        # each turn so remember/forget calls are reflected in the next round.
-        history = await self._db.load_chat_history(session_id, limit=self._max_history)
-        messages: list[dict[str, Any]] = [{"role": "system", "content": self._build_system_prompt()}]
+        # Load + possibly compress the rolling history. Compression is
+        # idempotent: if no compression is needed, the summary returned is
+        # whatever the previous summary was (possibly None).
+        summary, history = await self._load_and_maybe_compress(session_id)
+        system_prompt = self._build_system_prompt()
+        if language:
+            # Language hint goes at the END of the system prompt so it overrides
+            # any natural-language drift from the prior history window.
+            system_prompt = (
+                f"{system_prompt}\n\n# Output language\n\n"
+                f"Respond in: {language}. Match the user's dialect/register if "
+                f"the conversation history already establishes one."
+            )
+        messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+        if summary is not None:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "# Earlier conversation (compressed)\n\n"
+                    "The exchanges that preceded the messages below were summarized "
+                    "to keep this prompt small. Treat the summary as authoritative "
+                    "context. If you need current task state, query it (list_tasks / "
+                    "get_task_status) — don't speculate.\n\n"
+                    f"{summary['summary']}"
+                ),
+            })
         for row in history:
             messages.append(_row_to_openai_message(row))
 
@@ -459,6 +603,95 @@ class Operator:
         await self._db.append_chat_message(session_id, "assistant", msg)
         return OperatorTurnResult(text=msg, tool_calls_made=tool_calls_made)
 
+    # ---- context compression ----
+
+    async def _load_and_maybe_compress(
+        self, session_id: str,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        """Returns (summary, history). `history` is rows newer than the latest
+        summary's checkpoint. If the loaded window exceeds the configured token
+        budget, compress (older portion → new summary) and re-load."""
+        summary = await self._db.get_latest_chat_summary(session_id)
+        since_id = summary["through_message_id"] if summary else 0
+        # Big upper bound — compression is what keeps this small, not the limit.
+        history = await self._db.load_chat_history(session_id, since_id=since_id, limit=2000)
+
+        threshold = self._settings.oncall_compression_threshold_tokens
+        if _estimate_tokens(summary, history) <= threshold:
+            return summary, history
+
+        new_summary = await self._compress_history(session_id, summary, history)
+        if new_summary is None:
+            # Compression failed (claude not on PATH, timeout, etc). Proceed
+            # with the uncompressed history — the operator may produce a slow
+            # turn but it won't crash. Try again on the next user turn.
+            log.warning("compression failed for session %s; using uncompressed history", session_id)
+            return summary, history
+
+        since_id = new_summary["through_message_id"]
+        history = await self._db.load_chat_history(session_id, since_id=since_id, limit=2000)
+        return new_summary, history
+
+    async def _compress_history(
+        self,
+        session_id: str,
+        prior_summary: dict[str, Any] | None,
+        history: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Walk history backwards, choose a safe split point at a user-message
+        boundary near the halfway-token mark, call the runner to summarize the
+        older portion (+ any prior summary), and persist a new chat_summaries
+        row. Returns the new summary dict or None on failure."""
+        threshold = self._settings.oncall_compression_threshold_tokens
+        # Walk from newest to oldest; mark the split when we've covered ~half
+        # the token budget and we're sitting at a `user` row (safe boundary —
+        # tool_calls + tool rows always come AFTER a user message, never before).
+        acc = 0
+        split_idx: int | None = None
+        for i in range(len(history) - 1, -1, -1):
+            acc += len(history[i]["content"]) // 4
+            if acc >= threshold // 2 and history[i]["role"] == "user":
+                split_idx = i
+                break
+        if split_idx is None or split_idx == 0:
+            # Nothing safely splittable. Skip.
+            return None
+        older = history[:split_idx]
+        if not older:
+            return None
+
+        formatted_old = "\n".join(
+            f"[{row['role']}]: {row['content'][:2000]}" for row in older
+        )
+        prior_text = (prior_summary or {}).get("summary") or "(no prior summary)"
+        prompt = (
+            f"Prior summary of older history:\n{prior_text}\n\n"
+            f"Recent history to fold into the summary:\n{formatted_old}\n"
+        )
+        text = await self._runner.one_shot(
+            prompt,
+            system_prompt=COMPRESSION_SYSTEM_PROMPT,
+            model=self._settings.oncall_compression_model,
+            timeout_s=60.0,
+        )
+        if not text:
+            return None
+        through_id = older[-1]["id"]
+        est = len(text) // 4
+        await self._db.insert_chat_summary(
+            session_id=session_id, summary=text,
+            through_message_id=through_id, estimated_token_count=est,
+        )
+        operator_log.info("compress " + fmt(
+            chat=session_id, through_id=through_id, summary_tokens=est,
+            older_rows=len(older),
+        ))
+        return {
+            "summary": text,
+            "through_message_id": through_id,
+            "estimated_token_count": est,
+        }
+
     # ---- tool execution ----
 
     async def _execute_tool(
@@ -498,11 +731,16 @@ class Operator:
                  and not _was_resolved(events, e["payload"]["approval_id"])),
                 None,
             )
+            # result_summary is filled in by task_summary.summarize_task() once
+            # a task terminates. Authoritative digest of what the executor did;
+            # prefer it over latest_assistant_text when both are available.
+            result_summary = await self._db.get_task_result_summary(tid)
             return {
                 "task_id": str(task.id),
                 "state": task.state.value,
                 "terminal_reason": task.terminal_reason.value if task.terminal_reason else None,
                 "latest_assistant_text": latest_text[:600],
+                "result_summary": result_summary,
                 "pending_approval_id": pending_id,
             }
 
@@ -566,7 +804,10 @@ class Operator:
         if name == "forget":
             return self._memory.forget(str(args.get("substring") or ""))
 
-        if name in ("read_inbox", "read_chat_style", "mark_inbox_read"):
+        if name in (
+            "read_inbox", "read_chat_style", "mark_inbox_read",
+            "read_chat", "search_chats", "search_messages",
+        ):
             if self._telegram is None:
                 return {"error": "telegram not configured"}
             if name == "read_inbox":
@@ -586,6 +827,40 @@ class Operator:
                 except Exception as e:
                     return {"error": f"{type(e).__name__}: {e}"}
                 return {"chat_id": chat_id, "samples": samples}
+            if name == "read_chat":
+                chat_id = str(args.get("chat_id") or "")
+                if not chat_id:
+                    return {"error": "chat_id required"}
+                try:
+                    msgs = await self._telegram.get_chat_history(
+                        chat_id, limit=int(args.get("limit") or 10),
+                    )
+                except Exception as e:
+                    return {"error": f"{type(e).__name__}: {e}"}
+                return {"chat_id": chat_id, "messages": msgs}
+            if name == "search_chats":
+                q = str(args.get("query") or "").strip()
+                if not q:
+                    return {"error": "query required"}
+                try:
+                    chats = await self._telegram.search_chats(
+                        q, limit=int(args.get("limit") or 20),
+                    )
+                except Exception as e:
+                    return {"error": f"{type(e).__name__}: {e}"}
+                return {"query": q, "chats": chats}
+            if name == "search_messages":
+                chat_id = str(args.get("chat_id") or "")
+                q = str(args.get("query") or "").strip()
+                if not chat_id or not q:
+                    return {"error": "chat_id and query required"}
+                try:
+                    msgs = await self._telegram.search_messages(
+                        chat_id, q, limit=int(args.get("limit") or 20),
+                    )
+                except Exception as e:
+                    return {"error": f"{type(e).__name__}: {e}"}
+                return {"chat_id": chat_id, "query": q, "messages": msgs}
             if name == "mark_inbox_read":
                 inbox_id = str(args.get("inbox_id") or "")
                 if not inbox_id:
@@ -605,6 +880,19 @@ def _uuid(value: Any) -> UUID | None:
         return UUID(str(value))
     except (ValueError, AttributeError, TypeError):
         return None
+
+
+def _estimate_tokens(
+    summary: dict[str, Any] | None, history: list[dict[str, Any]],
+) -> int:
+    """Rough character-based heuristic: ~4 chars per token. Good enough for
+    deciding when to trigger compression — we don't need precision."""
+    total_chars = 0
+    if summary is not None:
+        total_chars += len(summary.get("summary") or "")
+    for row in history:
+        total_chars += len(row.get("content") or "")
+    return total_chars // 4
 
 
 def _was_resolved(events: list[dict[str, Any]], approval_id: str) -> bool:

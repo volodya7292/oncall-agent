@@ -153,14 +153,49 @@ def start() -> None:
     if not PLIST_PATH.exists():
         print("Service not installed. Run `oncall service install` first.", file=sys.stderr)
         sys.exit(2)
-    if not _is_loaded():
-        _launchctl("bootstrap", _domain(), str(PLIST_PATH))
-    r = _launchctl("kickstart", "-k", _domain_target(), capture=True)
-    if r.returncode == 0:
-        print(f"Started (or restarted) {LABEL}.")
-    else:
-        print(f"launchctl kickstart failed: {r.stderr.strip() or r.stdout.strip()}", file=sys.stderr)
-        sys.exit(r.returncode)
+
+    # Two paths:
+    #   * already loaded → kickstart -k restarts the process in place.
+    #   * not loaded     → bootstrap. Plist has RunAtLoad=True, so bootstrap
+    #                      itself starts the process — no kickstart needed.
+    #
+    # The previous version always called kickstart, which fails with empty
+    # stderr if bootstrap silently flopped (e.g. racing with bootout's teardown
+    # right after `oncall service stop`). Now we capture+check bootstrap so
+    # failures surface, and we only kickstart when there's actually a service
+    # to kick.
+    if _is_loaded():
+        r = _launchctl("kickstart", "-k", _domain_target(), capture=True)
+        if r.returncode != 0:
+            print(
+                f"launchctl kickstart failed (code={r.returncode}): "
+                f"{r.stderr.strip() or r.stdout.strip() or '<no output>'}",
+                file=sys.stderr,
+            )
+            sys.exit(r.returncode)
+        print(f"Restarted {LABEL}.")
+        return
+
+    r = _launchctl("bootstrap", _domain(), str(PLIST_PATH), capture=True)
+    if r.returncode != 0:
+        msg = r.stderr.strip() or r.stdout.strip() or "<no output>"
+        # Common race: bootout from a recent `stop` hasn't fully settled and
+        # launchctl rejects bootstrap with "Bootstrap failed: 5: Input/output
+        # error" or "service already loaded". Try once more after a brief
+        # pause — usually the second attempt succeeds.
+        import time
+        time.sleep(0.5)
+        r = _launchctl("bootstrap", _domain(), str(PLIST_PATH), capture=True)
+        if r.returncode != 0:
+            msg2 = r.stderr.strip() or r.stdout.strip() or "<no output>"
+            print(
+                f"launchctl bootstrap failed (code={r.returncode}).\n"
+                f"  first attempt:  {msg}\n"
+                f"  retry attempt:  {msg2}",
+                file=sys.stderr,
+            )
+            sys.exit(r.returncode)
+    print(f"Loaded and started {LABEL}.")
 
 
 def stop() -> None:
@@ -169,6 +204,14 @@ def stop() -> None:
         print(f"{LABEL} not loaded.")
         return
     _launchctl("bootout", _domain_target())
+    # bootout returns before launchd fully tears the service down — a
+    # subsequent `oncall service start` can race on the unload. Poll
+    # _is_loaded() briefly so the caller sees a clean state.
+    import time
+    for _ in range(20):  # up to ~1s
+        if not _is_loaded():
+            break
+        time.sleep(0.05)
     print(f"Stopped {LABEL}.")
 
 

@@ -36,13 +36,26 @@ AI_GATEWAY_API_KEY=
 # keychain OAuth for subscription users, or ANTHROPIC_API_KEY in your shell env
 # if you prefer a workspace API key. Nothing to configure here.
 
-# Telegram (optional — userbot via MTProto)
-# Get api_id + api_hash at https://my.telegram.org/apps
+# Telegram BOT (optional — talk to the operator via Telegram instead of REPL).
+# Uses the HTTP Bot API — only the token + your numeric user_id are needed.
+# 1. Create a bot via @BotFather and paste its token here.
+# 2. Get your own numeric user_id from @userinfobot and paste it as OWNER_ID.
+#    Only that id can DM the bot; everyone else is silently ignored.
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_BOT_OWNER_ID=
+
+# Telegram USERBOT (optional, separate from the bot above — reads inbound DMs
+# from arbitrary senders to the user's own account, for triage + reply-by-
+# proposal). Requires registering an app at https://my.telegram.org/apps.
 TELEGRAM_API_ID=
 TELEGRAM_API_HASH=
 TELEGRAM_SESSION_PATH=~/.oncall/telegram.session
 TELEGRAM_IMPORTANT_SENDERS=
 TELEGRAM_IMPORTANT_KEYWORDS=urgent,down,production,outage,critical
+# Comma-separated @usernames the userbot should NEVER surface (e.g. service
+# bots like @userinfobot). The own bot from TELEGRAM_BOT_TOKEN is auto-added
+# at startup via its user_id; you only need this list for extra entries.
+TELEGRAM_USERBOT_IGNORE_USERNAMES=
 """
 
 
@@ -85,21 +98,28 @@ def _init(*, force: bool = False) -> None:
     print("  4. `oncall api` to run the orchestrator.")
 
 
-def _telegram_login() -> None:
+def _telegram_login(*, verbose: bool = False, qr: bool = False) -> None:
     from .config import get_settings
-    from .telegram_service import login_interactive
+    from .telegram_service import login_interactive, login_qr_interactive
 
     s = get_settings()
     if not (s.telegram_api_id and s.telegram_api_hash):
         print("ERROR: set TELEGRAM_API_ID and TELEGRAM_API_HASH in .env first.", file=sys.stderr)
         print("  Get them at https://my.telegram.org/apps", file=sys.stderr)
         sys.exit(2)
-    asyncio.run(login_interactive(
+    logging.getLogger("telethon").setLevel(logging.DEBUG if verbose else logging.INFO)
+    runner = login_qr_interactive if qr else login_interactive
+    asyncio.run(runner(
         api_id=int(s.telegram_api_id),
         api_hash=s.telegram_api_hash,
         session_path=s.telegram_session_path,
     ))
-    print(f"Session written to {s.telegram_session_path}. You can now `oncall api`.")
+    print()
+    print(f"Session written to {s.telegram_session_path}.")
+    print()
+    print("Next: the userbot only attaches at daemon startup, so restart to pick up the new session:")
+    print("  oncall service stop && oncall service start    (LaunchAgent)")
+    print("  oncall api                                     (foreground / dev)")
 
 
 def _configure_logging() -> None:
@@ -122,9 +142,28 @@ def main() -> None:
                         help="Overwrite an existing ~/.oncall/.env.")
     sub.add_parser("api", help="Run the orchestrator HTTP API")
     sub.add_parser("mcp", help="Run the stdio MCP server (used by claude subprocesses)")
-    sub.add_parser(
+    chat_p = sub.add_parser(
+        "chat",
+        help="Interactive text mode — chat with the operator over the running daemon.",
+    )
+    chat_p.add_argument("--new", action="store_true",
+                        help="Start a fresh chat session instead of resuming the last one.")
+    chat_p.add_argument("--session", metavar="ID", default=None,
+                        help="Resume a specific chat session id.")
+    chat_p.add_argument("--debug", action="store_true",
+                        help="Stream state.changed events too (chatty).")
+    tg_login_p = sub.add_parser(
         "telegram-login",
         help="One-time interactive Telegram userbot login (writes session file).",
+    )
+    tg_login_p.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Show telethon DEBUG logs (every MTProto frame) for troubleshooting.",
+    )
+    tg_login_p.add_argument(
+        "--qr", action="store_true",
+        help="Login via QR code instead of phone+code. Scan from an already-"
+             "logged-in Telegram app (Settings → Devices → Link Desktop Device).",
     )
     svc = sub.add_parser(
         "service",
@@ -157,7 +196,20 @@ def main() -> None:
     elif args.cmd == "mcp":
         _serve_mcp()
     elif args.cmd == "telegram-login":
-        _telegram_login()
+        _telegram_login(
+            verbose=getattr(args, "verbose", False),
+            qr=getattr(args, "qr", False),
+        )
+    elif args.cmd == "chat":
+        from . import repl
+        from .config import get_settings
+        code = asyncio.run(repl.run(
+            get_settings(),
+            new_session=args.new,
+            session_override=args.session,
+            debug=args.debug,
+        ))
+        sys.exit(code)
     elif args.cmd == "service":
         from . import service
         fn = getattr(service, args.action)

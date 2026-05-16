@@ -68,6 +68,8 @@ class TelegramService:
         important_keywords: set[str],
         on_new_message: NewMessageCallback | None = None,
         archived_cache_ttl: float = ARCHIVED_CACHE_TTL_SECONDS,
+        ignore_usernames: set[str] | None = None,
+        ignore_user_ids: set[int] | None = None,
     ) -> None:
         self._db = db
         self._client = client
@@ -76,6 +78,16 @@ class TelegramService:
         self._on_new_message = on_new_message
         self._handler_ref: Any = None
         self._started = False
+        # Senders whose messages should never reach the inbox. Two channels:
+        #   * ignore_usernames: lowercased @handles (from env). Useful for
+        #     blocking third-party bots that auto-DM you (e.g. @userinfobot).
+        #   * ignore_user_ids: numeric ids (populated at runtime when the
+        #     own-bot front-end starts and tells us its user_id, so the bot's
+        #     own replies don't show up in your DM inbox stream).
+        self._ignore_usernames: set[str] = {
+            s.lstrip("@").lower() for s in (ignore_usernames or set())
+        }
+        self._ignore_user_ids: set[int] = set(ignore_user_ids or set())
         # Archived-chats cache: { chat_id_str }. Telegram users archive chats
         # they want hidden from main view without muting/blocking; we treat
         # archived chats as "do not surface" unless the user explicitly asks.
@@ -86,6 +98,11 @@ class TelegramService:
     @property
     def is_started(self) -> bool:
         return self._started
+
+    def add_ignore_user_id(self, user_id: int) -> None:
+        """Add a numeric user_id whose messages should be dropped from the
+        inbox. Safe to call any time — checked on each inbound."""
+        self._ignore_user_ids.add(int(user_id))
 
     # ---- lifecycle ----
 
@@ -203,6 +220,11 @@ class TelegramService:
             return
 
         username = (getattr(sender, "username", None) or "").lower() or None
+        sender_id = getattr(sender, "id", None)
+        if sender_id is not None and sender_id in self._ignore_user_ids:
+            return
+        if username is not None and username in self._ignore_usernames:
+            return
         display = _display_name(sender)
         chat_id = str(getattr(event, "chat_id", None) or getattr(event.message, "chat_id", ""))
         message_id = str(getattr(event.message, "id", ""))
@@ -290,6 +312,147 @@ class TelegramService:
             })
         return samples
 
+    async def get_chat_history(
+        self, chat_id: str, *, limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Return the last N messages of a chat, BOTH sides. Each row:
+            message_id, text, date, outgoing, sender_username, sender_display_name.
+        Unlike `get_chat_style` (which filters to from_user='me'), this includes
+        the counterparty's messages — use it when the user asks 'what did X say?'."""
+        entity = _entity_arg(chat_id)
+        out: list[dict[str, Any]] = []
+        async for msg in self._client.iter_messages(entity, limit=limit):
+            text = getattr(msg, "message", None) or ""
+            if not text:
+                continue  # skip system events, pure media, reactions
+            sender = (
+                await _maybe_await(msg.get_sender())
+                if hasattr(msg, "get_sender") else None
+            )
+            out.append({
+                "message_id": str(getattr(msg, "id", "")),
+                "text": text,
+                "date": _iso_or_none(getattr(msg, "date", None)),
+                "outgoing": bool(getattr(msg, "out", False)),
+                "sender_username": getattr(sender, "username", None) if sender else None,
+                "sender_display_name": _display_name(sender) if sender else None,
+            })
+        return out
+
+    async def search_messages(
+        self, chat_id: str, query: str, *, limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Server-side full-text search across messages in one chat. Returns
+        message rows in the same shape as `get_chat_history` (both sides,
+        skipping empty/media-only). Use for 'did we talk about X with Y'.
+        Telegram's search handles stemming/case better than a local substring
+        scan would."""
+        q = query.strip()
+        if not q:
+            return []
+        entity = _entity_arg(chat_id)
+        out: list[dict[str, Any]] = []
+        async for msg in self._client.iter_messages(entity, search=q, limit=limit):
+            text = getattr(msg, "message", None) or ""
+            if not text:
+                continue
+            sender = (
+                await _maybe_await(msg.get_sender())
+                if hasattr(msg, "get_sender") else None
+            )
+            out.append({
+                "message_id": str(getattr(msg, "id", "")),
+                "text": text,
+                "date": _iso_or_none(getattr(msg, "date", None)),
+                "outgoing": bool(getattr(msg, "out", False)),
+                "sender_username": getattr(sender, "username", None) if sender else None,
+                "sender_display_name": _display_name(sender) if sender else None,
+            })
+        return out
+
+    async def search_chats(
+        self, query: str, *, limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Token-AND match the user's recent dialogs against `dialog.name`
+        (every whitespace-split token must appear in the lowercased name) or a
+        plain substring against `@username`. Falls back to Telegram's
+        server-side `contacts.SearchRequest`, which handles transliteration
+        (e.g. "Alex" -> "Алекс") and surfaces contacts not yet in local
+        dialogs. Returns rows with a `source` field ("dialog" or "contact").
+        """
+        q_raw = query.strip()
+        if not q_raw:
+            return []
+        q = q_raw.lower()
+        tokens = [t for t in q.split() if t]
+
+        def _match(name: str, username: str) -> bool:
+            nl = name.lower()
+            if username and q in username.lower():
+                return True
+            return bool(tokens) and all(tok in nl for tok in tokens)
+
+        await self._refresh_archived()
+        seen_ids: set[str] = set()
+        out: list[dict[str, Any]] = []
+        async for dlg in self._client.iter_dialogs():
+            name = (getattr(dlg, "name", None) or "")
+            entity = getattr(dlg, "entity", None)
+            username = (getattr(entity, "username", None) or "") if entity else ""
+            if not _match(name, username):
+                continue
+            cid = _dialog_chat_id(dlg)
+            if cid is None or cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            out.append({
+                "chat_id": cid,
+                "name": name,
+                "username": username or None,
+                "is_user": bool(getattr(dlg, "is_user", False)),
+                "is_group": bool(getattr(dlg, "is_group", False)),
+                "is_channel": bool(getattr(dlg, "is_channel", False)),
+                "unread_count": int(getattr(dlg, "unread_count", 0) or 0),
+                "archived": cid in self._archived,
+                "source": "dialog",
+            })
+            if len(out) >= limit:
+                return out
+
+        # Fallback: Telegram-side contact search. Catches transliteration
+        # (Cyrillic <-> Latin) and contacts not yet present in iter_dialogs.
+        try:
+            from telethon.tl.functions.contacts import SearchRequest
+            res = await self._client(SearchRequest(q=q_raw, limit=limit))
+        except Exception:
+            log.exception("contacts.search fallback failed")
+            return out
+        for user in (getattr(res, "users", None) or []):
+            uid = str(getattr(user, "id", "") or "")
+            if not uid or uid in seen_ids:
+                continue
+            full_name = " ".join(
+                p for p in (
+                    getattr(user, "first_name", None),
+                    getattr(user, "last_name", None),
+                ) if p
+            ).strip()
+            seen_ids.add(uid)
+            out.append({
+                "chat_id": uid,
+                "name": full_name,
+                "username": getattr(user, "username", None) or None,
+                "is_user": True,
+                "is_group": False,
+                "is_channel": False,
+                "unread_count": 0,
+                "archived": False,
+                "source": "contact",
+            })
+            if len(out) >= limit:
+                break
+        return out
+
     async def send(self, chat_id: str, text: str) -> dict[str, Any]:
         entity = _entity_arg(chat_id)
         sent = await self._client.send_message(entity, text)
@@ -361,18 +524,166 @@ def make_telethon_client(
     return TelegramClient(str(session_path), api_id, api_hash)
 
 
+async def login_qr_interactive(
+    *, api_id: int, api_hash: str, session_path: Path,
+) -> None:
+    """QR-code login. Sidesteps SMS/in-app code delivery entirely — telethon
+    asks the server for a single-use login token, we render it as a QR code
+    in the terminal, the user scans it from an already-logged-in Telegram
+    app (Settings → Devices → Link Desktop Device), and the session is
+    authorized server-side. 2FA password is still requested after the scan."""
+    import getpass
+    import qrcode
+    from telethon import errors  # type: ignore
+
+    client = make_telethon_client(api_id=api_id, api_hash=api_hash, session_path=session_path)
+    print(f"Connecting to Telegram (session={session_path}, api_id={api_id})...")
+    await client.connect()
+
+    if await client.is_user_authorized():
+        me = await client.get_me()
+        print(f"Already logged in as @{getattr(me, 'username', None)} (id={getattr(me, 'id', None)}).")
+        await client.disconnect()
+        return
+
+    print("Open Telegram on your phone/desktop. Go to:")
+    print("  Settings → Devices → Link Desktop Device")
+    print("Then scan the QR code shown below.")
+    print()
+
+    qr_login = await client.qr_login()
+    while True:
+        # Re-render every cycle (the URL changes on .recreate()).
+        qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_L)
+        qr.add_data(qr_login.url)
+        qr.make(fit=True)
+        qr.print_ascii(invert=True)  # invert=True renders well on dark terminals
+        print(f"URL (paste if your terminal mangles QR): {qr_login.url}")
+        print("Waiting for scan...")
+        try:
+            await qr_login.wait()
+            break  # scanned
+        except asyncio.TimeoutError:
+            # QR codes expire after ~30s; telethon raises TimeoutError so we
+            # re-issue a fresh token and re-render.
+            print("(QR expired, generating a new one...)\n")
+            await qr_login.recreate()
+            continue
+        except errors.SessionPasswordNeededError:
+            # User has 2FA — telethon raises this after a successful scan.
+            print("\n2FA is enabled on this account.")
+            password = getpass.getpass("2FA password: ")
+            try:
+                await client.sign_in(password=password)
+                break
+            except errors.PasswordHashInvalidError:
+                print("Wrong 2FA password. Re-run `oncall telegram-login --qr`.")
+                await client.disconnect()
+                return
+
+    me = await client.get_me()
+    print(f"Logged in as @{getattr(me, 'username', None)} "
+          f"(id={getattr(me, 'id', None)}, name={getattr(me, 'first_name', None)}).")
+    await client.disconnect()
+
+
 async def login_interactive(
     *, api_id: int, api_hash: str, session_path: Path,
 ) -> None:
-    """One-shot interactive login. Prompts for phone, code, optional 2FA password."""
+    """One-shot interactive login. Prompts for phone, code, optional 2FA.
+
+    Implemented with the lower-level telethon calls (send_code_request +
+    sign_in) instead of client.start() so we can show the user exactly which
+    channel Telegram chose to deliver the code (in-app message vs SMS vs
+    voice call) and give clear error messages per exception type. This is
+    the path that needs to debug well — it's the one the user runs once and
+    swears at if anything goes wrong."""
     import getpass
+    from telethon import errors  # type: ignore
 
     client = make_telethon_client(api_id=api_id, api_hash=api_hash, session_path=session_path)
-    await client.start(
-        phone=lambda: input("Telegram phone (e.g. +14155551234): ").strip(),
-        code_callback=lambda: input("Code sent to Telegram: ").strip(),
-        password=lambda: getpass.getpass("2FA password (blank if none): ") or None,
-    )
+    print(f"Connecting to Telegram (session={session_path}, api_id={api_id})...")
+    await client.connect()
+
+    if await client.is_user_authorized():
+        me = await client.get_me()
+        print(f"Already logged in as @{getattr(me, 'username', None)} (id={getattr(me, 'id', None)}).")
+        await client.disconnect()
+        return
+
+    phone = input("Telegram phone (E.164, e.g. +14155551234): ").strip()
+    if not phone.startswith("+"):
+        # Telethon accepts both, but the canonical E.164 form is +<country><number>.
+        # Warn the user — typo'd country code is one of the most common reasons
+        # the code goes to a stranger.
+        print(f"Note: phone has no leading '+'. Treating as +{phone}. Hit Ctrl-C to abort if wrong.")
+
+    print(f"Sending code request to {phone}...")
+    try:
+        sent = await client.send_code_request(phone)
+    except errors.PhoneNumberInvalidError:
+        print(f"ERROR: Telegram rejected '{phone}' as not a valid phone number.")
+        await client.disconnect()
+        raise
+    except errors.PhoneNumberBannedError:
+        print(f"ERROR: Telegram says {phone} is banned. Contact recover@telegram.org.")
+        await client.disconnect()
+        raise
+    except errors.FloodWaitError as e:
+        print(f"ERROR: rate-limited. Wait {e.seconds}s and retry.")
+        await client.disconnect()
+        raise
+    except errors.PhoneNumberFloodError:
+        print(f"ERROR: too many sign-in attempts on this phone. Wait several hours.")
+        await client.disconnect()
+        raise
+
+    code_type = type(sent.type).__name__
+    next_type = type(sent.next_type).__name__ if sent.next_type else None
+    print(f"Code sent. channel={code_type}, length={getattr(sent.type, 'length', '?')}, "
+          f"timeout={getattr(sent, 'timeout', '?')}s, fallback_next={next_type or 'none'}")
+    if code_type == "SentCodeTypeApp":
+        print("  → Look in your Telegram app (any logged-in device) for a chat with")
+        print("    the official 'Telegram' account (blue ✓). The 5-digit code is there.")
+        print("    Note: Telegram chooses the delivery channel server-side; there is no")
+        print("    longer a reliable way to force SMS via the API.")
+    elif code_type == "SentCodeTypeSms":
+        print("  → SMS to your phone.")
+    elif code_type == "SentCodeTypeCall":
+        print("  → Automated voice call to your phone with the digits.")
+    elif code_type == "SentCodeTypeFlashCall":
+        print("  → A missed call; the code is the last digits of the calling number.")
+
+    while True:
+        code = input("Code: ").strip()
+        if not code:
+            print("Empty code — Telegram codes are always 5 digits. Try again.")
+            continue
+        try:
+            await client.sign_in(phone=phone, code=code, phone_code_hash=sent.phone_code_hash)
+            break
+        except errors.SessionPasswordNeededError:
+            print("2FA is enabled on this account.")
+            password = getpass.getpass("2FA password: ")
+            try:
+                await client.sign_in(password=password)
+                break
+            except errors.PasswordHashInvalidError:
+                print("Wrong 2FA password. Try again from the start (Ctrl-C, re-run).")
+                await client.disconnect()
+                return
+        except errors.PhoneCodeInvalidError:
+            print(f"Telegram says the code is wrong. Got {len(code)} digits; should be 5.")
+            continue
+        except errors.PhoneCodeExpiredError:
+            print("Code expired (~5 min lifetime). Re-run `oncall telegram-login`.")
+            await client.disconnect()
+            return
+        except errors.PhoneCodeEmptyError:
+            print("Empty code rejected; try again.")
+            continue
+
     me = await client.get_me()
-    log.info("logged in as @%s (%s)", getattr(me, "username", None), getattr(me, "id", None))
+    print(f"Logged in as @{getattr(me, 'username', None)} "
+          f"(id={getattr(me, 'id', None)}, name={getattr(me, 'first_name', None)}).")
     await client.disconnect()

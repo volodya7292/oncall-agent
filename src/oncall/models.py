@@ -78,7 +78,11 @@ class ApprovalRequest(BaseModel):
     blast_radius: str
     challenge_phrase: str | None  # None for auto-decided rows
     requested_at: datetime = Field(default_factory=utcnow)
-    timeout_seconds: int = 300
+    # Default 24h. Pending approvals consume no compute — the executor is
+    # paused at the broker — so a long backstop fits the on-call use case
+    # where the user might be asleep / in a flight / etc. The broker overrides
+    # this with `settings.oncall_approval_timeout_seconds` in production.
+    timeout_seconds: int = 86400
 
 
 class ApprovalResult(BaseModel):

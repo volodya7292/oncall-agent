@@ -83,6 +83,20 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     content TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+-- Compression checkpoints. When the live message tail grows past the model's
+-- context budget, the operator summarizes everything up through one row id
+-- and writes a single chat_summaries row. Future loads = (latest summary) +
+-- (chat_messages with id > through_message_id).
+CREATE TABLE IF NOT EXISTS chat_summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES chat_sessions(id),
+    summary TEXT NOT NULL,
+    through_message_id INTEGER NOT NULL,
+    estimated_token_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chat_summaries_session
+    ON chat_summaries(session_id, id DESC);
 
 CREATE TABLE IF NOT EXISTS credentials_issued (
     id TEXT PRIMARY KEY,
@@ -130,7 +144,19 @@ class Database:
         self._conn = await aiosqlite.connect(self.path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(SCHEMA)
+        # Idempotent migrations for columns added after the initial schema.
+        # SQLite ALTER TABLE ADD COLUMN errors if the column already exists,
+        # so we swallow that specific case.
+        await self._migrate_add_column("tasks", "result_summary", "TEXT")
         await self._conn.commit()
+
+    async def _migrate_add_column(self, table: str, column: str, type_decl: str) -> None:
+        try:
+            await self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {type_decl}")
+        except Exception as e:
+            # aiosqlite re-raises sqlite3.OperationalError; only swallow "duplicate"
+            if "duplicate column" not in str(e).lower():
+                raise
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -283,6 +309,19 @@ class Database:
         )).fetchone()
         return _row_to_approval_request(row) if row else None
 
+    async def get_pending_by_session_and_tool(
+        self, session_id: str, tool_use_id: str,
+    ) -> ApprovalRequest | None:
+        """Used by broker.decide on --resume: if a pending row already exists
+        for this (session_id, tool_use_id), re-attach instead of inserting a
+        duplicate (which would violate the UNIQUE index)."""
+        row = await (await self.conn.execute(
+            "SELECT * FROM approvals "
+            "WHERE session_id = ? AND tool_use_id = ? AND state = 'pending'",
+            (session_id, tool_use_id),
+        )).fetchone()
+        return _row_to_approval_request(row) if row else None
+
     async def get_approval(self, approval_id: UUID) -> dict[str, Any] | None:
         row = await (await self.conn.execute(
             "SELECT * FROM approvals WHERE id = ?", (str(approval_id),)
@@ -374,18 +413,70 @@ class Database:
         await self.conn.commit()
 
     async def load_chat_history(
-        self, session_id: str, *, limit: int = 60
+        self, session_id: str, *, limit: int = 60, since_id: int = 0,
     ) -> list[dict[str, Any]]:
+        """Most recent `limit` chat_messages for this session, in oldest-first
+        order. `since_id` (exclusive lower bound on message id) lets the caller
+        load only the tail newer than a compression checkpoint."""
         rows = await (await self.conn.execute(
             "SELECT id, role, content, created_at FROM chat_messages "
-            "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
-            (session_id, limit),
+            "WHERE session_id = ? AND id > ? ORDER BY id DESC LIMIT ?",
+            (session_id, since_id, limit),
         )).fetchall()
         return [
             {"id": int(r["id"]), "role": r["role"], "content": r["content"],
              "created_at": r["created_at"]}
             for r in reversed(rows)
         ]
+
+    # ---- chat compression checkpoints ----
+
+    async def insert_chat_summary(
+        self, *, session_id: str, summary: str,
+        through_message_id: int, estimated_token_count: int,
+    ) -> int:
+        cur = await self.conn.execute(
+            "INSERT INTO chat_summaries "
+            "(session_id, summary, through_message_id, estimated_token_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (session_id, summary, through_message_id,
+             estimated_token_count, iso(utcnow())),
+        )
+        await self.conn.commit()
+        return cur.lastrowid or 0
+
+    async def get_latest_chat_summary(self, session_id: str) -> dict[str, Any] | None:
+        row = await (await self.conn.execute(
+            "SELECT id, summary, through_message_id, estimated_token_count, created_at "
+            "FROM chat_summaries WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+            (session_id,),
+        )).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": int(row["id"]),
+            "summary": row["summary"],
+            "through_message_id": int(row["through_message_id"]),
+            "estimated_token_count": int(row["estimated_token_count"]),
+            "created_at": row["created_at"],
+        }
+
+    # ---- task result summaries ----
+
+    async def update_task_result_summary(self, task_id: UUID, summary: str) -> None:
+        await self.conn.execute(
+            "UPDATE tasks SET result_summary = ?, updated_at = ? WHERE id = ?",
+            (summary, iso(utcnow()), str(task_id)),
+        )
+        await self.conn.commit()
+
+    async def get_task_result_summary(self, task_id: UUID) -> str | None:
+        row = await (await self.conn.execute(
+            "SELECT result_summary FROM tasks WHERE id = ?", (str(task_id),),
+        )).fetchone()
+        if row is None:
+            return None
+        return row["result_summary"]
 
     # ---- approvals (continued) ----
 

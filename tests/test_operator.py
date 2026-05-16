@@ -77,6 +77,24 @@ def settings(tmp_path):
     )
 
 
+def test_tilde_path_is_expanded_by_settings(tmp_path, monkeypatch):
+    """Regression: pydantic-settings used to take TELEGRAM_SESSION_PATH=~/x
+    literally, creating a directory named '~' under cwd. The expanduser
+    validator must normalize before the value is stored."""
+    monkeypatch.setenv("TELEGRAM_SESSION_PATH", "~/.oncall/telegram.session")
+    monkeypatch.setenv("ONCALL_DB_PATH", "~/.oncall/state.db")
+    monkeypatch.setenv("ONCALL_MEMORY_PATH", "~/.oncall/memory.md")
+    monkeypatch.setenv("TELEGRAM_BOT_SESSION_PATH", "~/.oncall/telegram_bot.session")
+    monkeypatch.setattr("oncall.config.USER_ENV_FILE", tmp_path / "nonexistent.env")
+    s = Settings(_env_file=None)  # don't read project .env, avoid pollution
+    home = Path.home()
+    assert str(s.telegram_session_path).startswith(str(home))
+    assert "~" not in str(s.telegram_session_path)
+    assert str(s.oncall_db_path).startswith(str(home))
+    assert str(s.oncall_memory_path).startswith(str(home))
+    assert str(s.telegram_bot_session_path).startswith(str(home))
+
+
 @pytest.fixture
 def paths(tmp_path):
     return Paths()
@@ -445,3 +463,90 @@ async def test_tool_round_cap_prevents_loops(stack):
     assert "stuck" in result.text.lower() or "too many" in result.text.lower()
     # 3 rounds means 3 LLM calls; the 4th doesn't happen.
     assert len(llm.calls_made) == 3
+
+
+# ---------------------------------------------------------------------------
+# Auto-ping — operator gets re-engaged when a dispatched task terminates
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_auto_ping_no_history_is_noop(stack):
+    """If the session has no chat history (nobody ever talked here), the
+    auto-ping must not synthesize a turn."""
+    llm = ScriptedLLM(script=["should-not-be-called"])
+    operator = Operator(
+        db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
+        settings=stack["settings"], paths=stack["paths"], llm=llm,
+    )
+    result = await operator.auto_ping(session_id="empty", note="task abc terminated")
+    assert result.text == ""
+    assert llm.calls_made == []  # LLM never invoked
+
+
+@pytest.mark.asyncio
+async def test_auto_ping_injects_system_note_and_replies(stack):
+    """After a user turn exists, an auto-ping appends a `[system note: ...]`
+    pseudo-user turn and the LLM gets to produce a follow-up reply."""
+    llm = ScriptedLLM(script=[
+        "Dispatched.",                # first chat_turn reply
+        "Found 3 projects: a, b, c.", # auto-ping reply
+    ])
+    operator = Operator(
+        db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
+        settings=stack["settings"], paths=stack["paths"], llm=llm,
+    )
+    await operator.chat_turn(session_id="s1", user_text="what projects?")
+    result = await operator.auto_ping(session_id="s1", note="task abc terminated, state=completed")
+
+    assert result.text == "Found 3 projects: a, b, c."
+    # The 2nd LLM call must have seen the [system note: ...] as the last user message.
+    assert len(llm.calls_made) == 2
+    last_call_msgs = llm.calls_made[1]["messages"]
+    user_msgs = [m for m in last_call_msgs if m.get("role") == "user"]
+    assert user_msgs[-1]["content"].startswith("[system note: ")
+    assert "task abc terminated" in user_msgs[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_session_lock_serializes_chat_turn_and_auto_ping(stack):
+    """If a chat_turn is in flight, an auto-ping for the same session must
+    wait until the user-turn's chat_messages writes finish — otherwise the
+    LLM's view of history can be torn."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class GatedLLM:
+        def __init__(self) -> None:
+            self.order: list[str] = []
+
+        async def chat(self, *, model, messages, tools, max_tokens=None):
+            # The first invocation (chat_turn) gates on `release`; the second
+            # (auto_ping) records its order and returns immediately.
+            if not self.order:
+                self.order.append("chat_turn_in")
+                started.set()
+                await release.wait()
+                self.order.append("chat_turn_out")
+                return {"role": "assistant", "content": "User reply.", "tool_calls": []}
+            self.order.append("auto_ping")
+            return {"role": "assistant", "content": "Auto reply.", "tool_calls": []}
+
+    llm = GatedLLM()
+    operator = Operator(
+        db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
+        settings=stack["settings"], paths=stack["paths"], llm=llm,
+    )
+    # Need at least one history row for auto_ping to act.
+    await stack["db"].ensure_chat_session("s1")
+    await stack["db"].append_chat_message("s1", "user", "warmup")
+
+    turn = asyncio.create_task(operator.chat_turn(session_id="s1", user_text="hi"))
+    await started.wait()
+    ping = asyncio.create_task(operator.auto_ping(session_id="s1", note="task t1 done"))
+    # Auto-ping must NOT start until chat_turn finishes.
+    await asyncio.sleep(0.02)
+    assert llm.order == ["chat_turn_in"], llm.order
+
+    release.set()
+    await asyncio.gather(turn, ping)
+    assert llm.order == ["chat_turn_in", "chat_turn_out", "auto_ping"]

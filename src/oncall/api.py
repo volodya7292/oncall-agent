@@ -14,6 +14,7 @@ Milestone 1 endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -30,8 +31,12 @@ from .config import get_paths, get_settings
 from .db import Database
 from .events import EventBus
 from .lifecycle import Lifecycle
+from .local_claude import ClaudeCliRunner
 from .operator import GatewayLLMClient, Operator
+from .task_summary import summarize_task
+from .telegram_bot import HttpxBotApi, TelegramBotService
 from .telegram_service import TelegramService, make_telethon_client
+from .voice import to_voice_text
 
 
 log = logging.getLogger(__name__)
@@ -72,6 +77,10 @@ class KillBody(BaseModel):
 class ChatBody(BaseModel):
     session_id: str | None = None  # if absent, a new session id is minted
     text: str
+    # BCP-47 / common code (e.g. "en", "ru", "en-US"). The operator gets it
+    # as a hint at the bottom of its system prompt. Optional; if absent the
+    # operator infers from the conversation history.
+    language: str | None = None
 
 
 class BrokerDecideBody(BaseModel):
@@ -82,11 +91,12 @@ class BrokerDecideBody(BaseModel):
 
 
 class MessengerOpBody(BaseModel):
-    op: Literal["list", "read", "mark_read", "style", "send"]
+    op: Literal["list", "read", "mark_read", "style", "send", "history", "search", "search_messages"]
     chat_id: str | None = None
     message_id: str | None = None
     inbox_id: str | None = None
     text: str | None = None
+    query: str | None = None
     unread_only: bool = True
     limit: int = 20
 
@@ -124,7 +134,10 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await db.connect()
-        broker = Broker(db, approval_client, events.publish)
+        broker = Broker(
+            db, approval_client, events.publish,
+            approval_timeout_seconds=settings.oncall_approval_timeout_seconds,
+        )
         lifecycle = Lifecycle(
             db=db, broker=broker, approval_client=approval_client,
             events=events, settings=settings, paths=paths,
@@ -137,14 +150,39 @@ def create_app() -> FastAPI:
                 base_url=settings.ai_gateway_base_url,
                 api_key=settings.gateway_key,
             )
-        # Telegram — only set up if api_id/hash + session file are all present.
-        telegram: TelegramService | None = await _maybe_start_telegram(settings, db)
+        # Telegram userbot — only set up if api_id/hash + session file are
+        # all present. Inbound DMs from senders listed in
+        # `telegram_userbot_ignore_usernames` are skipped at the handler.
+        telegram: TelegramService | None = await _maybe_start_telegram(
+            settings, db, events,
+            ignore_usernames=settings.userbot_ignore_usernames,
+        )
+        # Shared one-shot Claude CLI runner — used by the operator for chat
+        # context compression and by the auto-ping loop for per-task summaries.
+        # Single instance: it's a fresh subprocess per call, no shared state.
+        cli_runner = ClaudeCliRunner()
         if settings.gateway_key:
             operator = Operator(
                 db=db, lifecycle=lifecycle, broker=broker,
                 settings=settings, paths=paths, llm=llm,
                 telegram=telegram,
+                runner=cli_runner,
             )
+        # Telegram bot front-end (optional, separate from userbot above).
+        telegram_bot: TelegramBotService | None = None
+        if operator is not None:
+            telegram_bot = await _maybe_start_telegram_bot(
+                settings, operator, events, broker=broker, db=db,
+            )
+        # Tell the userbot to ignore the bot's own replies — otherwise every
+        # outbound the bot front-end sends would re-enter the user's inbox.
+        if telegram is not None and telegram_bot is not None and telegram_bot.bot_user_id:
+            telegram.add_ignore_user_id(telegram_bot.bot_user_id)
+            log.info(
+                "userbot will ignore inbound from bot (@%s, id=%d)",
+                telegram_bot.bot_username, telegram_bot.bot_user_id,
+            )
+
         app.state.db = db
         app.state.events = events
         app.state.approval_client = approval_client
@@ -152,15 +190,36 @@ def create_app() -> FastAPI:
         app.state.lifecycle = lifecycle
         app.state.operator = operator
         app.state.telegram = telegram
+        app.state.telegram_bot = telegram_bot
         # Recover any tasks left running / awaiting_approval from a prior
         # orchestrator process. The CLI's session JSONL is on disk; we
         # re-spawn with --resume and the broker's (session_id, tool_use_id)
         # dedup re-attaches to existing pending approval rows.
         await lifecycle.recover()
+        # Background: when a task dispatched from a chat session reaches a
+        # terminal state, auto-ping the operator so it can summarize the result
+        # for the user without the user having to ask.
+        auto_ping_task: asyncio.Task | None = None
+        if operator is not None:
+            auto_ping_task = asyncio.create_task(
+                _auto_ping_loop(
+                    events=events, operator=operator, db=db,
+                    runner=cli_runner,
+                    summary_model=settings.oncall_compression_model,
+                )
+            )
         try:
             yield
         finally:
+            if auto_ping_task is not None:
+                auto_ping_task.cancel()
+                try:
+                    await auto_ping_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             await lifecycle.shutdown()
+            if telegram_bot is not None:
+                await telegram_bot.stop()
             if telegram is not None:
                 await telegram.stop()
             await db.close()
@@ -170,7 +229,130 @@ def create_app() -> FastAPI:
     return app
 
 
-async def _maybe_start_telegram(settings, db: Database) -> TelegramService | None:
+_TERMINAL_STATES = {"completed", "failed", "killed"}
+
+
+async def _auto_ping_loop(
+    *, events: EventBus, operator: Operator, db: Database,
+    runner: ClaudeCliRunner, summary_model: str,
+) -> None:
+    """Re-engage the operator on two kinds of triggers, so the user sees
+    follow-ups via the chat UI (REPL or Telegram bot) without having to ask:
+
+      * state.changed → terminal (completed/failed/killed):
+          1. Summarize the task's event trail into tasks.result_summary.
+          2. auto_ping with `task X just terminated`.
+          3. Publish the operator's reply as chat.reply.
+
+      * approval.requested:
+          auto_ping with `task X needs approval, approval_id=Y, tool=Z`.
+          The operator's prompt directs it to call present_pending_approval
+          and read back the canonical command + challenge phrase verbatim.
+
+    Each step is fail-soft; the loop only exits on cancel."""
+    from uuid import UUID
+    async for env in events.subscribe_global(
+        types={"state.changed", "approval.requested"},
+    ):
+        type_ = env.get("type")
+        task_id_str = env.get("task_id")
+        if not task_id_str:
+            continue
+        try:
+            task_uuid = UUID(task_id_str)
+            task = await db.get_task(task_uuid)
+        except Exception:
+            log.exception("auto-ping: failed to load task %s", task_id_str)
+            continue
+        if task is None or not task.dispatched_by_chat_session:
+            continue
+        session_id = task.dispatched_by_chat_session
+        short = task_id_str[:8]
+        payload = env.get("payload") or {}
+
+        if type_ == "state.changed":
+            new_state = payload.get("state")
+            if new_state not in _TERMINAL_STATES:
+                continue
+            try:
+                await summarize_task(db, runner, task_uuid, model=summary_model)
+            except Exception:
+                log.exception("auto-ping: summarize_task failed for %s", task_id_str)
+            terminal = (task.terminal_reason.value if task.terminal_reason else new_state)
+            note = f"task {short} just terminated, state={new_state}, reason={terminal}"
+            trigger = "task.terminal"
+            approval_id = None
+        elif type_ == "approval.requested":
+            approval_id = payload.get("approval_id") or ""
+            tool_name = payload.get("tool_name") or "?"
+            note = (
+                f"task {short} needs approval. approval_id={approval_id}, "
+                f"tool={tool_name}. Call present_pending_approval with that id, "
+                f"then read the canonical command, blast radius, and challenge "
+                f"phrase to the user VERBATIM. Do not paraphrase."
+            )
+            trigger = "approval.requested"
+        else:
+            continue
+
+        try:
+            result = await operator.auto_ping(session_id=session_id, note=note)
+        except Exception:
+            log.exception("auto-ping: operator.auto_ping failed for session %s", session_id)
+            continue
+        if not result.text:
+            continue
+
+        chat_reply_payload: dict[str, Any] = {
+            "session_id": session_id,
+            "text": result.text,
+            "voice_text": to_voice_text(result.text),
+            "trigger": trigger,
+            "task_id": task_id_str,
+        }
+        if approval_id:
+            chat_reply_payload["approval_id"] = approval_id
+        await events.publish_global("chat.reply", chat_reply_payload)
+
+
+async def _maybe_start_telegram_bot(
+    settings, operator: Operator, events: EventBus,
+    *, broker, db: Database,
+) -> TelegramBotService | None:
+    """Boot the Telegram bot front-end if a token + owner_id are set. Uses
+    the HTTP Bot API, so api_id/api_hash are NOT required. Logs and returns
+    None on misconfiguration / start failure — the rest of the API stays up."""
+    if not settings.telegram_bot_token:
+        log.info("telegram bot disabled: TELEGRAM_BOT_TOKEN not set")
+        return None
+    if not settings.telegram_bot_owner_id:
+        log.warning(
+            "telegram bot disabled: TELEGRAM_BOT_OWNER_ID not set. "
+            "Get your numeric user id from @userinfobot."
+        )
+        return None
+    try:
+        owner_id = int(settings.telegram_bot_owner_id)
+    except (TypeError, ValueError):
+        log.warning("telegram bot disabled: TELEGRAM_BOT_OWNER_ID must be an integer")
+        return None
+    try:
+        api = HttpxBotApi(settings.telegram_bot_token)
+        service = TelegramBotService(
+            api=api, operator=operator, events=events, owner_user_id=owner_id,
+            broker=broker, db=db,
+        )
+        await service.start()
+        return service
+    except Exception:
+        log.exception("telegram bot failed to start; continuing without it")
+        return None
+
+
+async def _maybe_start_telegram(
+    settings, db: Database, events: EventBus,
+    *, ignore_usernames: set[str] | None = None,
+) -> TelegramService | None:
     """Boot the telethon listener if credentials and a session file are present.
     Failures are logged but never crash the API — `/chat` and tasks still work
     without messenger integration."""
@@ -187,11 +369,17 @@ async def _maybe_start_telegram(settings, db: Database) -> TelegramService | Non
             api_hash=settings.telegram_api_hash,
             session_path=session_path,
         )
+
+        async def _emit_received(row: dict[str, Any]) -> None:
+            await events.publish_global("messenger.received", row)
+
         service = TelegramService(
             db=db,
             client=client,
             important_senders=settings.important_senders,
             important_keywords=settings.important_keywords,
+            on_new_message=_emit_received,
+            ignore_usernames=ignore_usernames or set(),
         )
         await service.start()
         return service
@@ -246,6 +434,56 @@ def _register_routes(app: FastAPI) -> None:
         async def gen():
             async for evt in ev.subscribe(task_id, since_seq=since):
                 yield {"data": json.dumps(evt)}
+
+        return EventSourceResponse(gen())
+
+    @app.get("/events", dependencies=[Depends(verify_token)])
+    async def stream_global_events(
+        request: Request,
+        types: str = "approval.requested,approval.resolved,result.final,messenger.received,state.changed",
+    ):
+        """Live global SSE feed for clients like the `oncall chat` REPL.
+        `types` is a comma-separated filter; pass empty to receive everything."""
+        ev = _events(request)
+        wanted = {t.strip() for t in types.split(",") if t.strip()} or None
+
+        async def gen():
+            agen = ev.subscribe_global(types=wanted)
+            next_event: asyncio.Task | None = None
+            try:
+                next_event = asyncio.ensure_future(agen.__anext__())
+                while True:
+                    if await request.is_disconnected():
+                        return
+                    done, _ = await asyncio.wait(
+                        {next_event}, timeout=15.0,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        # Idle keepalive — SSE comments are ignored by clients.
+                        yield {"comment": "ping"}
+                        continue
+                    try:
+                        evt = next_event.result()
+                    except StopAsyncIteration:
+                        return
+                    yield {"data": json.dumps(evt)}
+                    next_event = asyncio.ensure_future(agen.__anext__())
+            finally:
+                # CRITICAL: cancel AND await the pre-fetched task before
+                # calling aclose(). aclose() raises "generator already running"
+                # if its underlying __anext__ coroutine hasn't finished
+                # settling the cancellation yet.
+                if next_event is not None and not next_event.done():
+                    next_event.cancel()
+                    try:
+                        await next_event
+                    except BaseException:
+                        pass
+                try:
+                    await agen.aclose()
+                except Exception:
+                    log.debug("global events aclose raised", exc_info=True)
 
         return EventSourceResponse(gen())
 
@@ -343,6 +581,20 @@ def _register_routes(app: FastAPI) -> None:
             if not body.chat_id:
                 raise HTTPException(400, "chat_id required")
             return {"samples": await tg.get_chat_style(body.chat_id, limit=body.limit)}
+        if body.op == "history":
+            if not body.chat_id:
+                raise HTTPException(400, "chat_id required")
+            return {"messages": await tg.get_chat_history(body.chat_id, limit=body.limit)}
+        if body.op == "search":
+            if not body.query:
+                raise HTTPException(400, "query required")
+            return {"chats": await tg.search_chats(body.query, limit=body.limit)}
+        if body.op == "search_messages":
+            if not body.chat_id or not body.query:
+                raise HTTPException(400, "chat_id and query required")
+            return {"messages": await tg.search_messages(
+                body.chat_id, body.query, limit=body.limit,
+            )}
         if body.op == "send":
             if not body.chat_id or not body.text:
                 raise HTTPException(400, "chat_id and text required")
@@ -357,10 +609,14 @@ def _register_routes(app: FastAPI) -> None:
         if operator is None:
             raise HTTPException(503, "operator not configured: set AI_GATEWAY_API_KEY")
         session_id = body.session_id or str(__import__("uuid").uuid4())
-        result = await operator.chat_turn(session_id=session_id, user_text=body.text)
+        result = await operator.chat_turn(
+            session_id=session_id, user_text=body.text, language=body.language,
+        )
         return {
             "session_id": session_id,
             "text": result.text,
+            "voice_text": to_voice_text(result.text, language=body.language),
+            "language": body.language,
             "tool_calls": result.tool_calls_made,
         }
 

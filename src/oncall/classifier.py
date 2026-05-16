@@ -736,7 +736,7 @@ def _stmt_is_read_only(stmt: exp.Expression) -> bool:
 
 def _classify_messenger(tool_input: dict[str, Any]) -> Verdict:
     op = str(tool_input.get("op", ""))
-    if op in ("list", "read", "mark_read", "style"):
+    if op in ("list", "read", "mark_read", "style", "history", "search", "search_messages"):
         return Verdict(
             kind=ClassifierVerdict.READONLY,
             canonical=f"messenger_inbox.{op}",
