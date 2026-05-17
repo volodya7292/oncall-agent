@@ -91,13 +91,19 @@ class BrokerDecideBody(BaseModel):
 
 
 class MessengerOpBody(BaseModel):
-    op: Literal["list", "read", "mark_read", "style", "send", "history", "search", "search_messages"]
+    op: Literal[
+        "list", "read", "mark_read", "style", "send",
+        "history", "search", "search_messages", "list_chats",
+    ]
     chat_id: str | None = None
     message_id: str | None = None
     inbox_id: str | None = None
     text: str | None = None
     query: str | None = None
-    unread_only: bool = True
+    # Per-op default applied at the router. `read_inbox` reads as True
+    # if unset; `list_chats` reads as False.
+    unread_only: bool | None = None
+    dms_only: bool = False
     limit: int = 20
 
 
@@ -564,7 +570,8 @@ def _register_routes(app: FastAPI) -> None:
         if tg is None:
             raise HTTPException(503, "telegram service not configured")
         if body.op == "list":
-            return {"messages": await tg.list_inbox(unread_only=body.unread_only, limit=body.limit)}
+            unread_only = True if body.unread_only is None else body.unread_only
+            return {"messages": await tg.list_inbox(unread_only=unread_only, limit=body.limit)}
         if body.op == "read":
             if not body.inbox_id:
                 raise HTTPException(400, "inbox_id required")
@@ -594,6 +601,13 @@ def _register_routes(app: FastAPI) -> None:
                 raise HTTPException(400, "chat_id and query required")
             return {"messages": await tg.search_messages(
                 body.chat_id, body.query, limit=body.limit,
+            )}
+        if body.op == "list_chats":
+            unread_only = False if body.unread_only is None else body.unread_only
+            return {"chats": await tg.list_chats(
+                unread_only=unread_only,
+                dms_only=body.dms_only,
+                limit=body.limit,
             )}
         if body.op == "send":
             if not body.chat_id or not body.text:

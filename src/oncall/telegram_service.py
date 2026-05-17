@@ -339,6 +339,42 @@ class TelegramService:
             })
         return out
 
+    async def list_chats(
+        self, *, unread_only: bool = False, dms_only: bool = False, limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Enumerate the user's recent Telegram dialogs (no name query).
+        Telethon returns dialogs in last-activity order. Archived chats are
+        filtered out (matches read_inbox / search_chats behaviour).
+        - `unread_only=True` keeps only dialogs with unread_count > 0.
+        - `dms_only=True` keeps only private chats (1:1)."""
+        await self._refresh_archived()
+        out: list[dict[str, Any]] = []
+        async for dlg in self._client.iter_dialogs():
+            cid = _dialog_chat_id(dlg)
+            if cid is None or cid in self._archived:
+                continue
+            is_user = bool(getattr(dlg, "is_user", False))
+            unread = int(getattr(dlg, "unread_count", 0) or 0)
+            if unread_only and unread <= 0:
+                continue
+            if dms_only and not is_user:
+                continue
+            entity = getattr(dlg, "entity", None)
+            username = (getattr(entity, "username", None) or "") if entity else ""
+            out.append({
+                "chat_id": cid,
+                "name": getattr(dlg, "name", None) or "",
+                "username": username or None,
+                "is_user": is_user,
+                "is_group": bool(getattr(dlg, "is_group", False)),
+                "is_channel": bool(getattr(dlg, "is_channel", False)),
+                "unread_count": unread,
+                "archived": False,
+            })
+            if len(out) >= limit:
+                break
+        return out
+
     async def search_messages(
         self, chat_id: str, query: str, *, limit: int = 20,
     ) -> list[dict[str, Any]]:

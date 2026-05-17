@@ -675,6 +675,115 @@ async def test_get_chat_history_skips_empty_messages(db):
 
 
 @pytest.mark.asyncio
+async def test_list_chats_returns_recent_dialogs_in_order(db):
+    """list_chats: no query, returns telethon's iter_dialogs order verbatim
+    (telethon already sorts by last activity)."""
+    client = FakeTelegramClient(dialogs=[
+        {"id": 1, "name": "Alex Smith", "username": "alex_smith",
+         "is_user": True, "unread_count": 0},
+        {"id": 2, "name": "Eng",        "username": None,
+         "is_user": False, "is_group": True, "unread_count": 3},
+        {"id": 3, "name": "News",       "username": "news_channel",
+         "is_user": False, "is_channel": True, "unread_count": 0},
+    ])
+    s = TelegramService(
+        db=db, client=client,
+        important_senders=set(), important_keywords=set(),
+    )
+    await s.start()
+    try:
+        rows = await s.list_chats()
+    finally:
+        await s.stop()
+    assert [r["chat_id"] for r in rows] == ["1", "2", "3"]
+    assert rows[1] == {
+        "chat_id": "2", "name": "Eng", "username": None,
+        "is_user": False, "is_group": True, "is_channel": False,
+        "unread_count": 3, "archived": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_chats_unread_only_filter(db):
+    client = FakeTelegramClient(dialogs=[
+        {"id": 1, "name": "A", "unread_count": 0, "is_user": True},
+        {"id": 2, "name": "B", "unread_count": 5, "is_user": True},
+        {"id": 3, "name": "C", "unread_count": 0, "is_user": True},
+        {"id": 4, "name": "D", "unread_count": 1, "is_user": True},
+    ])
+    s = TelegramService(
+        db=db, client=client,
+        important_senders=set(), important_keywords=set(),
+    )
+    await s.start()
+    try:
+        rows = await s.list_chats(unread_only=True)
+    finally:
+        await s.stop()
+    assert [r["chat_id"] for r in rows] == ["2", "4"]
+
+
+@pytest.mark.asyncio
+async def test_list_chats_dms_only_filter(db):
+    client = FakeTelegramClient(dialogs=[
+        {"id": 1, "name": "DM Alice",  "is_user": True},
+        {"id": 2, "name": "Eng group", "is_user": False, "is_group": True},
+        {"id": 3, "name": "DM Bob",    "is_user": True},
+        {"id": 4, "name": "Channel",   "is_user": False, "is_channel": True},
+    ])
+    s = TelegramService(
+        db=db, client=client,
+        important_senders=set(), important_keywords=set(),
+    )
+    await s.start()
+    try:
+        rows = await s.list_chats(dms_only=True)
+    finally:
+        await s.stop()
+    assert [r["chat_id"] for r in rows] == ["1", "3"]
+    assert all(r["is_user"] for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_list_chats_excludes_archived(db):
+    """Archived dialogs are filtered out automatically (matches search_chats /
+    read_inbox behavior). The cache is populated via the iter_dialogs(archived=True)
+    path under the hood."""
+    client = FakeTelegramClient(dialogs=[
+        {"id": 1, "name": "Active",   "is_user": True, "archived": False},
+        {"id": 2, "name": "Archived", "is_user": True, "archived": True},
+        {"id": 3, "name": "Active2",  "is_user": True, "archived": False},
+    ])
+    s = TelegramService(
+        db=db, client=client,
+        important_senders=set(), important_keywords=set(),
+    )
+    await s.start()
+    try:
+        rows = await s.list_chats()
+    finally:
+        await s.stop()
+    assert [r["chat_id"] for r in rows] == ["1", "3"]
+
+
+@pytest.mark.asyncio
+async def test_list_chats_respects_limit(db):
+    client = FakeTelegramClient(dialogs=[
+        {"id": i, "name": f"chat {i}", "is_user": True} for i in range(50)
+    ])
+    s = TelegramService(
+        db=db, client=client,
+        important_senders=set(), important_keywords=set(),
+    )
+    await s.start()
+    try:
+        rows = await s.list_chats(limit=7)
+    finally:
+        await s.stop()
+    assert len(rows) == 7
+
+
+@pytest.mark.asyncio
 async def test_ignore_does_not_block_legitimate_senders(db):
     """Sanity: the ignore set must only block matching senders. Others go
     through normally."""

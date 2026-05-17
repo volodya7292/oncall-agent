@@ -13,7 +13,7 @@ A personal on-call agent that the user can reach over voice from a phone to dele
 
 The classifier is the universal gate — it doesn't care whether a command is local Bash, an SSH wrapper, or a DB query. Each tool name has a per-tool classification rule; the Bash classifier additionally walks the command syntax to decide if the underlying program + args are read-only or mutating.
 
-### Reframed scope (per user, 2026-05-16)
+### Scope
 **Voice is deferred.** It will live as a thin client on top of the agent (e.g., an Android app calling the agent over HTTPS). The current focus is **the agent API and its safety core**. Telephony/STT/TTS is out of scope for this iteration — design with a clean "voice gateway" interface so it can be bolted on later without architectural changes.
 
 ### Core architectural commitments (decided)
@@ -31,7 +31,7 @@ The classifier is the universal gate — it doesn't care whether a command is lo
 - **Operator runtime: Ollama-hosted Gemma**, local. Default model `gemma3:latest` (user said "gemma4" — Gemma 4 isn't a widely-released ID yet; the model is a config knob via `ONCALL_OPERATOR_MODEL`, swap freely). HTTP `/api/chat` with tool-calling. Operator handles dialogue, status questions, reading inbox, dispatching tasks, presenting approvals.
 - **Executor runtime: the `claude` CLI, NOT the Agent SDK.** The orchestrator spawns `claude` as a subprocess per task with `--print --output-format stream-json --input-format stream-json`, parses streaming JSON events, and supervises session lifecycle via `--session-id` / `--resume`. Rationale per user directive (2026-05-16): fewer dependencies, no SDK version drift, the CLI already implements the full permission pipeline.
 - **Permission chokepoint = CLI flags.** Deterministic gate is `.claude/settings.json` `permissions.deny` + `permissions.allow` + `--permission-mode`. The escalation hook is `--permission-prompt-tool mcp__oncall__approve`, pointing at an MCP tool we own (the broker). That MCP tool implements the read-back / challenge-phrase contract.
-- **MCP servers we provide** (registered inline via `--mcp-config <json>` at spawn time by the supervisor): `oncall` (the approval broker + domain tools like `ssh_exec`, `web_search`, `messenger_read`). Built-in CLI tools (Bash, Read, Edit, Write, Grep, Glob) are used directly with the allow/deny rules; mutations route through the broker via `--permission-prompt-tool`.
+- **MCP servers we provide** (registered inline via `--mcp-config <json>` at spawn time by the supervisor): `oncall` (the approval broker + `messenger_inbox`). Built-in CLI tools (Bash, Read, Edit, Write, Grep, Glob, WebFetch) are used directly with the allow/deny rules; mutations route through the broker via `--permission-prompt-tool`. SSH and DB access happen via Bash (`ssh …`, `psql -c …`) under the same classifier rules as everything else.
 - **Durable state:** SQLite file (single-user; migrate to Postgres later if needed).
 - **Telephony:** deferred — defined behind an interface so any client (Android app, future SIP gateway, CLI) can drive approvals.
 - **Messenger: Telegram is the primary** (per user, 2026-05-16) — and it's a *userbot*, not a bot account. The agent reads and sends as the user's own Telegram account via MTProto (`telethon`). Bot accounts can't see inbound DMs from arbitrary people; only userbots can, which is what this flow requires. Other messengers (Slack/Discord/etc.) bolt on later via the `MessengerProvider` Protocol.
@@ -102,7 +102,7 @@ The operator is just one of several possible HTTP clients. A test CLI, a future 
     ├── ollama_client.py                # /api/chat HTTP wrapper with tool-calling
     ├── operator.py                      # Gemma loop + operator-tool dispatch
     ├── api.py                          # FastAPI: /chat, /tasks, /approvals, SSE
-    ├── mcp_server.py                   # stdio MCP: approve, ssh_exec, db_query, web_search, messenger_inbox
+    ├── mcp_server.py                   # stdio MCP: approve, messenger_inbox (ssh/db/web handled by Bash + native WebFetch)
     ├── telegram_listener.py            # long-lived telethon userbot: NewMessage → SQLite + event bus
     └── main.py                         # entrypoints: `oncall api`, `oncall mcp`, `oncall telegram-login`
 └── tests/
@@ -145,7 +145,6 @@ def build_argv(task, *, resuming, paths, mcp_inline_json):
         "--append-system-prompt", paths.executor_prompt.read_text(),
         "--model", task.model or "sonnet",
         "--max-turns", str(task.max_turns or 40),
-        "--disallowedTools", "WebFetch",       # route via mcp__oncall__web_search instead
     ]
     if resuming:
         argv += ["--resume", task.session_id]
@@ -247,11 +246,8 @@ Per-tool dispatch. The `Bash` case is the hard part; everything else is a one-li
   Per-program allowlist (first token): `ls cat head tail file stat wc grep rg ack find fd tree pwd whoami id env printenv date uname hostname jq yq dig nslookup ping traceroute df du free top ps uptime which type echo printf basename dirname realpath true false test [`. Read-only subcommands by program: `git {status, diff, log, show, blame, ls-files, ls-tree, remote, config --get, rev-parse, branch --list, tag --list}`; `kubectl {get, describe, logs, top, version, config view, api-resources, api-versions, explain}`; `docker {ps, inspect, logs, images, version, info, history}`; `aws` with read-only verbs `{describe-*, list-*, get-*, head-*}`; `gcloud` with read-only verbs `{describe, list, get-*}`; `psql -c '<SELECT|EXPLAIN|SHOW>...'` (best-effort SQL parse via `sqlglot`); `redis-cli` with read-only commands `{GET, MGET, HGET, HGETALL, KEYS, SCAN, DBSIZE, INFO, TYPE, EXISTS, TTL, PTTL, OBJECT, CLIENT LIST, MEMORY STATS}`.
   
   Catastrophic regexes (settings.json deny is the real backstop; classifier mirrors as the second line): `rm -rf /`, `rm -rf ~`, `dd .* of=/dev/`, `mkfs(\.|$)`, `:(){:|:&};:`, `chmod -R 777 /`, `shutdown`, `reboot`, `halt`, `curl .* \| (ba)?sh`, `wget .* \| (ba)?sh`. Anything else not classifiable as readonly → mutating.
-- `mcp__oncall__ssh_exec`: recursively classify the inner `command` with same Bash rules; if `host` is in `prod_hosts`, promote everything to mutating regardless.
-- `mcp__oncall__db_query`: input `{connection: str, sql: str}`. Parse SQL with `sqlglot`; auto-allow if the top-level statement is `SELECT`, `EXPLAIN`, `SHOW`, `DESCRIBE`, `WITH ... SELECT` (no CTE writes). Anything else (`INSERT`/`UPDATE`/`DELETE`/`CREATE`/`DROP`/`ALTER`/`TRUNCATE`/`GRANT`/`COPY ... FROM`) → mutating. If `connection` resolves to a prod DSN in env, promote to mutating regardless. (See §10 for the MCP tool.)
-- `mcp__oncall__web_search` → readonly.
 - `mcp__oncall__messenger_inbox` with `op ∈ {list, read}` → readonly; else mutating.
-- `WebFetch` → disallowed at CLI level; if seen, deny.
+- `WebFetch` → readonly (allowed at CLI level).
 - Unknown tool name → mutating (default-deny posture).
 
 Returns:
@@ -424,9 +420,6 @@ Event bus: in-process asyncio pub/sub. Events also appended to `task_events` so 
 
 Single stdio server, name `oncall`. Tools:
 - `approve` — §4.
-- `ssh_exec` (`{host, command, timeout_s?}`) — MVP `LocalSSHKeyCredentialProvider` stub (just shells out to `ssh`); `CredentialProvider` Protocol for SSM/Teleport later.
-- `db_query` (`{connection, sql, params?}`) — first-class DB access. Connections are named in `~/.oncall/connections.toml` (DSN never appears in tool input, only the name). MVP supports postgres (`asyncpg`) and the named connection's user is enforced read-only at the DB level for connections marked `readonly = true` in the config — defense in depth on top of the classifier's SQL parsing. Results returned as JSON rows (capped at N rows). Future: `redis`, `mongo`, `mysql`.
-- `web_search` (`{query, n?}`) — MVP returns fixed result; `WebSearchProvider` Protocol for Brave/Tavily.
 - `messenger_inbox` (`{op, chat_id?, message_id?, text?}`) — Telegram-backed via `telethon`. Operations:
   - `list` (readonly) — returns recent unread DMs from the `messenger_inbox` SQLite table (telethon listener writes here on `NewMessage`).
   - `read` (readonly) — fetch one message's full thread context.
@@ -563,8 +556,7 @@ dependencies = [
     "mcp>=1.2",
     "aiosqlite>=0.20",
     "python-dotenv>=1.0",
-    "sqlglot>=25",            # SQL parsing for db_query classifier
-    "asyncpg>=0.30",          # postgres for db_query MVP
+    "sqlglot>=25",            # SQL parsing inside `psql -c '...'` classification
     "bashlex>=0.18",          # bash AST for compositional classifier
     "telethon>=1.36",         # Telegram userbot (MTProto)
 ]
@@ -581,7 +573,7 @@ Bootstrap: `uv sync`. Run orchestrator: `uv run oncall api`. MCP child (spawned 
 ONCALL_TOKEN=replace-with-long-random-string
 ONCALL_PORT=8765
 ONCALL_DB_PATH=~/.oncall/state.db
-ONCALL_PROD_HOSTS=                       # comma-separated; matches in classifier promote ssh_exec → mutating
+ONCALL_PROD_HOSTS=                       # comma-separated; matches in classifier promote `ssh <host> …` → mutating
 ONCALL_OPERATOR_MODEL=gemma3:latest       # or whichever Gemma you've pulled
 ONCALL_OLLAMA_URL=http://localhost:11434
 ANTHROPIC_API_KEY=                       # if not using subscription auth
@@ -630,19 +622,16 @@ Acceptance:
 3. Mutating task: operator reads canonical command + blast radius + challenge phrase verbatim. User says the phrase in next `/chat`; operator calls `submit_approval_response`; task completes.
 4. User says "stop everything" mid-task → pre-filter routes to kill, task killed.
 
-**Milestone 3 — domain tools + Telegram.**
-- `ssh_exec` (LocalSSHKey stub)
-- `db_query` (postgres via asyncpg + sqlglot SELECT-only parsing + `connections.toml`)
-- `web_search` (Brave or Tavily)
+**Milestone 3 — Telegram.**
 - `messenger_inbox` backed by Telegram via telethon:
   - `telegram_listener.py` boots with `oncall api`, registers `NewMessage` handler, writes inbound DMs to `messenger_inbox`, publishes `messenger.received` events.
   - Operator triage rule: `is_important = (sender_username in TELEGRAM_IMPORTANT_SENDERS) or any(k in body.lower() for k in TELEGRAM_IMPORTANT_KEYWORDS)`. Set on insert.
   - Reply-by-proposal (§7): operator drafts → user approves via `/chat` → `submit_approval_response` on the send approval → telethon `client.send_message(chat_id, text)` → record `replied_message_id`.
 
 Acceptance:
-- (a) operator dispatches a task that ssh's to a local sshd container and runs `ls`.
-- (b) `SELECT count(*) FROM …` via `db_query` auto-allows; reports number.
-- (c) `UPDATE` via `db_query` gets gated for voice approval.
+- (a) operator dispatches a task that ssh's to a local sshd container and runs `ls` via Bash; classifier-gated.
+- (b) `psql -c 'SELECT count(*) FROM …'` via Bash auto-allows; reports number.
+- (c) `psql -c 'UPDATE …'` via Bash gets gated for approval.
 - (d) Send a Telegram DM to the user's account from a second test account; verify `messenger_inbox` row appears with `is_important=1` (keyword match); verify operator pushes a proactive notification on `/chat/{id}/events` proposing a reply; approve the reply; verify the message arrives in Telegram from the user's account.
 
 **Milestone 4 — voice client.** Out of scope for current iteration. The seams are `/chat` (text in, text out) and `/chat/{id}/events` (SSE). Any voice frontend pipes STT → `/chat` → TTS, with separate handling for the SSE stream.
@@ -684,4 +673,4 @@ Acceptance:
 7. `src/oncall/api.py` + `src/oncall/main.py` — milestone 1 ships here.
 8. `prompts/executor_system.md`, `prompts/operator_system.md`.
 9. `src/oncall/ollama_client.py` + `src/oncall/operator.py` — milestone 2.
-10. Domain tools (`ssh_exec`, `db_query`, `web_search`) + `telegram_listener.py` + `messenger_inbox` via telethon — milestone 3.
+10. `telegram_listener.py` + `messenger_inbox` via telethon — milestone 3.

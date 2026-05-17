@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -29,6 +30,7 @@ from .audit import fmt, telegram_log
 from .broker import Broker
 from .db import Database
 from .events import EventBus
+from .models import TaskState
 from .operator import Operator
 
 
@@ -272,8 +274,14 @@ class TelegramBotService:
             return
         if text.startswith("/help"):
             await self._send(chat_id, (
-                "/start — greeting\n/help — this\nAnything else is a chat turn."
+                "/start — greeting\n"
+                "/status — snapshot of running tasks, queue, approvals, unread DMs\n"
+                "/help — this\n"
+                "Anything else is a chat turn."
             ))
+            return
+        if text.startswith("/status"):
+            await self._send(chat_id, await self._render_status())
             return
 
         telegram_log.info("bot inbound " + fmt(
@@ -294,6 +302,84 @@ class TelegramBotService:
             session=self._session_id, len=len(reply),
             tool_calls=len(result.tool_calls_made),
         ))
+
+    # ---- /status renderer ----
+
+    async def _render_status(self) -> str:
+        """Build a one-message snapshot of the orchestrator's state. Queries
+        the DB directly (no operator turn) so /status stays cheap and never
+        waits behind a busy chat session."""
+        if self._db is None:
+            return "Status unavailable (DB not wired)."
+
+        running = await self._db.list_tasks_in_states(TaskState.RUNNING)
+        queued = await self._db.list_tasks_in_states(TaskState.PENDING)
+        awaiting = await self._db.list_tasks_in_states(TaskState.AWAITING_APPROVAL)
+        approvals = await self._db.list_pending_approvals()
+        unread = await self._db.list_inbox(unread_only=True, limit=200)
+
+        # Sort lists deterministically: running by age (oldest first — longest
+        # in flight deserves attention), queued by created_at (FIFO).
+        running.sort(key=lambda t: t.created_at)
+        queued.sort(key=lambda t: t.created_at)
+
+        lines = [
+            "oncall status",
+            "",
+            f"Tasks: {len(running)} running, {len(queued)} queued, "
+            f"{len(awaiting)} awaiting approval",
+            f"Approvals pending: {len(approvals)}",
+            f"Unread DMs: {len(unread)}",
+        ]
+
+        if running:
+            lines += ["", "Running:"]
+            for t in running[:5]:
+                lines.append(f"- {str(t.id)[:6]} ({_age(t.created_at)}): {_truncate(t.prompt, 70)}")
+            if len(running) > 5:
+                lines.append(f"- ...and {len(running) - 5} more")
+
+        if queued:
+            lines += ["", "Queued:"]
+            for t in queued[:5]:
+                lines.append(f"- {str(t.id)[:6]}: {_truncate(t.prompt, 70)}")
+            if len(queued) > 5:
+                lines.append(f"- ...and {len(queued) - 5} more")
+
+        # Operator-side state: model, memory size, this session's context
+        # usage, last compression checkpoint. Cheap — DB reads only.
+        try:
+            op = await self._operator.get_status(self._session_id)
+        except Exception:
+            log.exception("operator.get_status failed for /status")
+            op = None
+
+        if op is not None:
+            lines += ["", "Operator:"]
+            lines.append(f"- model: {op['model']}")
+            lines.append(f"- memory: {op['memory_entries']} entries")
+            est = op["estimated_context_tokens"]
+            thr = op["compression_threshold_tokens"]
+            pct = (100 * est // thr) if thr else 0
+            lines.append(
+                f"- context: ~{est} tokens / {thr} threshold ({pct}%, "
+                f"{op['session_messages_since_summary']} msgs since last compression)"
+            )
+            last = op["latest_summary"]
+            if last:
+                created = last.get("created_at") or ""
+                lines.append(
+                    f"- last compression: {_relative_age(created)} "
+                    f"(through msg #{last['through_message_id']}, "
+                    f"~{last['estimated_token_count']} summary tokens)"
+                )
+            else:
+                lines.append("- last compression: none yet")
+
+        if not (running or queued or approvals or unread) and op is None:
+            return "All quiet. No tasks, no pending approvals, no unread DMs."
+
+        return "\n".join(lines)
 
     # ---- chat.reply auto-ping subscriber ----
 
@@ -477,3 +563,43 @@ class TelegramBotService:
             await self._api.call("sendMessage", {
                 "chat_id": chat_id, "text": piece,
             })
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers (module-scope so tests can exercise them directly)
+# ---------------------------------------------------------------------------
+
+def _truncate(text: str, limit: int) -> str:
+    text = (text or "").replace("\n", " ").strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _age(when: datetime) -> str:
+    """Compact human age: 5s / 12m / 3h / 4d. `when` is timezone-aware UTC
+    (Task.created_at)."""
+    return _format_seconds((datetime.now(timezone.utc) - when).total_seconds())
+
+
+def _relative_age(iso_string: str) -> str:
+    """Age of an ISO-formatted timestamp string. Returns 'unknown' if it
+    can't be parsed."""
+    try:
+        when = datetime.fromisoformat(iso_string)
+    except (TypeError, ValueError):
+        return "unknown"
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return _format_seconds((datetime.now(timezone.utc) - when).total_seconds()) + " ago"
+
+
+def _format_seconds(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h"
+    return f"{hours // 24}d"

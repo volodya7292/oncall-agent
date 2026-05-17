@@ -22,6 +22,7 @@ from uuid import UUID
 from .audit import fmt, operator_log
 from .broker import Broker
 from .config import Paths, Settings
+from . import chat_summary
 from .db import Database
 from .lifecycle import Lifecycle
 from .local_claude import ClaudeCliRunner, OneShotRunner
@@ -281,6 +282,51 @@ OPERATOR_TOOLS: list[dict[str, Any]] = [
                 "properties": {
                     "chat_id": {"type": "string"},
                     "limit": {"type": "integer", "default": 10},
+                },
+                "required": ["chat_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_chats",
+            "description": (
+                "Enumerate the user's recent Telegram dialogs in last-activity "
+                "order (no query needed). Use when the user asks 'show me my "
+                "chats' / 'what's been active'. Distinct from `search_chats` "
+                "(requires a query) and `read_inbox` (unread-only). Pass "
+                "`unread_only=true` for unread-only, `dms_only=true` to skip "
+                "groups/channels."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "unread_only": {"type": "boolean", "default": False},
+                    "dms_only": {"type": "boolean", "default": False},
+                    "limit": {"type": "integer", "default": 20},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "summarize_chat",
+            "description": (
+                "Summarize the recent history of one Telegram chat via Sonnet. "
+                "Use for 'what did we talk about with X' / 'TL;DR my "
+                "conversation with Y'. Pass optional `focus` to narrow "
+                "(e.g. 'focus on the redis migration'). Slower than read_chat "
+                "(~5-15s) — for short windows just call read_chat and read the "
+                "messages directly."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chat_id": {"type": "string"},
+                    "focus": {"type": "string"},
+                    "limit": {"type": "integer", "default": 200},
                 },
                 "required": ["chat_id"],
             },
@@ -692,6 +738,33 @@ class Operator:
             "estimated_token_count": est,
         }
 
+    # ---- introspection (for /status surfaces) ----
+
+    async def get_status(self, session_id: str) -> dict[str, Any]:
+        """Cheap snapshot of operator-side state for /status. Reads only what's
+        in the DB + in-memory configuration; no LLM round-trip."""
+        summary = await self._db.get_latest_chat_summary(session_id)
+        since_id = summary["through_message_id"] if summary else 0
+        history = await self._db.load_chat_history(
+            session_id, since_id=since_id, limit=2000,
+        )
+        return {
+            "model": self._settings.oncall_operator_model,
+            "memory_entries": len(self._memory.entries()),
+            "compression_threshold_tokens": self._settings.oncall_compression_threshold_tokens,
+            "session_id": session_id,
+            "session_messages_since_summary": len(history),
+            "estimated_context_tokens": _estimate_tokens(summary, history),
+            "latest_summary": (
+                {
+                    "through_message_id": summary["through_message_id"],
+                    "estimated_token_count": summary["estimated_token_count"],
+                    "created_at": summary["created_at"],
+                }
+                if summary else None
+            ),
+        }
+
     # ---- tool execution ----
 
     async def _execute_tool(
@@ -807,6 +880,7 @@ class Operator:
         if name in (
             "read_inbox", "read_chat_style", "mark_inbox_read",
             "read_chat", "search_chats", "search_messages",
+            "list_chats", "summarize_chat",
         ):
             if self._telegram is None:
                 return {"error": "telegram not configured"}
@@ -861,6 +935,35 @@ class Operator:
                 except Exception as e:
                     return {"error": f"{type(e).__name__}: {e}"}
                 return {"chat_id": chat_id, "query": q, "messages": msgs}
+            if name == "list_chats":
+                try:
+                    chats = await self._telegram.list_chats(
+                        unread_only=bool(args.get("unread_only", False)),
+                        dms_only=bool(args.get("dms_only", False)),
+                        limit=int(args.get("limit") or 20),
+                    )
+                except Exception as e:
+                    return {"error": f"{type(e).__name__}: {e}"}
+                return {"chats": chats}
+            if name == "summarize_chat":
+                chat_id = str(args.get("chat_id") or "")
+                if not chat_id:
+                    return {"error": "chat_id required"}
+                focus_raw = args.get("focus")
+                focus = str(focus_raw).strip() if focus_raw else None
+                try:
+                    summary = await chat_summary.summarize_chat(
+                        self._telegram,
+                        self._runner,
+                        chat_id,
+                        limit=int(args.get("limit") or 200),
+                        focus=focus or None,
+                    )
+                except Exception as e:
+                    return {"error": f"{type(e).__name__}: {e}"}
+                if summary is None:
+                    return {"chat_id": chat_id, "error": "summarization unavailable"}
+                return {"chat_id": chat_id, "summary": summary}
             if name == "mark_inbox_read":
                 inbox_id = str(args.get("inbox_id") or "")
                 if not inbox_id:

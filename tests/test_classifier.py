@@ -256,7 +256,10 @@ def test_mcp_messenger_send_mutating() -> None:
     assert "AS the user" in v.blast_radius
 
 
-@pytest.mark.parametrize("op", ["list", "read", "mark_read", "style"])
+@pytest.mark.parametrize("op", [
+    "list", "read", "mark_read", "style",
+    "history", "search", "search_messages", "list_chats",
+])
 def test_mcp_messenger_readonly_ops(op: str) -> None:
     v = classify("mcp__oncall__messenger_inbox", {"op": op})
     assert v.kind == ClassifierVerdict.READONLY

@@ -16,6 +16,7 @@ telethon at all. They cover:
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -28,10 +29,14 @@ from oncall.db import Database
 from oncall.events import EventBus
 from oncall.models import ApprovalRequest, ClassifierVerdict, Task
 from oncall.operator import OperatorTurnResult
+from oncall.models import TaskState
 from oncall.telegram_bot import (
     TelegramBotService,
     bot_session_id,
     chunk_message,
+    _format_seconds,
+    _relative_age,
+    _truncate,
 )
 
 
@@ -72,13 +77,32 @@ class FakeBotApi:
 
 
 class FakeOperator:
-    def __init__(self, reply_text: str = "got it") -> None:
+    def __init__(
+        self, reply_text: str = "got it",
+        status: dict[str, Any] | None = None,
+    ) -> None:
         self.reply_text = reply_text
         self.calls: list[dict[str, Any]] = []
+        self.status_payload = status
+        self.status_calls: list[str] = []
 
     async def chat_turn(self, *, session_id: str, user_text: str, language=None) -> OperatorTurnResult:
         self.calls.append({"session_id": session_id, "user_text": user_text, "language": language})
         return OperatorTurnResult(text=self.reply_text, tool_calls_made=[])
+
+    async def get_status(self, session_id: str) -> dict[str, Any]:
+        self.status_calls.append(session_id)
+        if self.status_payload is not None:
+            return self.status_payload
+        return {
+            "model": "openai/test-model",
+            "memory_entries": 0,
+            "compression_threshold_tokens": 64000,
+            "session_id": session_id,
+            "session_messages_since_summary": 0,
+            "estimated_context_tokens": 0,
+            "latest_summary": None,
+        }
 
 
 def _msg(*, sender_id: int, text: str, chat_id: int = 999, update_id: int = 1) -> dict:
@@ -583,3 +607,161 @@ async def _model_request(db: Database, approval_id: UUID) -> ApprovalRequest:
         blast_radius=row["blast_radius"],
         challenge_phrase=row["challenge_phrase"],
     )
+
+
+# ---------------------------------------------------------------------------
+# /status — render & dispatch
+# ---------------------------------------------------------------------------
+
+async def _make_bot_with_db(
+    db: Database, bus: EventBus, api: FakeBotApi, operator: FakeOperator,
+) -> TelegramBotService:
+    """Bot wired with a real DB (so /status can query state). No broker
+    needed — these tests don't exercise the approval path."""
+    svc = TelegramBotService(
+        api=api, operator=operator, events=bus, owner_user_id=OWNER_ID, db=db,
+    )
+    await svc.start()
+    return svc
+
+
+@pytest.mark.asyncio
+async def test_status_all_quiet(db, bus):
+    """No tasks, no approvals, no unread DMs → terse 'all quiet' line."""
+    api = FakeBotApi()
+    # Operator returns None so all-quiet branch fires.
+    operator = FakeOperator()
+    svc = await _make_bot_with_db(db, bus, api, operator)
+    try:
+        # Force the "no operator" branch so it returns the all-quiet string.
+        operator.status_payload = None
+        # Override: cause get_status to raise so op stays None.
+        async def boom(_sid):
+            raise RuntimeError("nope")
+        operator.get_status = boom  # type: ignore[method-assign]
+        text = await svc._render_status()
+    finally:
+        await svc.stop()
+    assert text == "All quiet. No tasks, no pending approvals, no unread DMs."
+
+
+@pytest.mark.asyncio
+async def test_status_summarizes_tasks_approvals_inbox_and_operator(db, bus):
+    api = FakeBotApi()
+    operator = FakeOperator(status={
+        "model": "openai/gpt-oss-20b",
+        "memory_entries": 7,
+        "compression_threshold_tokens": 64000,
+        "session_id": bot_session_id(OWNER_ID),
+        "session_messages_since_summary": 12,
+        "estimated_context_tokens": 16000,
+        "latest_summary": None,
+    })
+    svc = await _make_bot_with_db(db, bus, api, operator)
+    try:
+        await db.insert_task(Task(
+            session_id=str(uuid4()), prompt="check staging health",
+            state=TaskState.RUNNING,
+        ))
+        await db.insert_task(Task(
+            session_id=str(uuid4()), prompt="refactor auth handler",
+            state=TaskState.PENDING,
+        ))
+        await db.insert_task(Task(
+            session_id=str(uuid4()), prompt="anything",
+            state=TaskState.AWAITING_APPROVAL,
+        ))
+        # Seed an unread inbox row.
+        await db.record_inbox(
+            inbox_id="i1", platform="telegram", chat_id="999",
+            message_id="1", sender_username="alex",
+            sender_display_name="Alex", body="hi",
+            is_important=False,
+            received_at=datetime(2026, 5, 17, tzinfo=timezone.utc),
+        )
+        text = await svc._render_status()
+    finally:
+        await svc.stop()
+    # Top-line summary counts.
+    assert "1 running, 1 queued, 1 awaiting approval" in text
+    assert "Unread DMs: 1" in text
+    # Task previews surface.
+    assert "check staging health" in text
+    assert "refactor auth handler" in text
+    # Operator section is rendered.
+    assert "openai/gpt-oss-20b" in text
+    assert "7 entries" in text
+    assert "16000 tokens" in text and "64000 threshold" in text
+    assert "25%" in text                # 16000 / 64000
+    assert "12 msgs since last compression" in text
+    assert "none yet" in text           # latest_summary was None
+    # get_status was called with the bot's session_id.
+    assert operator.status_calls == [bot_session_id(OWNER_ID)]
+
+
+@pytest.mark.asyncio
+async def test_status_command_ignored_from_non_owner(db, bus):
+    """Slash commands inherit the owner gate — a stranger sending /status
+    must get nothing back and must NOT touch the DB/operator path."""
+    api = FakeBotApi()
+    operator = FakeOperator()
+    svc = await _make_bot_with_db(db, bus, api, operator)
+    try:
+        await svc._dispatch(_msg(sender_id=99999, text="/status")["message"])
+        assert api.sent == []
+        assert operator.status_calls == []
+    finally:
+        await svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_status_command_dispatches_locally_without_operator_turn(db, bus):
+    """`/status` must NOT route to operator.chat_turn — it's a local readout."""
+    api = FakeBotApi()
+    operator = FakeOperator()
+    svc = await _make_bot_with_db(db, bus, api, operator)
+    try:
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="/status")["message"])
+        # /status is local; chat_turn must not have been invoked.
+        assert operator.calls == []
+        # Exactly one outbound message (the status snapshot).
+        assert len(api.sent) == 1
+        body = api.sent[0]["text"]
+        assert "oncall status" in body or "All quiet" in body
+    finally:
+        await svc.stop()
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers — pure functions
+# ---------------------------------------------------------------------------
+
+def test_truncate_short_passthrough():
+    assert _truncate("hello", 10) == "hello"
+
+
+def test_truncate_collapses_newlines_and_trims():
+    assert _truncate("  hi\nworld  ", 20) == "hi world"
+
+
+def test_truncate_long_gets_ellipsis():
+    out = _truncate("x" * 100, 10)
+    assert len(out) == 10 and out.endswith("…")
+
+
+@pytest.mark.parametrize("seconds,expected", [
+    (0, "0s"),
+    (45, "45s"),
+    (60, "1m"),
+    (3599, "59m"),
+    (3600, "1h"),
+    (47 * 3600, "47h"),
+    (48 * 3600, "2d"),
+])
+def test_format_seconds_buckets(seconds, expected):
+    assert _format_seconds(seconds) == expected
+
+
+def test_relative_age_unparseable_returns_unknown():
+    assert _relative_age("not a date") == "unknown"
+    assert _relative_age("") == "unknown"
