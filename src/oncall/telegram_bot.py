@@ -33,6 +33,7 @@ from .db import Database
 from .events import EventBus
 from .models import TaskState
 from .operator import Operator
+from . import service
 
 
 log = logging.getLogger(__name__)
@@ -56,6 +57,8 @@ _BOT_COMMANDS: list[dict[str, str]] = [
     {"command": "context",  "description": "export this session's history + summary as a markdown file"},
     {"command": "clear",    "description": "wipe this session's history (memory preserved)"},
     {"command": "compress", "description": "force-compress older messages into a summary"},
+    {"command": "restart",  "description": "restart the oncall service (brief downtime)"},
+    {"command": "stop",     "description": "stop the oncall service entirely (bot goes silent)"},
     {"command": "help",     "description": "list commands"},
 ]
 
@@ -428,6 +431,24 @@ class TelegramBotService:
     def _release_heavy_op(self) -> None:
         self._heavy_op_in_flight = None
 
+    async def _do_service_action(self, *, is_restart: bool) -> None:
+        """Background task that fires `service.start()` (kickstart -k) or
+        `service.stop()` (bootout) on a thread, after a brief delay so the
+        ack message to the user has time to flush. Both actions kill this
+        very daemon (launchd SIGTERMs the process), so we don't expect to
+        return from `to_thread` — control flow ends when launchd takes us
+        down. Any exception is logged before that happens."""
+        try:
+            await asyncio.sleep(0.5)
+            if is_restart:
+                await asyncio.to_thread(service.start)
+            else:
+                await asyncio.to_thread(service.stop)
+        except Exception:
+            log.exception(
+                "service-%s failed", "restart" if is_restart else "stop",
+            )
+
     # ---- polling ----
 
     async def _poll_loop(self) -> None:
@@ -498,6 +519,8 @@ class TelegramBotService:
                 "/context — export this session's chat history + latest summary as a markdown file\n"
                 "/clear — wipe this chat session's history (memory is preserved)\n"
                 "/compress — force-compress older messages into a summary now\n"
+                "/restart — restart the oncall daemon via launchctl (brief downtime)\n"
+                "/stop — stop the oncall daemon via launchctl (bot goes silent until manual start)\n"
                 "/help — this\n"
                 "Anything else is a chat turn."
             ))
@@ -543,6 +566,30 @@ class TelegramBotService:
             telegram_log.info("bot clear " + fmt(
                 session=self._session_id, **out,
             ))
+            return
+        if text.startswith("/restart") or text.startswith("/stop"):
+            # /restart → `oncall service start` (which kickstart -k's when
+            # already loaded; launchd kills + respawns the daemon).
+            # /stop    → `oncall service stop` (bootout; daemon dies, no
+            # auto-restart until the user runs `oncall service start`).
+            # Both kill the current daemon (us). We send the ack first,
+            # then schedule the actual launchctl call on a background
+            # thread with a brief sleep so the ack flushes to Telegram
+            # before launchd SIGTERMs the process.
+            is_restart = text.startswith("/restart")
+            verb = "restart" if is_restart else "stop"
+            ack = (
+                "Restarting service. Brief downtime; you'll get the "
+                "startup ping when I'm back."
+                if is_restart else
+                "Stopping service. Bot will go silent until "
+                "`oncall service start` is run manually."
+            )
+            await self._send(chat_id, ack)
+            telegram_log.info(f"bot service-{verb} requested " + fmt(
+                session=self._session_id,
+            ))
+            asyncio.create_task(self._do_service_action(is_restart=is_restart))
             return
         if text.startswith("/compress"):
             if not await self._claim_heavy_op(chat_id, "/compress"):

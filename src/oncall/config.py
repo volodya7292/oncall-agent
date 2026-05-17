@@ -83,17 +83,23 @@ class Settings(BaseSettings):
     # Operator backend: OpenAI-compatible HTTP via Vercel AI Gateway.
     # https://vercel.com/docs/ai-gateway/sdks-and-apis/python
     # Set ONCALL_OPERATOR_MODEL to a gateway model id like "openai/gpt-oss-20b".
-    oncall_operator_model: str = "google/gemma-4-31b-it"
-    # Reasoning level. "minimal" cuts TTFA dramatically on gemma-4-31b-it
-    # (7s → 1s) by suppressing the model's default ~150-300-token internal
-    # monologue, which we don't need for routing/dispatch decisions. Set to
-    # None to leave the dial unset.
-    oncall_operator_reasoning_effort: str | None = "minimal"
+    # Default is gemini-3.1-flash-lite via AI Studio: ~0.45s TTFA in benches
+    # (vs ~2.8s on gemma-4-31b-it) and it natively supports ack-first
+    # (text + function_call in the same response).
+    oncall_operator_model: str = "gemini-3.1-flash-lite"
+    # Reasoning level. "low" buys ~100-160 reasoning tokens (~+0.4s TTFA on
+    # flash-lite) for noticeably better triage / memory / tool-routing
+    # decisions vs "minimal". Bench: minimal TTFA 0.43s, low TTFA 0.95s on
+    # the tool-ack-first path. Set to "minimal" to claw back the latency,
+    # or None to leave the dial unset (model default — usually "medium" or
+    # higher, which is slower than we want).
+    oncall_operator_reasoning_effort: str | None = "low"
     # Which API surface to use for the operator's LLM.
     #   "gemini" → native Google AI Studio API (google-genai SDK). Required
-    #              for ack-first behavior (model emits user-facing text in
-    #              the same response as tool calls) — the Vercel gateway's
-    #              routing strips that on gemma-4-31b-it.
+    #              for ack-first behavior on Google models (the Vercel gateway
+    #              strips assistant text when a tool_call rides in the same
+    #              response). Also required for flash-lite's thought_signature
+    #              round-trip on multi-round tool flows.
     #   "vercel" → OpenAI-compatible via Vercel AI Gateway. Useful for
     #              non-Google models (zai/, minimax/, etc).
     oncall_operator_backend: str = "gemini"

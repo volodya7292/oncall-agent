@@ -1,13 +1,19 @@
-"""User-turn fact extraction.
+"""User-turn fact-candidate suggester.
 
 Looks at the user's latest message and the immediately preceding assistant
 turn (context only — never a source of facts), and asks a cheap LLM for a
-JSON list of durable facts worth remembering. The operator never sees this
-prompt or its output; the extracted facts go straight to OperatorMemory.
+JSON list of durable fact CANDIDATES the operator might want to remember.
+The candidates are NOT auto-saved; the operator is auto-pinged with the
+suggestions and decides which (if any) to commit via its `save_memory`
+tool. This keeps the operator authoritative over what enters memory.
 
-The mental model: each fact, if absent next time, would force a clarifying
-question. So the extractor is asking "what makes this terse intent
-self-contained?" — not "what's interesting?"
+The mental model: each candidate, if absent next time, would force a
+clarifying question. So the suggester is asking "what makes this terse
+intent self-contained?" — not "what's interesting?"
+
+To avoid re-suggesting things the operator already saved during the same
+turn, callers pass `already_saved` so the suggester can exclude near-
+duplicates from its output.
 """
 
 from __future__ import annotations
@@ -29,25 +35,30 @@ _USER_CHAR_CAP = 4000
 
 
 EXTRACTOR_SYSTEM_PROMPT = """\
-You extract durable facts from a single user message to a personal on-call
-agent. Your output IS the agent's long-term memory — short, declarative,
-reusable facts that let the user phrase future requests terser without the
-agent having to ask clarifying questions.
+You suggest durable fact CANDIDATES from a single user message to a personal
+on-call agent. Your output is advisory — the agent decides which (if any)
+candidates to actually save via its `save_memory` tool. Suggest short,
+declarative, reusable facts that would let the user phrase future requests
+terser without the agent having to ask clarifying questions.
 
-You receive two pieces:
+You receive three pieces:
   - PREVIOUS_ASSISTANT (may be empty): the assistant's prior reply. CONTEXT
     ONLY — never extract facts from it. Use it to disambiguate the user
     message ("use the staging one" means nothing without the prior question).
   - USER: the user's latest message. This is the ONLY source of facts.
+  - ALREADY_SAVED (may be empty): facts the operator already committed
+    during this turn. Do NOT re-suggest any candidate that's a near-
+    duplicate of an entry here.
 
-What to extract:
+What to suggest:
   - Identifiers, hostnames, URLs, file paths, service names, project names.
   - People the user references by name/role (coworker, boss, on-call lead).
   - Conventions the user states (where staging lives, which DB is prod).
   - Schedules and preferences ("don't ping me 11pm-7am", "I prefer terse
     replies", "always use lowercase").
 
-What NOT to extract:
+What NOT to suggest:
+  - Anything already in ALREADY_SAVED (or trivially paraphrasing it).
   - Anything quoted from a third party (a DM the user is forwarding).
   - Anything the assistant said.
   - Task-specific transient state ("the error was X", "T1 is running").
@@ -56,16 +67,17 @@ What NOT to extract:
     anything credentials-shaped.
 
 Output format — JSON ONLY:
-  {"facts": ["...", "..."]}
+  {"candidates": ["...", "..."]}
 
-Each fact:
+Each candidate:
   - One declarative sentence, ≤200 chars.
   - Phrased in third person about the user where natural ("the user prefers
     terse replies"; "staging API is at api-staging.example.com:8443").
   - Self-contained — readable a year from now without the original message.
 
-If nothing memorable, return {"facts": []}. Trivial turns ("ok", "thanks",
-"hi", short questions, status checks) almost always produce no facts.
+If nothing memorable beyond what's in ALREADY_SAVED, return {"candidates": []}.
+Trivial turns ("ok", "thanks", "hi", short questions, status checks) almost
+always produce no candidates.
 """
 
 
@@ -80,16 +92,21 @@ class LLMChat(Protocol):
     ) -> dict[str, Any]: ...
 
 
-async def extract_facts(
+async def extract_candidates(
     llm: LLMChat,
     *,
     model: str,
     user_text: str,
     prev_assistant_text: str | None,
+    already_saved: list[str] | None = None,
 ) -> list[str]:
-    """Run the extractor LLM, parse the JSON response, return zero-or-more
-    facts. Raises on LLM transport failure (so the caller can surface the
-    failure to the user); a malformed/empty model response returns []."""
+    """Run the suggester LLM, parse the JSON response, return zero-or-more
+    candidate facts the operator may want to save. Raises on LLM transport
+    failure (so the caller can surface the failure to the user); a
+    malformed/empty model response returns [].
+
+    `already_saved` lists facts the operator committed during this turn —
+    passed to the model so it doesn't re-suggest near-duplicates."""
     user_block = _truncate(user_text, _USER_CHAR_CAP)
     prev_block = _truncate(prev_assistant_text or "", _PREV_ASSISTANT_CHAR_CAP)
 
@@ -97,6 +114,10 @@ async def extract_facts(
     if prev_block:
         parts.append(f"PREVIOUS_ASSISTANT:\n{prev_block}")
     parts.append(f"USER:\n{user_block}")
+    if already_saved:
+        saved_block = "\n".join(f"- {s}" for s in already_saved if s.strip())
+        if saved_block:
+            parts.append(f"ALREADY_SAVED (do not re-suggest):\n{saved_block}")
     body = "\n\n".join(parts)
 
     resp = await llm.chat(
@@ -114,10 +135,15 @@ async def extract_facts(
     data = _parse_json_loose(text)
     if not isinstance(data, dict):
         return []
-    facts = data.get("facts")
-    if not isinstance(facts, list):
+    # Accept both `candidates` (new) and `facts` (old) keys — older
+    # extractor responses or models trained on the prior prompt sometimes
+    # emit "facts" anyway, and there's no reason to drop them.
+    raw = data.get("candidates")
+    if not isinstance(raw, list):
+        raw = data.get("facts")
+    if not isinstance(raw, list):
         return []
-    return [s.strip() for s in facts if isinstance(s, str) and s.strip()]
+    return [s.strip() for s in raw if isinstance(s, str) and s.strip()]
 
 
 # ---- helpers ---------------------------------------------------------------

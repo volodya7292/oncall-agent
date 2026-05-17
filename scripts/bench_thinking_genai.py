@@ -20,7 +20,7 @@ from google import genai
 from google.genai import types
 
 
-MODEL = "gemma-4-31b-it"
+MODEL = "gemma-4-31b-it"  # overridable via --model
 
 PROMPTS: dict[str, str] = {
     "short_ack": (
@@ -65,7 +65,7 @@ DISPATCH_TOOL = types.Tool(function_declarations=[
 # Supported by GenerateContentConfig.ThinkingConfig per the SDK. We probe all
 # levels (some may be unsupported by gemma-4 and surface as an error — we
 # capture and report it rather than crashing).
-LEVELS: list[str | None] = [None, "MINIMAL"]
+LEVELS: list[str | None] = ["MINIMAL", "LOW"]
 
 
 async def _stream_round(
@@ -236,10 +236,14 @@ def _summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 async def main() -> None:
+    global MODEL
     parser = argparse.ArgumentParser()
     parser.add_argument("--iters", type=int, default=4)
     parser.add_argument("--sleep", type=float, default=0.0)
+    parser.add_argument("--model", default=MODEL,
+                        help=f"Gemini model id (default {MODEL}).")
     args = parser.parse_args()
+    MODEL = args.model
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:

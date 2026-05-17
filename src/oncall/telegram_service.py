@@ -498,6 +498,30 @@ class TelegramService:
         ))
         return {"message_id": sent_id, "chat_id": chat_id}
 
+    async def reply_to_inbox(
+        self, inbox_id: str, text: str,
+    ) -> dict[str, Any]:
+        """Send `text` to the sender of the named inbox row, mark the row read,
+        and record the outbound message id. Used by the operator's
+        `reply_to_dm` tool for memory-authorized autonomous replies.
+
+        Raises ValueError if the inbox row doesn't exist — the caller (the
+        operator tool handler) surfaces that to the model so it can recover."""
+        row = await self._db.get_inbox_message(inbox_id)
+        if row is None:
+            raise ValueError(f"inbox row {inbox_id} not found")
+        chat_id = str(row["chat_id"])
+        sent = await self.send(chat_id, text)
+        await self._db.record_inbox_reply(inbox_id, sent["message_id"])
+        return {
+            "inbox_id": inbox_id,
+            "chat_id": chat_id,
+            "message_id": sent["message_id"],
+            "sender_username": row.get("sender_username"),
+            "sender_display_name": row.get("sender_display_name"),
+            "inbound_body": row.get("body"),
+        }
+
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -629,12 +629,81 @@ async def _drain_extractions(operator: Operator) -> None:
 
 
 @pytest.mark.asyncio
-async def test_extraction_writes_facts_and_emits_breadcrumb(stack):
-    """Happy path: extractor returns facts → memory.store sees them →
-    breadcrumb assistant row appended → chat.reply event fired."""
-    main_llm = ScriptedLLM(script=["ok"])
+async def test_save_memory_tool_writes_and_emits_breadcrumb(stack):
+    """Operator-driven write path: the operator's main turn calls
+    `save_memory` → memory.store sees the fact → `_Remembered: ..._`
+    breadcrumb row appended → chat.reply event fired with the
+    `memory.breadcrumb` trigger so the bot relays it."""
+    fact = "the staging api lives at api-staging.example.com:8443"
+    # Turn 1 = save_memory + final-text reply "ok".
+    main_llm = ScriptedLLM(script=[
+        [("save_memory", {"text": fact})],
+        "ok",
+    ])
+    received: list[dict[str, Any]] = []
+
+    async def consume_events() -> None:
+        async for env in stack["events"].subscribe_global(types={"chat.reply"}):
+            received.append(env)
+
+    consumer = asyncio.create_task(consume_events())
+    try:
+        operator = Operator(
+            db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
+            settings=stack["settings"], paths=stack["paths"], llm=main_llm,
+            memory=stack["memory"],
+            events=stack["events"],
+            # No extractor — the operator drives saves itself this turn.
+        )
+        result = await operator.chat_turn(
+            session_id="s_save",
+            user_text="staging api lives at api-staging:8443",
+        )
+        assert result.text == "ok"
+        # Let publish_global push reach the subscriber queue.
+        await asyncio.sleep(0)
+    finally:
+        consumer.cancel()
+        try:
+            await consumer
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    # memory.store was called with the fact text.
+    assert stack["memory"].stored_batches == [[fact]]
+
+    # Breadcrumb row exists in chat history.
+    history = await stack["db"].load_chat_history("s_save")
+    breadcrumb_rows = [
+        r for r in history
+        if r["role"] == "assistant" and r["content"].startswith("_Remembered:")
+    ]
+    assert len(breadcrumb_rows) == 1
+    assert fact in breadcrumb_rows[0]["content"]
+
+    # chat.reply event with the memory.breadcrumb trigger was published —
+    # this is what the Telegram bot subscribes to.
+    assert any(
+        env["type"] == "chat.reply"
+        and env["payload"].get("trigger") == "memory.breadcrumb"
+        and env["payload"].get("session_id") == "s_save"
+        for env in received
+    ), received
+
+
+@pytest.mark.asyncio
+async def test_extractor_suggestion_ping_is_silent(stack):
+    """The extractor's candidate suggestions are routed to the operator
+    via a synthetic auto-ping. The operator's reply on that suggestion
+    turn — whether it's filler text or a save — must NOT produce a
+    chat.reply event of the user-visible 'main reply' kind. The user
+    only sees breadcrumbs from `save_memory` calls (trigger
+    'memory.breadcrumb'); the suggestion note itself never escapes."""
+    # Main turn: no tool calls, just a reply. Suggestion-ping turn: the
+    # operator stays silent (empty content, no tool calls).
+    main_llm = ScriptedLLM(script=["got it.", ""])
     extractor = FakeExtractorLLM(facts_per_call=[
-        ["staging api lives at api-staging.example.com:8443"],
+        ["a candidate fact the operator did not save"],
     ])
     received: list[dict[str, Any]] = []
 
@@ -652,13 +721,9 @@ async def test_extraction_writes_facts_and_emits_breadcrumb(stack):
             extract_llm=extractor,
             extract_model="test-extractor",
         )
-        result = await operator.chat_turn(
-            session_id="s_ex", user_text="staging api lives at api-staging:8443",
-        )
-        # Main reply is the script string; breadcrumb is delivered out-of-band.
-        assert result.text == "ok"
+        await operator.chat_turn(session_id="s_silent", user_text="anything")
         await _drain_extractions(operator)
-        await asyncio.sleep(0)  # let event-loop drain the publish_global push
+        await asyncio.sleep(0)
     finally:
         consumer.cancel()
         try:
@@ -666,36 +731,36 @@ async def test_extraction_writes_facts_and_emits_breadcrumb(stack):
         except (asyncio.CancelledError, Exception):
             pass
 
-    # The extractor saw exactly one chat call, with the right model.
-    assert len(extractor.calls) == 1
-    assert extractor.calls[0]["model"] == "test-extractor"
-
-    # memory.store received the extracted facts.
-    assert stack["memory"].stored_batches == [
-        ["staging api lives at api-staging.example.com:8443"],
+    # The suggestion auto-ping DID happen — the operator's main LLM got a
+    # second `chat` call whose user-message includes the candidate-note
+    # prefix our system note emits.
+    assert len(main_llm.calls_made) == 2, (
+        f"expected 2 main_llm calls (user turn + suggestion ping), "
+        f"got {len(main_llm.calls_made)}"
+    )
+    suggestion_call_user_msgs = [
+        m for m in main_llm.calls_made[1]["messages"] if m["role"] == "user"
     ]
-
-    # Breadcrumb row exists in chat history.
-    history = await stack["db"].load_chat_history("s_ex")
-    breadcrumb_rows = [
-        r for r in history
-        if r["role"] == "assistant" and r["content"].startswith("_Remembered:")
-    ]
-    assert len(breadcrumb_rows) == 1
-    assert "staging api" in breadcrumb_rows[0]["content"]
-
-    # chat.reply event with the memory.breadcrumb trigger was published.
     assert any(
-        env["type"] == "chat.reply"
-        and env["payload"].get("trigger") == "memory.breadcrumb"
-        and env["payload"].get("session_id") == "s_ex"
-        for env in received
-    ), received
+        "extractor flagged candidate memories" in m["content"]
+        for m in suggestion_call_user_msgs
+    ), suggestion_call_user_msgs
+
+    # CRITICAL: no chat.reply was published for the suggestion turn. The
+    # only valid chat.reply trigger here would be `memory.breadcrumb` (from
+    # a save_memory call); since the operator stayed silent, there should
+    # be NONE.
+    assert not received, (
+        f"silent suggestion ping must not produce chat.reply events; got "
+        f"{[(e['type'], e['payload'].get('trigger')) for e in received]}"
+    )
 
 
 @pytest.mark.asyncio
-async def test_no_facts_extracted_emits_no_breadcrumb(stack):
-    """Trivial turn ('hi') → extractor returns [] → no breadcrumb."""
+async def test_extractor_skipped_when_no_candidates(stack):
+    """Suggester returns empty → NO auto-ping is fired; the operator's
+    main LLM is called exactly once (only for the user turn), and no
+    candidate-note row exists in chat history."""
     main_llm = ScriptedLLM(script=["hello"])
     extractor = FakeExtractorLLM(facts_per_call=[[]])
 
@@ -706,17 +771,59 @@ async def test_no_facts_extracted_emits_no_breadcrumb(stack):
         events=stack["events"],
         extract_llm=extractor,
     )
-    await operator.chat_turn(session_id="s_trivial", user_text="hi")
+    await operator.chat_turn(session_id="s_empty", user_text="hi")
     await _drain_extractions(operator)
 
-    assert stack["memory"].stored_batches == [] or all(
-        b == [] for b in stack["memory"].stored_batches
-    )
-    history = await stack["db"].load_chat_history("s_trivial")
+    # Only one main_llm call — the user turn. No suggestion-ping round.
+    assert len(main_llm.calls_made) == 1
+
+    # No breadcrumb of any kind in chat history.
+    history = await stack["db"].load_chat_history("s_empty")
     assert not any(
         r["role"] == "assistant" and r["content"].startswith("_Remembered:")
         for r in history
     )
+    # No suggestion-note injected either.
+    assert not any(
+        r["role"] == "user" and "extractor flagged" in (r["content"] or "")
+        for r in history
+    )
+
+
+@pytest.mark.asyncio
+async def test_extractor_receives_operator_saves_as_already_saved(stack):
+    """When the operator commits a fact via save_memory during the main
+    turn, the extractor's prompt body includes that fact under
+    ALREADY_SAVED so it won't re-suggest a duplicate."""
+    fact = "the prod db is pg-prod-1"
+    main_llm = ScriptedLLM(script=[
+        [("save_memory", {"text": fact})],
+        "ok",
+        "",  # silent on the suggestion ping (if it happens)
+    ])
+    extractor = FakeExtractorLLM(facts_per_call=[[]])
+
+    operator = Operator(
+        db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
+        settings=stack["settings"], paths=stack["paths"], llm=main_llm,
+        memory=stack["memory"],
+        events=stack["events"],
+        extract_llm=extractor,
+        extract_model="test-extractor",
+    )
+    await operator.chat_turn(session_id="s_dedup", user_text="prod db is pg-prod-1")
+    await _drain_extractions(operator)
+
+    # Extractor was called once; its user-message body cites the already-
+    # saved fact under the ALREADY_SAVED header.
+    assert len(extractor.calls) == 1
+    user_msgs = [
+        m for m in extractor.calls[0]["messages"] if m["role"] == "user"
+    ]
+    assert user_msgs, "extractor must receive a user message"
+    body = user_msgs[0]["content"]
+    assert "ALREADY_SAVED" in body, body
+    assert fact in body, body
 
 
 @pytest.mark.asyncio

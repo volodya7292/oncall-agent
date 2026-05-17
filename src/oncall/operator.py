@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import UUID
@@ -60,10 +61,12 @@ class GenAILLMClient:
     + tools into Gemini's Contents/FunctionDeclaration shape and translates
     the response back, so it's a drop-in for `GatewayLLMClient`.
 
-    The Vercel gateway's gemma-4-31b-it routing strips assistant text when
-    a tool call is present in the same response — that kills our ack-first
-    latency optimization. The native AI Studio API preserves both parts,
-    so we use this client by default for Gemma operator models."""
+    Used by default for Google models. Two reasons over the Vercel gateway:
+    (1) the gateway strips assistant text when a tool_call is in the same
+    response, breaking ack-first; (2) gemini-3.1-flash-lite emits a
+    `thought_signature` on every function_call Part and rejects the
+    follow-up turn if we don't echo it back — we capture and re-attach it
+    via the OpenAI-style tool_call dict (`gemini_thought_signature_b64`)."""
 
     def __init__(self, api_key: str) -> None:
         from google import genai
@@ -78,6 +81,7 @@ class GenAILLMClient:
         max_tokens: int | None = None,
         reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
+        import base64
         from google.genai import types
         from uuid import uuid4
 
@@ -115,9 +119,18 @@ class GenAILLMClient:
                         args = json.loads(raw) if raw else {}
                     except json.JSONDecodeError:
                         args = {}
-                    parts.append(types.Part(function_call=types.FunctionCall(
-                        name=name, args=args,
-                    )))
+                    # gemini-3.1-flash-lite (and other thinking-enabled models)
+                    # require the model's `thought_signature` to be echoed back
+                    # on the function-call Part when we send the follow-up turn,
+                    # or round 2 fails with 400 INVALID_ARGUMENT. We stash the
+                    # signature on the OpenAI-style tool_call as a base64 string
+                    # in the response translation below; reattach it here.
+                    sig_b64 = tc.get("gemini_thought_signature_b64")
+                    sig = base64.b64decode(sig_b64) if sig_b64 else None
+                    parts.append(types.Part(
+                        function_call=types.FunctionCall(name=name, args=args),
+                        thought_signature=sig,
+                    ))
                     if tc.get("id"):
                         id_to_name[tc["id"]] = name
                 if parts:
@@ -146,15 +159,16 @@ class GenAILLMClient:
             cfg_kwargs["system_instruction"] = "\n\n".join(system_chunks)
         if max_tokens is not None:
             cfg_kwargs["max_output_tokens"] = max_tokens
-        # OpenAI's reasoning_effort levels → Gemini thinking_level. Gemma-4
-        # only accepts MINIMAL or HIGH; other levels would 400 the call, so
-        # we skip the dial rather than fail loudly. Leaving thinking_config
-        # unset means default (HIGH) — but we never want default for the
-        # operator, hence the explicit MINIMAL when caller asks for any
-        # low-effort variant.
+        # OpenAI's reasoning_effort levels → Gemini thinking_level. Valid
+        # values per the Gemini API are MINIMAL / LOW / MEDIUM / HIGH; some
+        # models accept a subset (gemma-4-31b for instance rejects LOW and
+        # MEDIUM with 400). We forward whichever level the caller picked
+        # so the API error surfaces honestly if it's unsupported, rather
+        # than silently downgrading. Anything unrecognized → fall back to
+        # MINIMAL (the latency-conservative default).
         if reasoning_effort:
             level = reasoning_effort.upper()
-            if level not in {"MINIMAL", "HIGH"}:
+            if level not in {"MINIMAL", "LOW", "MEDIUM", "HIGH"}:
                 level = "MINIMAL"
             cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=level)
         if tools:
@@ -169,27 +183,52 @@ class GenAILLMClient:
             cfg_kwargs["tools"] = [types.Tool(function_declarations=decls)]
 
         cfg = types.GenerateContentConfig(**cfg_kwargs)
-        resp = await self._client.aio.models.generate_content(
-            model=gem_model, contents=contents, config=cfg,
-        )
 
-        # Gemini → OpenAI response shape.
+        # Streaming: the non-streaming `generate_content` call typically waits
+        # for the FULL response before returning, which on gemma-4-31b lands
+        # at ~2.5–3s end-to-end. The streamed call delivers tokens as they're
+        # produced — same total time on paper, but it (a) lets callers surface
+        # the first text chunk immediately if they wire up a chunk sink, and
+        # (b) gives us per-stream wall-clock cancellation that doesn't depend
+        # on whatever retry/backoff the SDK is doing internally. We bound the
+        # whole stream at 20s — that's well above the observed p99 (~5s) and
+        # short enough that a stuck call doesn't block a session lock for
+        # minutes when the upstream is rate-limited or wedged.
         text_parts: list[str] = []
         tool_calls: list[dict[str, Any]] = []
-        for c in (resp.candidates or []):
-            if c.content and c.content.parts:
-                for part in c.content.parts:
-                    if getattr(part, "thought", False):
+
+        async def _consume() -> None:
+            stream = await self._client.aio.models.generate_content_stream(
+                model=gem_model, contents=contents, config=cfg,
+            )
+            async for chunk in stream:
+                for c in (chunk.candidates or []):
+                    if not (c.content and c.content.parts):
                         continue
-                    if part.text:
-                        text_parts.append(part.text)
-                    fc = getattr(part, "function_call", None)
-                    if fc is not None:
-                        tool_calls.append({
-                            "id": f"gemini_call_{uuid4().hex[:16]}",
-                            "name": fc.name,
-                            "arguments_json": json.dumps(dict(fc.args or {})),
-                        })
+                    for part in c.content.parts:
+                        if getattr(part, "thought", False):
+                            continue
+                        if part.text:
+                            text_parts.append(part.text)
+                        fc = getattr(part, "function_call", None)
+                        if fc is not None:
+                            entry: dict[str, Any] = {
+                                "id": f"gemini_call_{uuid4().hex[:16]}",
+                                "name": fc.name,
+                                "arguments_json": json.dumps(dict(fc.args or {})),
+                            }
+                            # Preserve the part-level thought_signature for
+                            # round-2: see the assistant-turn translation above
+                            # for why this is mandatory on flash-lite.
+                            sig = getattr(part, "thought_signature", None)
+                            if sig:
+                                entry["thought_signature_b64"] = (
+                                    base64.b64encode(sig).decode("ascii")
+                                )
+                            tool_calls.append(entry)
+
+        await asyncio.wait_for(_consume(), timeout=20.0)
+
         return {
             "role": "assistant",
             "content": "".join(text_parts),
@@ -526,6 +565,46 @@ OPERATOR_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "reply_to_dm",
+            "description": (
+                "Send a Telegram DM reply on behalf of the user, autonomously "
+                "(NO approval round-trip). ONLY for memory-authorized auto-"
+                "replies: you MUST cite the `authority_memory_id` of a memory "
+                "that explicitly authorizes a reply on behalf of the user for "
+                "THIS sender (e.g. an entry like 'if X DMs me about Y, you may "
+                "Z'). The tool verifies the memory id exists; the *semantic* "
+                "match between the memory and this sender + message is YOUR "
+                "responsibility. If you are not sure whether a memory grants "
+                "authority, DO NOT call this tool — propose the reply to the "
+                "user instead, via the regular reply-by-proposal flow. Every "
+                "call is audited."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "inbox_id": {
+                        "type": "string",
+                        "description": "id of the inbox row you are replying to.",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Verbatim reply body (already styled per `read_chat_style`).",
+                    },
+                    "authority_memory_id": {
+                        "type": "integer",
+                        "description": (
+                            "id of the persistent-memory entry that authorizes "
+                            "this autonomous reply. Obtain it via `query_memory`."
+                        ),
+                    },
+                },
+                "required": ["inbox_id", "text", "authority_memory_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "mark_inbox_read",
             "description": (
                 "Mark ONE inbox row read in the local DB. LOCAL-ONLY: this does "
@@ -541,6 +620,65 @@ OPERATOR_TOOLS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {"inbox_id": {"type": "string"}},
                 "required": ["inbox_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_memory",
+            "description": (
+                "Persist a durable fact to your long-term memory. Use this "
+                "during a turn whenever you notice something worth keeping: "
+                "a person + their context, an identifier, a preference, a "
+                "convention the user states. Resolve deictic references "
+                "first ('same for X' → spell out the full extended fact). "
+                "Phrase the fact as one self-contained declarative sentence "
+                "≤200 chars in third person about the user. Idempotent — "
+                "near-duplicate facts merge into the existing memory entry "
+                "instead of creating a new row. The system writes a "
+                "`_Remembered: ..._` breadcrumb to chat automatically; "
+                "don't echo the fact in your own reply."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": (
+                            "The fact to remember, ≤200 chars, declarative, "
+                            "self-contained."
+                        ),
+                    },
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget_memory",
+            "description": (
+                "Hard-delete ONE memory entry by id. Call this ONLY when the "
+                "user explicitly asks to forget / drop / remove a specific "
+                "stored fact (e.g. 'forget that staging is at host X', "
+                "'delete the memory about Y'). Workflow: first `query_memory` "
+                "to find the candidate id(s); if multiple plausible matches, "
+                "list them to the user and ask which one — do NOT pick "
+                "silently. NEVER call autonomously, never as housekeeping. "
+                "Memory storage is otherwise auto-managed (extraction + LRU); "
+                "this is the user's escape hatch for a specific wrong entry."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "memory_id": {
+                        "type": "integer",
+                        "description": "id from `query_memory` of the row to delete.",
+                    },
+                },
+                "required": ["memory_id"],
             },
         },
     },
@@ -621,7 +759,12 @@ class Operator:
         extract_llm: LLMClient | None = None,
         extract_model: str | None = None,
         max_history: int = 60,
-        max_tool_rounds: int = 6,
+        # 10 is enough for the worst-case drain flow (3 prep tool calls +
+        # dispatch_task + tool_status poll + reply_to_dm + a few stragglers
+        # for redundant model behavior) without giving runaway loops too
+        # much room. Bumped from 6 after observing inbox-drain triage burn
+        # the cap on prep alone.
+        max_tool_rounds: int = 10,
         runner: OneShotRunner | None = None,
     ) -> None:
         self._db = db
@@ -657,6 +800,12 @@ class Operator:
         # Strong references to in-flight extraction tasks so they aren't
         # garbage-collected while running.
         self._extraction_tasks: set[asyncio.Task[Any]] = set()
+        # Per-turn buffer of facts the operator saved via `save_memory`
+        # during the in-flight turn. Drained at extraction time so the
+        # candidate-suggester can dedup against what's already committed.
+        # Keyed by session_id; the session lock guarantees one in-flight
+        # turn at a time per key, so writes here don't race.
+        self._turn_saves: dict[str, list[str]] = {}
 
     def _lock_for(self, session_id: str) -> asyncio.Lock:
         lock = self._session_locks.get(session_id)
@@ -694,14 +843,21 @@ class Operator:
         prev_assistant_text = await self._latest_assistant_text(session_id)
         async with self._lock_for(session_id):
             result = await self._run_turn(session_id, user_text, language=language)
+            # Capture the operator's saves from THIS turn while still under
+            # the lock — otherwise a fast follow-up turn could clobber
+            # `_turn_saves[session_id]` before we read it.
+            already_saved_this_turn = list(
+                self._turn_saves.pop(session_id, [])
+            )
         # Fire-and-forget extraction. Skipped if disabled, or if this was
         # an auto-ping (those don't reach chat_turn anyway).
         if self._extract_llm is not None:
             task = asyncio.create_task(
-                self._extract_and_breadcrumb(
+                self._extract_and_propose(
                     session_id=session_id,
                     user_text=user_text,
                     prev_assistant_text=prev_assistant_text,
+                    already_saved=already_saved_this_turn,
                 ),
                 name=f"extract-{session_id}",
             )
@@ -709,19 +865,33 @@ class Operator:
             task.add_done_callback(self._extraction_tasks.discard)
         return result
 
-    async def auto_ping(self, session_id: str, note: str) -> OperatorTurnResult:
+    async def auto_ping(
+        self, session_id: str, note: str, *, retrieval_query: str | None = None,
+    ) -> OperatorTurnResult:
         """Inject a synthetic '[system note: ...]' turn into a chat session.
-        Used by the background task that re-engages the operator when a task
-        the user dispatched reaches a terminal state. No-op if the session
-        has no history (we don't manufacture context for nobody)."""
+        Used by background tasks that re-engage the operator (task terminated,
+        approval requested, inbound DM landed). No-op if the session has no
+        history (we don't manufacture context for nobody).
+
+        `retrieval_query`: when set, this string is used as the semantic
+        retrieval key for the memory section instead of skipping retrieval.
+        Pass the substance the operator should react to (e.g. an inbound DM
+        body) so memory entries about the sender / topic / preferences are
+        loaded; leave None for purely procedural pings (a task terminating)
+        where no user-meaningful content needs surfacing."""
         history = await self._db.load_chat_history(session_id, limit=1)
         if not history:
             return OperatorTurnResult(text="", tool_calls_made=[])
         async with self._lock_for(session_id):
-            return await self._run_turn(session_id, f"{AUTO_PING_PREFIX}{note}]")
+            return await self._run_turn(
+                session_id, f"{AUTO_PING_PREFIX}{note}]",
+                retrieval_query=retrieval_query,
+            )
 
     async def _run_turn(
-        self, session_id: str, user_text: str, *, language: str | None = None,
+        self, session_id: str, user_text: str, *,
+        language: str | None = None,
+        retrieval_query: str | None = None,
     ) -> OperatorTurnResult:
         await self._db.ensure_chat_session(session_id)
         await self._db.append_chat_message(session_id, "user", user_text)
@@ -730,12 +900,17 @@ class Operator:
         # idempotent: if no compression is needed, the summary returned is
         # whatever the previous summary was (possibly None).
         summary, history = await self._load_and_maybe_compress(session_id)
-        # Auto-ping turns aren't user statements, so they're not a useful
-        # retrieval key — pass None to skip retrieval. For real user turns,
-        # use the user's text as the semantic query.
-        retrieval_query = (
-            None if user_text.startswith(AUTO_PING_PREFIX) else user_text
-        )
+        # Pick the semantic retrieval key:
+        #   - Caller-supplied (e.g. inbox-drain passes the DM body so memory
+        #     about the sender / topic loads, even though user_text is the
+        #     synthetic AUTO_PING_PREFIX note).
+        #   - Otherwise: the user's own message, except for plain auto-ping
+        #     notes (task terminated, approval requested) — those aren't a
+        #     useful retrieval signal, so we skip retrieval entirely.
+        if retrieval_query is None:
+            retrieval_query = (
+                None if user_text.startswith(AUTO_PING_PREFIX) else user_text
+            )
         system_prompt = await self._build_system_prompt(retrieval_query)
         if language:
             # Language hint goes at the END of the system prompt so it overrides
@@ -767,12 +942,20 @@ class Operator:
                 model=self._settings.oncall_operator_model,
                 messages=messages,
                 tools=OPERATOR_TOOLS,
-                max_tokens=512,
+                # Gemini thinking models count `thoughts_token_count`
+                # against `max_output_tokens` — at reasoning_effort=low
+                # that's ~500–1300 tokens before any visible output, so
+                # 512 truncated replies mid-sentence. 2048 leaves ~1.5k+
+                # for the actual reply even at MEDIUM. Operator replies
+                # are still terse by prompt — this is just headroom.
+                max_tokens=2048,
                 reasoning_effort=self._settings.oncall_operator_reasoning_effort,
             )
             tc_list = resp.get("tool_calls") or []
             if not tc_list:
-                final_text = resp.get("content") or ""
+                final_text = _strip_breadcrumb_impersonation(
+                    resp.get("content") or ""
+                )
                 await self._db.append_chat_message(session_id, "assistant", final_text)
                 return OperatorTurnResult(text=final_text, tool_calls_made=tool_calls_made)
 
@@ -786,6 +969,11 @@ class Operator:
                         "id": tc["id"],
                         "type": "function",
                         "function": {"name": tc["name"], "arguments": tc["arguments_json"]},
+                        # Gemini-only metadata: preserved across DB round-trip
+                        # via assistant_tool_calls history rows. Backends that
+                        # don't need it (Vercel gateway) just ignore the key.
+                        **({"gemini_thought_signature_b64": tc["thought_signature_b64"]}
+                           if tc.get("thought_signature_b64") else {}),
                     }
                     for tc in tc_list
                 ],
@@ -1097,43 +1285,82 @@ class Operator:
                     return text
         return None
 
-    async def _extract_and_breadcrumb(
+    # Note used to wrap candidate suggestions for the silent auto-ping that
+    # follows a user turn. The operator's prompt has a matching rule —
+    # respond only with `save_memory` calls (or nothing); never narrate.
+    _CANDIDATES_NOTE_PREFIX = "extractor flagged candidate memories"
+
+    async def _extract_and_propose(
         self,
         *,
         session_id: str,
         user_text: str,
         prev_assistant_text: str | None,
+        already_saved: list[str],
     ) -> None:
-        """Run fact extraction off the hot path. On any non-empty result,
-        write the breadcrumb to chat history AND publish a chat.reply event
-        so live UIs (Telegram bot, REPL SSE) surface it to the user.
+        """Run the candidate-suggester off the hot path. The operator (not
+        this function) owns memory writes — we just route suggestions back
+        to it via a SILENT auto-ping. The operator may then call
+        `save_memory` for any candidates it judges worth keeping; if not,
+        nothing happens.
 
-        Errors here MUST be visible — they signal that memory is silently
-        breaking. We emit a `_Memory extraction failed: ..._` breadcrumb on
-        failure rather than swallow."""
+        `already_saved` is the list of facts the operator committed via
+        `save_memory` during THIS user turn — captured by chat_turn before
+        the scheduling so a fast follow-up turn can't clobber it. The
+        suggester uses it to skip near-duplicates.
+
+        Failures stay visible — we emit a `_Memory extraction failed: ..._`
+        breadcrumb so the user knows when the suggester is broken (LRU
+        otherwise hides the absence)."""
         assert self._extract_llm is not None  # checked by caller
         try:
-            facts = await memory_extractor.extract_facts(
+            candidates = await memory_extractor.extract_candidates(
                 self._extract_llm,
                 model=self._extract_model,
                 user_text=user_text,
                 prev_assistant_text=prev_assistant_text,
+                already_saved=already_saved,
             )
-            written = await self._memory.store(facts, source_turn=user_text)
         except Exception as e:
-            text = (
-                f"_Memory extraction failed: {type(e).__name__}: {e}_"
-            )
+            # Don't paste the upstream's full error body into the user's chat —
+            # SDK errors like google-genai's ClientError stringify to
+            # `429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': ...}}`
+            # and the dict is huge. Keep just the human-readable prefix.
+            msg = str(e).splitlines()[0]
+            brace = msg.find("{")
+            if brace > 0:
+                msg = msg[:brace].rstrip(" .:,-")
+            if len(msg) > 160:
+                msg = msg[:157] + "…"
+            text = f"_Memory extraction failed: {type(e).__name__}: {msg}_"
             operator_log.exception("memory extraction failed for session %s", session_id)
             await self._emit_breadcrumb(session_id, text)
             return
 
-        if not written:
+        if not candidates:
             return
-        joined = ", ".join(written)
-        if len(joined) > 120:
-            joined = joined[:117] + "…"
-        await self._emit_breadcrumb(session_id, f"_Remembered: {joined}_")
+        # SILENT suggestion auto-ping: the operator gets the candidates as
+        # a system note and may call `save_memory` for any it wants kept.
+        # We do NOT publish chat.reply for the operator's reply text on
+        # this turn — only `save_memory` calls (which emit their own
+        # breadcrumbs via the tool handler) reach the user. The operator
+        # prompt has a matching rule telling it to emit empty content.
+        bullets = "\n".join(f"  • {c}" for c in candidates)
+        note = (
+            f"{self._CANDIDATES_NOTE_PREFIX} that you did not save this "
+            f"turn. Call `save_memory` for any worth keeping; ignore the "
+            f"rest. Emit empty assistant content — no text reply.\n"
+            f"{bullets}"
+        )
+        try:
+            await self.auto_ping(
+                session_id=session_id, note=note, retrieval_query=None,
+            )
+        except Exception:
+            operator_log.exception(
+                "candidate-suggestion auto-ping failed for session %s",
+                session_id,
+            )
 
     async def _emit_breadcrumb(self, session_id: str, text: str) -> None:
         """Append the breadcrumb to chat history (so future turns and
@@ -1257,6 +1484,58 @@ class Operator:
             ok = await self._lifecycle.kill(tid, reason="kill_phrase")
             return {"killed": ok}
 
+        if name == "save_memory":
+            text = str(args.get("text") or "").strip()
+            if not text:
+                return {"error": "text required"}
+            written = await self._memory.store(
+                [text], source_turn=chat_session_id,
+            )
+            # Track for the extractor pass so it doesn't re-suggest a
+            # near-duplicate of what we just wrote.
+            self._turn_saves.setdefault(chat_session_id, []).extend(written)
+            operator_log.info("save_memory " + fmt(
+                chat=chat_session_id, written=len(written), text=text,
+            ))
+            # Breadcrumb. We're inside _execute_tool, which runs under the
+            # session lock — so we append + publish directly instead of
+            # going through _emit_breadcrumb (which re-acquires the lock
+            # and would deadlock).
+            if written:
+                joined = ", ".join(written)
+                if len(joined) > 400:
+                    joined = joined[:397] + "…"
+                breadcrumb = f"_Remembered: {joined}_"
+                await self._db.append_chat_message(
+                    chat_session_id, "assistant", breadcrumb,
+                )
+                if self._events is not None:
+                    await self._events.publish_global("chat.reply", {
+                        "session_id": chat_session_id,
+                        "text": breadcrumb,
+                        "voice_text": breadcrumb,
+                        "trigger": "memory.breadcrumb",
+                        "task_id": None,
+                    })
+            return {"saved": written}
+
+        if name == "forget_memory":
+            try:
+                memory_id = int(args.get("memory_id"))
+            except (TypeError, ValueError):
+                return {"error": "memory_id (integer) required"}
+            # Fetch the text BEFORE delete so the audit log records what was
+            # forgotten — otherwise we'd just see a bare id with no context.
+            existing = await self._memory.get_by_id(memory_id)
+            if existing is None:
+                return {"error": f"memory_id={memory_id} not found"}
+            ok = await self._memory.delete_by_id(memory_id)
+            operator_log.info("forget_memory " + fmt(
+                chat=chat_session_id, memory_id=memory_id,
+                deleted=ok, text=existing.text,
+            ))
+            return {"forgotten": ok, "memory_id": memory_id}
+
         if name == "query_memory":
             q = str(args.get("query") or "").strip()
             if not q:
@@ -1270,7 +1549,7 @@ class Operator:
             return {
                 "query": q,
                 "memories": [
-                    {"text": m.text, "score": round(m.score, 3)}
+                    {"id": m.id, "text": m.text, "score": round(m.score, 3)}
                     for m in memories
                 ],
             }
@@ -1278,7 +1557,7 @@ class Operator:
         if name in (
             "read_inbox", "read_chat_style", "mark_inbox_read",
             "read_chat", "search_chats", "search_messages",
-            "list_chats", "summarize_chat",
+            "list_chats", "summarize_chat", "reply_to_dm",
         ):
             if self._telegram is None:
                 return {"error": "telegram not configured"}
@@ -1368,6 +1647,61 @@ class Operator:
                     return {"error": "inbox_id required"}
                 ok = await self._telegram.mark_read(inbox_id)
                 return {"marked_read": ok}
+            if name == "reply_to_dm":
+                inbox_id = str(args.get("inbox_id") or "")
+                text = str(args.get("text") or "")
+                try:
+                    authority_id = int(args.get("authority_memory_id"))
+                except (TypeError, ValueError):
+                    return {"error": "authority_memory_id (integer) required"}
+                if not inbox_id or not text.strip():
+                    return {"error": "inbox_id and non-empty text required"}
+                # Hard gate: the cited memory must actually exist. The
+                # semantic match (does this memory authorize a reply for
+                # THIS sender?) is the model's responsibility — we just
+                # ensure it's pointing at a real row, log the text for
+                # audit, and refuse on missing ids.
+                authority = await self._memory.get_by_id(authority_id)
+                if authority is None:
+                    return {"error": f"authority_memory_id={authority_id} not found"}
+                operator_log.info("reply_to_dm.authority " + fmt(
+                    inbox=inbox_id, memory_id=authority_id,
+                    memory_text=authority.text,
+                ))
+                try:
+                    sent = await self._telegram.reply_to_inbox(inbox_id, text)
+                except Exception as e:
+                    return {"error": f"{type(e).__name__}: {e}"}
+                # Auto-log: surface every successful auto-reply to the user
+                # via the same chat.reply channel the bot already subscribes
+                # to. Persisted as an assistant row so it's in chat history
+                # for `/status` and future turns. No lock acquire — we're
+                # already inside _execute_tool under the session lock.
+                sender = (
+                    sent.get("sender_username")
+                    or sent.get("sender_display_name")
+                    or "unknown"
+                )
+                reply_preview = text[:200] + ("…" if len(text) > 200 else "")
+                inbound = (sent.get("inbound_body") or "").replace("\n", " ").strip()
+                inbound_preview = inbound[:120] + ("…" if len(inbound) > 120 else "")
+                notice = (
+                    f"_Auto-replied to @{sender} per memory #{authority_id}._\n"
+                    f"in:  {inbound_preview}\n"
+                    f"out: {reply_preview}"
+                )
+                await self._db.append_chat_message(
+                    chat_session_id, "assistant", notice,
+                )
+                if self._events is not None:
+                    await self._events.publish_global("chat.reply", {
+                        "session_id": chat_session_id,
+                        "text": notice,
+                        "voice_text": notice,
+                        "trigger": "reply_to_dm",
+                        "task_id": None,
+                    })
+                return {**sent, "authority_memory_id": authority_id}
 
         return {"error": f"unknown tool '{name}'"}
 
@@ -1401,6 +1735,33 @@ def _was_resolved(events: list[dict[str, Any]], approval_id: str) -> bool:
         if e["type"] == "approval.resolved" and e["payload"].get("approval_id") == approval_id:
             return True
     return False
+
+
+_BREADCRUMB_LINE_RE = re.compile(
+    # Match either the markdown-italicized form the system actually emits
+    # (`_Remembered: …_`) or the bare paraphrase the model occasionally
+    # produces (`Remembered: …`). Same for the failure breadcrumb. Match
+    # whole lines only — we don't want to clip mid-paragraph mentions.
+    r"^\s*_?\s*(Remembered|Memory extraction (failed|skipped))\s*:.*?_?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_breadcrumb_impersonation(text: str) -> str:
+    """Remove any line in the operator's reply that impersonates a memory
+    system breadcrumb. The system emits its own `_Remembered: …_` /
+    `_Memory extraction failed: …_` message out of band; when the model
+    restates one in its main reply (despite the prompt rule), the user
+    sees the breadcrumb twice. Strip those lines defensively so the
+    duplicate never reaches Telegram. Empty result is fine — the bot's
+    chat.reply subscriber drops empty text."""
+    if not text:
+        return text
+    kept = [
+        line for line in text.splitlines()
+        if not _BREADCRUMB_LINE_RE.match(line)
+    ]
+    return "\n".join(kept).strip()
 
 
 def _row_to_openai_message(row: dict[str, Any]) -> dict[str, Any]:

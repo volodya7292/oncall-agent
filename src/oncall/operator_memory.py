@@ -60,6 +60,8 @@ class MemoryStore(Protocol):
     async def retrieve(
         self, query: str, *, limit: int | None = None,
     ) -> list[Memory]: ...
+    async def get_by_id(self, memory_id: int) -> Memory | None: ...
+    async def delete_by_id(self, memory_id: int) -> bool: ...
     async def for_prompt(self, query: str | None) -> str: ...
     async def entries_count(self) -> int: ...
 
@@ -218,6 +220,39 @@ class OperatorMemory:
         if not memories:
             return "(no relevant entries this turn)"
         return "\n".join(f"- {m.text}" for m in memories)
+
+    async def get_by_id(self, memory_id: int) -> Memory | None:
+        """Look up a memory by its primary key. Used by the operator's
+        `reply_to_dm` tool to verify that an `authority_memory_id` actually
+        resolves to an existing row before sending an autonomous reply.
+        Returns None if the id doesn't exist (or has been LRU-evicted)."""
+        row = await (await self._db.conn.execute(
+            "SELECT id, text, last_accessed_at FROM operator_memories "
+            "WHERE id = ? AND model = ?",
+            (memory_id, self._embed_model),
+        )).fetchone()
+        if row is None:
+            return None
+        return Memory(
+            id=int(row["id"]),
+            text=str(row["text"]),
+            score=0.0,
+            cosine=0.0,
+            last_accessed_at=str(row["last_accessed_at"]),
+        )
+
+    async def delete_by_id(self, memory_id: int) -> bool:
+        """Hard-delete one memory by id. Returns True if a row was deleted,
+        False if no row matched (already evicted, wrong id, or wrong model).
+        Used by the operator's `forget_memory` tool when the user explicitly
+        asks to drop a memory. We filter on `model` so a stale-but-pending-
+        rebuild row can't be deleted via a different model's id namespace."""
+        cur = await self._db.conn.execute(
+            "DELETE FROM operator_memories WHERE id = ? AND model = ?",
+            (memory_id, self._embed_model),
+        )
+        await self._db.conn.commit()
+        return cur.rowcount > 0
 
     async def entries_count(self) -> int:
         """Count of rows usable for retrieval — i.e., embedded with the

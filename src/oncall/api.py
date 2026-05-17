@@ -283,6 +283,20 @@ def create_app() -> FastAPI:
                     summary_model=settings.oncall_compression_model,
                 )
             )
+        # Inbox drain: when the userbot lands an *important* inbound DM, push
+        # it into the bot front-end's session as an auto-ping so the user
+        # finds out immediately. Non-important DMs sit silently in
+        # messenger_inbox and are picked up later via /status or
+        # `read_inbox`. Requires the bot front-end (we ping its session).
+        inbox_drain_task: asyncio.Task | None = None
+        if operator is not None and telegram_bot is not None:
+            inbox_drain_task = asyncio.create_task(
+                _inbox_drain_loop(
+                    events=events, operator=operator,
+                    target_session_id=telegram_bot.session_id,
+                ),
+                name="inbox-drain",
+            )
         # Memory-embedding rebuild: if the configured embed model differs
         # from what stored rows were last embedded with, kick off a
         # background re-embed pass. Retrieval is already filtering stale
@@ -323,10 +337,12 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
-            if auto_ping_task is not None:
-                auto_ping_task.cancel()
+            for bg_task in (auto_ping_task, inbox_drain_task):
+                if bg_task is None:
+                    continue
+                bg_task.cancel()
                 try:
-                    await auto_ping_task
+                    await bg_task
                 except (asyncio.CancelledError, Exception):
                     pass
             await lifecycle.shutdown()
@@ -425,6 +441,127 @@ async def _auto_ping_loop(
         if approval_id:
             chat_reply_payload["approval_id"] = approval_id
         await events.publish_global("chat.reply", chat_reply_payload)
+
+
+_INBOX_BATCH_SIZE = 5
+_INBOX_IDLE_FLUSH_SECONDS = 300.0  # 5 minutes
+
+
+async def _inbox_drain_loop(
+    *, events: EventBus, operator: Operator, target_session_id: str,
+) -> None:
+    """Triage inbound DMs through the operator in BATCHES so memory-backed
+    triage doesn't fire one LLM call per DM (cost + rate-limit + UX: one
+    consolidated heads-up reads better than five back-to-back pings).
+
+    Flush rule: whichever fires first —
+      * batch reaches `_INBOX_BATCH_SIZE` (5) messages, OR
+      * `_INBOX_IDLE_FLUSH_SECONDS` (5 min) passes with no new DM.
+
+    Why this isn't a hard `is_important` gate: the heuristic in telegram_service
+    (sender-in-allowlist OR keyword-match) is coarse — it misses "your sister
+    just messaged" if she isn't in the allowlist and over-fires on the
+    literal word 'urgent'. The operator has memory at hand and decides in
+    context. The heuristic verdict is threaded into the note as a hint.
+
+    Silence contract: the operator prompt instructs it to emit empty text
+    when no DM in the batch is worth interrupting the user. The bot's
+    chat.reply subscriber drops empty text, so nothing reaches Telegram in
+    that case. The DMs still live in messenger_inbox for later inspection."""
+    pending: list[dict[str, Any]] = []
+    sub_iter = events.subscribe_global(types={"messenger.received"}).__aiter__()
+    while True:
+        try:
+            # No pending → block forever waiting for the first DM. Pending →
+            # apply the idle timer so a small batch still flushes eventually.
+            timeout = _INBOX_IDLE_FLUSH_SECONDS if pending else None
+            env = await asyncio.wait_for(sub_iter.__anext__(), timeout=timeout)
+        except asyncio.TimeoutError:
+            await _flush_inbox_batch(events, operator, target_session_id, pending)
+            pending.clear()
+            continue
+        except StopAsyncIteration:
+            break
+        payload = env.get("payload") or {}
+        pending.append(payload)
+        if len(pending) >= _INBOX_BATCH_SIZE:
+            await _flush_inbox_batch(events, operator, target_session_id, pending)
+            pending.clear()
+
+
+async def _flush_inbox_batch(
+    events: EventBus, operator: Operator,
+    target_session_id: str, batch: list[dict[str, Any]],
+) -> None:
+    """Format the batch into one auto-ping note and hand it to the operator.
+    Caller resets the batch list. No-op on empty input."""
+    if not batch:
+        return
+    lines: list[str] = []
+    for i, row in enumerate(batch, start=1):
+        inbox_id = row.get("id") or ""
+        sender = (
+            row.get("sender_username")
+            or row.get("sender_display_name")
+            or "unknown"
+        )
+        body = (row.get("body") or "").replace("\n", " ").strip()
+        body_preview = body[:200] + ("…" if len(body) > 200 else "")
+        heuristic = "yes" if row.get("is_important") else "no"
+        chat_id = row.get("chat_id") or ""
+        lines.append(
+            f"  {i}. inbox_id={inbox_id} chat_id={chat_id} from=@{sender} "
+            f"heuristic_important={heuristic} body={body_preview!r}"
+        )
+    note = (
+        f"{len(batch)} inbound DM(s) since the last triage:\n"
+        + "\n".join(lines)
+        + "\n\nFor each DM you have exactly TWO options: AUTO-REPLY or "
+          "STAY SILENT. No heads-up to the user — the user reads their own "
+          "Telegram.\n"
+          "AUTO-REPLY: if the memory entries loaded into your system prompt "
+          "(possibly via JOINT inference across multiple entries) authorize "
+          "you to reply on the user's behalf for THIS sender on THIS topic, "
+          "execute the instruction (dispatch tasks if needed for gathering) "
+          "then call `reply_to_dm` with the controlling memory's id.\n"
+          "STAY SILENT: otherwise. Emit ZERO assistant content for that DM. "
+          "Do not narrate non-events; the user already sees their inbox.\n"
+          "If NONE of the DMs is auto-replyable, emit EMPTY text overall — "
+          "no 'no instructions found' line, no 'nothing important' line, no "
+          "status. heuristic_important is a hint, not a gate."
+    )
+    # Retrieval key: join the bodies (cap total) so memory hits cover any of
+    # the topics. Senders join in too — memory may key off a name.
+    senders = " ".join(
+        (r.get("sender_username") or r.get("sender_display_name") or "")
+        for r in batch
+    )
+    bodies = " ".join((r.get("body") or "") for r in batch)
+    retrieval_query = (senders + " " + bodies).strip()[:1200] or None
+    inbox_ids = [r.get("id") for r in batch]
+    try:
+        result = await operator.auto_ping(
+            session_id=target_session_id,
+            note=note,
+            retrieval_query=retrieval_query,
+        )
+    except Exception:
+        log.exception(
+            "inbox-drain: auto_ping failed for batch %s", inbox_ids,
+        )
+        return
+    # Empty text == operator triaged "nothing important here". Skip the
+    # chat.reply publish so the bot doesn't relay anything; the DMs stay
+    # in messenger_inbox for later inspection.
+    if not result.text:
+        return
+    await events.publish_global("chat.reply", {
+        "session_id": target_session_id,
+        "text": result.text,
+        "voice_text": to_voice_text(result.text),
+        "trigger": "inbox.batch",
+        "task_id": None,
+    })
 
 
 async def _probe_ollama(host: str = "http://localhost:11434") -> str | None:

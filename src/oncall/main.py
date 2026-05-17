@@ -27,11 +27,12 @@ ONCALL_DB_PATH=~/.oncall/state.db
 ONCALL_PROD_HOSTS=
 
 # Operator backend choice — see .env.example for details.
-# Default uses Google AI Studio (gemini) which preserves ack-first behavior;
-# set to "vercel" only if you need non-Google models via the AI Gateway.
+# Default uses Google AI Studio (gemini) with gemini-3.1-flash-lite for
+# fast ack-first responses (~0.45s TTFA). Set to "vercel" if you need
+# non-Google models via the AI Gateway.
 ONCALL_OPERATOR_BACKEND=gemini
-ONCALL_OPERATOR_MODEL=google/gemma-4-31b-it
-ONCALL_OPERATOR_REASONING_EFFORT=minimal
+ONCALL_OPERATOR_MODEL=gemini-3.1-flash-lite
+ONCALL_OPERATOR_REASONING_EFFORT=low
 
 # Gemini (AI Studio) — required when ONCALL_OPERATOR_BACKEND=gemini.
 # Get a key at https://aistudio.google.com/apikey
