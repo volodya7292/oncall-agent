@@ -125,6 +125,11 @@ class FakeTelegramClient:
             return SimpleNamespace(
                 id=m["id"], message=m["message"], date=m["date"],
                 out=bool(m.get("out", False)), get_sender=_get_sender,
+                # `media` / `file` are optional; when present, they let
+                # the service detect media-only messages and emit a
+                # [photo] / [file: ...] placeholder.
+                media=m.get("media"),
+                file=m.get("file"),
             )
 
         return _async_iter([_make(m) for m in msgs[:limit]])
@@ -327,6 +332,105 @@ async def test_send_calls_underlying_client(db):
     assert client.sent and client.sent[0]["message"] == "draft reply"
     assert client.sent[0]["entity"] == 12345  # coerced to int
     assert out["message_id"] == str(client.sent[0]["id"])
+
+
+@pytest.mark.asyncio
+async def test_list_pending_chats_groups_by_chat_with_body_tail(service, db):
+    """Multiple unread DMs in the same chat collapse to ONE pending-chats
+    row with a `unread_count` and a `body_tail` of the unread bodies
+    joined oldest→newest. A second chat gets its own row."""
+    s, client = service
+    await client.handler(make_event(
+        sender_username="alex", body="ping 1", chat_id=111, message_id=1,
+    ))
+    await client.handler(make_event(
+        sender_username="alex", body="ping 2", chat_id=111, message_id=2,
+    ))
+    await client.handler(make_event(
+        sender_username="bob", body="hey", chat_id=222, message_id=10,
+    ))
+    rows = await s.list_pending_chats()
+    by_chat = {r["chat_id"]: r for r in rows}
+    assert set(by_chat.keys()) == {"111", "222"}
+    assert by_chat["111"]["unread_count"] == 2
+    assert by_chat["111"]["body_tail"] == "ping 1\nping 2"
+    assert by_chat["111"]["sender_username"] == "alex"
+    assert by_chat["222"]["unread_count"] == 1
+    assert by_chat["222"]["body_tail"] == "hey"
+
+
+@pytest.mark.asyncio
+async def test_list_pending_chats_body_tail_truncates_from_start(db):
+    """Once the concatenated unread bodies exceed `body_tail_chars`, the
+    tail is preserved (most recent content) and an ellipsis is prepended
+    so the operator can tell truncation happened."""
+    client = FakeTelegramClient()
+    s = TelegramService(
+        db=db, client=client,
+        important_senders=set(), important_keywords=set(),
+    )
+    await s.start()
+    try:
+        # 3 bodies of 200 chars each → ~600 chars joined; body_tail_chars=300
+        # should yield the last 300 chars prefixed with "…".
+        for i in range(3):
+            await client.handler(make_event(
+                sender_username="alex",
+                body=("X" * 199 + str(i)),
+                chat_id=111, message_id=100 + i,
+            ))
+        rows = await s.list_pending_chats(body_tail_chars=300)
+    finally:
+        await s.stop()
+    assert len(rows) == 1
+    tail = rows[0]["body_tail"]
+    assert tail.startswith("…")
+    # The "…" prefix + exactly 300 chars of trailing body.
+    assert len(tail) == 301
+    # The tail must contain the final body's content (suffix preserved).
+    assert tail.endswith("2")
+
+
+@pytest.mark.asyncio
+async def test_reply_to_chat_marks_chat_read_and_records_reply(service, db):
+    """`reply_to_chat` sends via the underlying client AND clears the
+    chat's unread state. Every unread inbox row for that chat ends up
+    marked read; the latest row gets its `replied_message_id` stamped
+    for audit."""
+    s, client = service
+    await client.handler(make_event(
+        sender_username="alex", body="m1", chat_id=111, message_id=1,
+    ))
+    await client.handler(make_event(
+        sender_username="alex", body="m2", chat_id=111, message_id=2,
+    ))
+    out = await s.reply_to_chat("111", "ok")
+    assert out["chat_id"] == "111"
+    assert out["sender_username"] == "alex"
+    assert out["inbound_body"] == "m2"  # the latest unread row's body
+    # Both unread rows are now read.
+    rows_after = await db.list_inbox(unread_only=True)
+    assert [r for r in rows_after if r["chat_id"] == "111"] == []
+    # Latest row carries the outbound message id.
+    all_rows = await db.list_inbox(unread_only=False)
+    for r in all_rows:
+        if r["chat_id"] == "111" and r["message_id"] == "2":
+            assert r["replied_message_id"] == str(client.sent[-1]["id"])
+
+
+@pytest.mark.asyncio
+async def test_mark_chat_read_bulk(service, db):
+    """`mark_chat_read(chat_id)` flips read_at on every unread row in that
+    chat in one shot — the chat-keyed replacement for `mark_read(id)`."""
+    s, client = service
+    for i in range(3):
+        await client.handler(make_event(
+            sender_username="alex", body=f"m{i}", chat_id=111, message_id=10 + i,
+        ))
+    n = await s.mark_chat_read("111")
+    assert n == 3
+    rows = await db.list_inbox(unread_only=True)
+    assert [r for r in rows if r["chat_id"] == "111"] == []
 
 
 @pytest.mark.asyncio
@@ -672,6 +776,47 @@ async def test_get_chat_history_skips_empty_messages(db):
         await s.stop()
     assert len(rows) == 1
     assert rows[0]["text"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_get_chat_history_surfaces_media_only_messages(db):
+    """Regression: a media-only (no caption) message used to be silently
+    dropped, leaving the operator to guess at nearby IDs when asked to
+    `read_image`. It must now appear with `has_media=True` and a
+    placeholder body that names what the file is, so the operator can
+    pass the real message_id to `read_image`."""
+    now = datetime.now(timezone.utc)
+    me = SimpleNamespace(username="me_user", first_name="V", last_name=None)
+    image_file = SimpleNamespace(name=None, mime_type="image/jpeg")
+    doc_file = SimpleNamespace(name="report.pdf", mime_type="application/pdf")
+    client = FakeTelegramClient(messages={
+        99: [
+            {"id": 30, "message": "hello",  "date": now, "out": True,  "sender": me},
+            {"id": 29, "message": "",       "date": now, "out": False, "sender": me,
+             "media": object(), "file": image_file},
+            {"id": 28, "message": "",       "date": now, "out": False, "sender": me,
+             "media": object(), "file": doc_file},
+            {"id": 27, "message": "",       "date": now, "out": True,  "sender": me},  # no media, no text → still dropped
+        ],
+    })
+    s = TelegramService(
+        db=db, client=client,
+        important_senders=set(), important_keywords=set(),
+    )
+    await s.start()
+    try:
+        rows = await s.get_chat_history("99", limit=10)
+    finally:
+        await s.stop()
+    # The pure-empty row (id=27) is still dropped; the two media rows are
+    # surfaced with their real ids + placeholders.
+    by_id = {r["message_id"]: r for r in rows}
+    assert set(by_id.keys()) == {"30", "29", "28"}
+    assert by_id["29"]["text"] == "[photo]"
+    assert by_id["29"]["has_media"] is True
+    assert by_id["28"]["text"] == "[file: report.pdf]"
+    assert by_id["28"]["has_media"] is True
+    assert by_id["30"]["has_media"] is False
 
 
 @pytest.mark.asyncio

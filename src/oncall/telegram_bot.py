@@ -19,6 +19,7 @@ task terminates — no need to ask.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import re
 from datetime import datetime, timezone
@@ -46,6 +47,37 @@ _TELEGRAM_MSG_LIMIT = 4000
 _LONG_POLL_SECONDS = 25
 # Backoff between failed getUpdates calls (network issues, 5xx, rate limits).
 _RETRY_DELAY_SECONDS = 3.0
+
+# Max bytes for an inbound photo/document we'll pull into a chat turn. The
+# operator's `read_image` cap is identical; sized for screenshots, small PDFs,
+# etc. — well within Gemini's inline-data limits without blowing up the
+# prompt.
+_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _pick_attachment_file(msg: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Pull the best `file_id` (and declared mime, if any) out of a
+    Telegram `message` update. Returns `(None, None)` when the message
+    carries no media we know how to ingest.
+
+    For photos Telegram sends an array of size variants — we pick the
+    LAST entry (largest, highest-quality) so the model gets the best
+    image it can. Documents and stickers carry a single file_id; voice/
+    audio/video also work but are passed through as-is since Gemini
+    accepts those mime types too."""
+    photos = msg.get("photo")
+    if isinstance(photos, list) and photos:
+        last = photos[-1]
+        fid = last.get("file_id") if isinstance(last, dict) else None
+        if fid:
+            return str(fid), None  # photos don't carry mime; let the sniffer guess
+    for key in ("document", "audio", "voice", "video", "video_note", "sticker"):
+        m = msg.get(key)
+        if isinstance(m, dict):
+            fid = m.get("file_id")
+            if fid:
+                return str(fid), m.get("mime_type")
+    return None, None
 
 # Bot menu definition. Pushed to Telegram via setMyCommands at startup so
 # the user gets autocomplete + the slash-command menu without having to
@@ -179,6 +211,7 @@ class BotApi(Protocol):
         content: bytes,
         caption: str | None = None,
     ) -> Any: ...
+    async def download_file(self, file_id: str) -> tuple[bytes, str, str]: ...
     async def aclose(self) -> None: ...
 
 
@@ -233,6 +266,39 @@ class HttpxBotApi:
                 f"(HTTP {r.status_code})"
             )
         return body.get("result")
+
+    async def download_file(self, file_id: str) -> tuple[bytes, str, str]:
+        """Fetch the bytes for a `file_id` produced by a Telegram update.
+
+        Two round-trips: (1) `getFile` resolves `file_id` to a server-side
+        `file_path`; (2) GET against the file endpoint (NOTE: a different
+        base URL than the bot API itself — `/file/bot<token>/...` instead
+        of `/bot<token>/...`) returns the raw bytes.
+
+        Returns `(data, mime_type, filename)`. mime_type is guessed from
+        the file_path suffix (Telegram doesn't return it in getFile);
+        falls back to `application/octet-stream`. filename is the basename
+        of `file_path` so the caller can show the user something sensible
+        in audit logs.
+        """
+        import mimetypes
+        from os.path import basename
+
+        info = await self.call("getFile", {"file_id": file_id})
+        file_path = (info or {}).get("file_path") or ""
+        if not file_path:
+            raise RuntimeError(f"getFile returned no file_path for {file_id}")
+        # `self._http.base_url` is `https://api.telegram.org/bot<token>`.
+        # The file fetch uses `https://api.telegram.org/file/bot<token>/<path>`.
+        # Build the absolute URL once instead of swapping base URLs on the
+        # client — simpler and keeps `call` correct for everything else.
+        bot_base = str(self._http.base_url)  # ".../bot<token>"
+        file_url = bot_base.replace("/bot", "/file/bot", 1) + "/" + file_path
+        r = await self._http.get(file_url)
+        r.raise_for_status()
+        data = r.content
+        mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        return data, mime, basename(file_path) or file_path
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -502,6 +568,45 @@ class TelegramBotService:
             return
 
         text = (msg.get("text") or "").strip()
+        # Photo / document fallback: when the owner sends an image or a
+        # file (with or without a caption), Telegram puts the text on
+        # `msg.caption` instead of `msg.text`, and the media metadata on
+        # `msg.photo` / `msg.document`. We fetch the bytes eagerly so the
+        # operator can see the image on the SAME turn the user asks about
+        # it — no extra `read_image` round-trip needed.
+        attachments: list[dict[str, Any]] = []
+        if not text:
+            caption = (msg.get("caption") or "").strip()
+            file_id, declared_mime = _pick_attachment_file(msg)
+            if file_id is not None:
+                try:
+                    data, sniffed_mime, fname = await self._api.download_file(file_id)
+                except Exception:
+                    log.exception("download_file failed for owner attachment")
+                    await self._send(
+                        chat_id,
+                        "Couldn't download that attachment. Try again or send it "
+                        "as a smaller file.",
+                    )
+                    return
+                if len(data) > _ATTACHMENT_MAX_BYTES:
+                    await self._send(
+                        chat_id,
+                        f"Attachment too large ({len(data)} bytes; cap "
+                        f"{_ATTACHMENT_MAX_BYTES}).",
+                    )
+                    return
+                mime = declared_mime or sniffed_mime
+                attachments.append({
+                    "data_b64": base64.b64encode(data).decode("ascii"),
+                    "mime_type": mime,
+                    "size_bytes": len(data),
+                    "source": f"telegram bot ({fname or 'attachment'})",
+                })
+                # Default text when the user sent only the image, so the
+                # operator has SOMETHING in the user turn instead of an
+                # empty string (which would confuse the LLM).
+                text = caption or "(attachment — please look at the image)"
         if not text:
             return
 
@@ -612,10 +717,12 @@ class TelegramBotService:
 
         telegram_log.info("bot inbound " + fmt(
             session=self._session_id, len=len(text),
+            attachments=len(attachments),
         ))
         try:
             result = await self._operator.chat_turn(
                 session_id=self._session_id, user_text=text,
+                attachments=attachments or None,
             )
         except Exception:
             log.exception("operator.chat_turn failed for telegram bot")

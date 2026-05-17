@@ -615,6 +615,117 @@ class Database:
         )
         await self.conn.commit()
 
+    async def list_pending_chats(
+        self, *, body_tail_chars: int = 500,
+    ) -> list[dict[str, Any]]:
+        """One row per chat_id that has unread, not-yet-triaged inbox messages.
+
+        Each row carries the metadata the inbox-drain needs to build an
+        auto-ping without ever batching bodies: sender (from the latest
+        unread row), `unread_count`, `first_unread_at` / `last_unread_at`,
+        and a `body_tail` — the most recent unread bodies concatenated
+        oldest→newest and truncated from the START to `body_tail_chars`
+        (so the suffix is always intact; an ellipsis is prepended when
+        truncation happened). Bodies live in the audit table; this is
+        only a thin pointer the operator uses to decide whether to call
+        `read_chat` for full context."""
+        rows = await (await self.conn.execute(
+            """
+            SELECT id, chat_id, sender_username, sender_display_name,
+                   body, received_at
+            FROM messenger_inbox
+            WHERE read_at IS NULL
+              AND id NOT IN (SELECT inbox_id FROM messenger_inbox_triaged)
+            ORDER BY received_at ASC
+            """
+        )).fetchall()
+        # Group by chat_id, preserving oldest-first ordering.
+        grouped: dict[str, list[Any]] = {}
+        for r in rows:
+            grouped.setdefault(r["chat_id"], []).append(r)
+        out: list[dict[str, Any]] = []
+        for chat_id, msgs in grouped.items():
+            latest = msgs[-1]
+            joined = "\n".join((m["body"] or "") for m in msgs)
+            if len(joined) > body_tail_chars:
+                body_tail = "…" + joined[-body_tail_chars:]
+            else:
+                body_tail = joined
+            out.append({
+                "chat_id": chat_id,
+                "sender_username": latest["sender_username"],
+                "sender_display_name": latest["sender_display_name"],
+                "unread_count": len(msgs),
+                "first_unread_at": msgs[0]["received_at"],
+                "last_unread_at": latest["received_at"],
+                "body_tail": body_tail,
+            })
+        # Most-recently-updated chats first — matches what the operator
+        # would expect to see if asked "any DMs?".
+        out.sort(key=lambda r: r["last_unread_at"], reverse=True)
+        return out
+
+    async def mark_chat_triaged(self, chat_id: str) -> int:
+        """Mark every unread, not-yet-triaged row for `chat_id` as triaged.
+        Returns the count of rows just inserted. Called once per chat after
+        an inbox-drain auto-ping completes (whether the operator replied or
+        stayed silent) so a restart's recovery doesn't re-burn LLM on the
+        same chat."""
+        ids_rows = await (await self.conn.execute(
+            """
+            SELECT id FROM messenger_inbox
+            WHERE chat_id = ? AND read_at IS NULL
+              AND id NOT IN (SELECT inbox_id FROM messenger_inbox_triaged)
+            """,
+            (chat_id,),
+        )).fetchall()
+        ids = [r["id"] for r in ids_rows]
+        if not ids:
+            return 0
+        await self.mark_inbox_triaged(ids)
+        return len(ids)
+
+    async def mark_chat_read(self, chat_id: str) -> int:
+        """Set `read_at` on every unread inbox row for this chat. Returns
+        the rowcount. Used by the operator's `mark_chat_read` tool and by
+        `record_chat_reply` to clear an entire conversation's unread state
+        after the operator replies to it."""
+        cur = await self.conn.execute(
+            "UPDATE messenger_inbox SET read_at = ? "
+            "WHERE chat_id = ? AND read_at IS NULL",
+            (iso(utcnow()), chat_id),
+        )
+        await self.conn.commit()
+        return cur.rowcount
+
+    async def record_chat_reply(
+        self, chat_id: str, reply_message_id: str,
+    ) -> None:
+        """After the operator successfully replies to a chat, stamp the
+        latest unread row with `replied_message_id` (audit hook for "which
+        DM did this reply address?") and mark every unread row in that
+        chat read in one go. Idempotent — runs even if no rows match."""
+        now = iso(utcnow())
+        # The most recent unread row is the one we conceptually replied to.
+        latest = await (await self.conn.execute(
+            "SELECT id FROM messenger_inbox "
+            "WHERE chat_id = ? AND read_at IS NULL "
+            "ORDER BY received_at DESC LIMIT 1",
+            (chat_id,),
+        )).fetchone()
+        if latest is not None:
+            await self.conn.execute(
+                "UPDATE messenger_inbox SET replied_message_id = ? "
+                "WHERE id = ?",
+                (reply_message_id, latest["id"]),
+            )
+        await self.conn.execute(
+            "UPDATE messenger_inbox SET read_at = ? "
+            "WHERE chat_id = ? AND read_at IS NULL",
+            (now, chat_id),
+        )
+        await self.conn.commit()
+
     async def get_inbox_message(self, inbox_id: str) -> dict[str, Any] | None:
         row = await (await self.conn.execute(
             "SELECT * FROM messenger_inbox WHERE id = ?", (inbox_id,),

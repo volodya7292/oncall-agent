@@ -82,6 +82,13 @@ class FakeBotApi:
         })
         return {"message_id": 9000 + len(self.documents)}
 
+    async def download_file(self, file_id: str) -> tuple[bytes, str, str]:
+        self.calls.append(("download_file", {"file_id": file_id}))
+        # Tests pre-stamp `_attachment_payload` if they want non-default bytes.
+        if hasattr(self, "_attachment_payload"):
+            return self._attachment_payload  # type: ignore[return-value]
+        return b"fake-png-bytes", "image/png", "photo.jpg"
+
     async def aclose(self) -> None:
         self.closed = True
 
@@ -105,8 +112,14 @@ class FakeOperator:
         self._compress_result = compress_result or {"compressed": False, "reason": "not enough history"}
         self._export_payload = export_payload
 
-    async def chat_turn(self, *, session_id: str, user_text: str, language=None) -> OperatorTurnResult:
-        self.calls.append({"session_id": session_id, "user_text": user_text, "language": language})
+    async def chat_turn(
+        self, *, session_id: str, user_text: str,
+        language=None, attachments=None,
+    ) -> OperatorTurnResult:
+        self.calls.append({
+            "session_id": session_id, "user_text": user_text,
+            "language": language, "attachments": attachments,
+        })
         return OperatorTurnResult(text=self.reply_text, tool_calls_made=[])
 
     async def clear_session(self, session_id: str) -> dict[str, int]:
@@ -229,6 +242,7 @@ async def test_owner_message_routes_through_operator(bus):
             "session_id": bot_session_id(OWNER_ID),
             "user_text": "check staging",
             "language": None,
+            "attachments": None,
         }]
         assert len(api.sent) == 1
         assert api.sent[0]["chat_id"] == 999
@@ -1006,3 +1020,86 @@ def test_format_seconds_buckets(seconds, expected):
 def test_relative_age_unparseable_returns_unknown():
     assert _relative_age("not a date") == "unknown"
     assert _relative_age("") == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Owner-sent media (photo / document) → chat_turn(attachments=[...])
+# ---------------------------------------------------------------------------
+
+
+def _photo_msg(*, sender_id: int, caption: str = "", chat_id: int = 999) -> dict:
+    """Minimal Telegram `message` payload carrying a photo. Telegram sends
+    `photo` as an array of size variants — the bot picks the LAST one."""
+    return {
+        "message_id": 5,
+        "date": 0,
+        "from": {"id": sender_id, "is_bot": False, "first_name": "Owner"},
+        "chat": {"id": chat_id, "type": "private"},
+        "photo": [
+            {"file_id": "tiny",  "file_unique_id": "u_tiny",  "width": 64,  "height": 64,  "file_size": 1234},
+            {"file_id": "small", "file_unique_id": "u_small", "width": 320, "height": 240, "file_size": 5678},
+            {"file_id": "large", "file_unique_id": "u_large", "width": 1280, "height": 960, "file_size": 90000},
+        ],
+        "caption": caption,
+    }
+
+
+@pytest.mark.asyncio
+async def test_owner_photo_with_caption_routes_attachment_to_chat_turn(bus):
+    """Photo + caption: caption becomes user_text; download_file fires on
+    the LARGEST variant; bytes are passed as a single base64-encoded
+    attachment to operator.chat_turn."""
+    api = FakeBotApi()
+    api._attachment_payload = (b"\x89PNG\r\n\x1a\nlive-bytes", "image/png", "shot.jpg")
+    operator = FakeOperator(reply_text="looks ok.")
+    svc = await _make_bot(bus, api, operator)
+    try:
+        await svc._dispatch(_photo_msg(sender_id=OWNER_ID, caption="what's wrong?"))
+    finally:
+        await svc.stop()
+
+    dl_calls = [c for c in api.calls if c[0] == "download_file"]
+    assert dl_calls and dl_calls[0][1]["file_id"] == "large"
+
+    assert len(operator.calls) == 1
+    call = operator.calls[0]
+    assert call["user_text"] == "what's wrong?"
+    assert call["attachments"] is not None and len(call["attachments"]) == 1
+    att = call["attachments"][0]
+    import base64
+    assert base64.b64decode(att["data_b64"]) == b"\x89PNG\r\n\x1a\nlive-bytes"
+    assert att["mime_type"] == "image/png"
+    assert att["size_bytes"] == len(b"\x89PNG\r\n\x1a\nlive-bytes")
+    assert "telegram bot" in att["source"]
+
+
+@pytest.mark.asyncio
+async def test_owner_photo_without_caption_gets_default_prompt(bus):
+    """Pure photo (no caption): user_text falls back to a generic 'please
+    look at the image' prompt so the operator has SOMETHING to react to
+    instead of an empty string."""
+    api = FakeBotApi()
+    operator = FakeOperator(reply_text="i see a graph.")
+    svc = await _make_bot(bus, api, operator)
+    try:
+        await svc._dispatch(_photo_msg(sender_id=OWNER_ID, caption=""))
+    finally:
+        await svc.stop()
+    call = operator.calls[0]
+    assert "please look at the image" in call["user_text"]
+    assert call["attachments"] is not None and len(call["attachments"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_owner_text_only_still_passes_attachments_none(bus):
+    """Plain text message (no photo / document) → attachments=None.
+    Regression: don't manufacture an empty list."""
+    api = FakeBotApi()
+    operator = FakeOperator(reply_text="ok")
+    svc = await _make_bot(bus, api, operator)
+    try:
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="hi")["message"])
+    finally:
+        await svc.stop()
+    assert operator.calls[0]["attachments"] is None
+    assert [c[0] for c in api.calls if c[0] == "download_file"] == []

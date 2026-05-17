@@ -279,11 +279,29 @@ class TelegramService:
         filtered = [r for r in rows if r["chat_id"] not in self._archived]
         return filtered[:limit]
 
+    async def list_pending_chats(
+        self, *, body_tail_chars: int = 500,
+    ) -> list[dict[str, Any]]:
+        """One entry per chat with unread DMs. Archived chats are excluded
+        — they're the same things `list_inbox` filters out. Used by the
+        inbox-drain triage path and by the operator's `read_inbox` tool
+        in the new chat-centric flow (the operator sees the dirty chat
+        and then calls `read_chat` for full context if it wants it)."""
+        await self._refresh_archived()
+        rows = await self._db.list_pending_chats(body_tail_chars=body_tail_chars)
+        return [r for r in rows if r["chat_id"] not in self._archived]
+
     async def get_message(self, inbox_id: str) -> dict[str, Any] | None:
         return await self._db.get_inbox_message(inbox_id)
 
     async def mark_read(self, inbox_id: str) -> bool:
         return await self._db.mark_inbox_read(inbox_id)
+
+    async def mark_chat_read(self, chat_id: str) -> int:
+        """Mark every unread inbox row in this chat as read. Returns the
+        rowcount affected. The operator calls this after the user says
+        'skip / ignore / dismiss' a chat's pending DMs."""
+        return await self._db.mark_chat_read(chat_id)
 
     # ---- telethon-backed reads/writes ----
 
@@ -316,15 +334,26 @@ class TelegramService:
         self, chat_id: str, *, limit: int = 10,
     ) -> list[dict[str, Any]]:
         """Return the last N messages of a chat, BOTH sides. Each row:
-            message_id, text, date, outgoing, sender_username, sender_display_name.
-        Unlike `get_chat_style` (which filters to from_user='me'), this includes
-        the counterparty's messages — use it when the user asks 'what did X say?'."""
+            message_id, text, date, outgoing, sender_username, sender_display_name, has_media.
+
+        Media-only messages (photo / document / etc. with no caption) get
+        a synthetic body like `[photo]` / `[file: name.pdf]` so the
+        operator sees the message_id and can call `read_image(chat_id,
+        message_id)` to load the bytes. Without this they were invisible
+        and the operator would guess (wrongly) at nearby IDs.
+
+        Unlike `get_chat_style` (which filters to from_user='me'), this
+        includes the counterparty's messages — use it when the user asks
+        'what did X say?'."""
         entity = _entity_arg(chat_id)
         out: list[dict[str, Any]] = []
         async for msg in self._client.iter_messages(entity, limit=limit):
             text = getattr(msg, "message", None) or ""
-            if not text:
-                continue  # skip system events, pure media, reactions
+            has_media = bool(getattr(msg, "media", None))
+            if not text and not has_media:
+                continue  # system events, reactions, etc.
+            if not text and has_media:
+                text = _media_placeholder(msg)
             sender = (
                 await _maybe_await(msg.get_sender())
                 if hasattr(msg, "get_sender") else None
@@ -336,6 +365,7 @@ class TelegramService:
                 "outgoing": bool(getattr(msg, "out", False)),
                 "sender_username": getattr(sender, "username", None) if sender else None,
                 "sender_display_name": _display_name(sender) if sender else None,
+                "has_media": has_media,
             })
         return out
 
@@ -380,7 +410,8 @@ class TelegramService:
     ) -> list[dict[str, Any]]:
         """Server-side full-text search across messages in one chat. Returns
         message rows in the same shape as `get_chat_history` (both sides,
-        skipping empty/media-only). Use for 'did we talk about X with Y'.
+        media-only messages surfaced via `[photo]`/`[file: ...]` placeholders
+        with `has_media: True`). Use for 'did we talk about X with Y'.
         Telegram's search handles stemming/case better than a local substring
         scan would."""
         q = query.strip()
@@ -390,8 +421,11 @@ class TelegramService:
         out: list[dict[str, Any]] = []
         async for msg in self._client.iter_messages(entity, search=q, limit=limit):
             text = getattr(msg, "message", None) or ""
-            if not text:
+            has_media = bool(getattr(msg, "media", None))
+            if not text and not has_media:
                 continue
+            if not text and has_media:
+                text = _media_placeholder(msg)
             sender = (
                 await _maybe_await(msg.get_sender())
                 if hasattr(msg, "get_sender") else None
@@ -403,6 +437,7 @@ class TelegramService:
                 "outgoing": bool(getattr(msg, "out", False)),
                 "sender_username": getattr(sender, "username", None) if sender else None,
                 "sender_display_name": _display_name(sender) if sender else None,
+                "has_media": has_media,
             })
         return out
 
@@ -498,34 +533,117 @@ class TelegramService:
         ))
         return {"message_id": sent_id, "chat_id": chat_id}
 
-    async def reply_to_inbox(
-        self, inbox_id: str, text: str,
-    ) -> dict[str, Any]:
-        """Send `text` to the sender of the named inbox row, mark the row read,
-        and record the outbound message id. Used by the operator's
-        `reply_to_dm` tool for memory-authorized autonomous replies.
+    async def download_attachment(
+        self, chat_id: str, message_id: str, *, max_bytes: int = 10 * 1024 * 1024,
+    ) -> tuple[bytes, str, str]:
+        """Re-fetch one Telegram message by (chat_id, message_id) and
+        return (data, mime_type, file_name) for its attachment.
 
-        Raises ValueError if the inbox row doesn't exist — the caller (the
-        operator tool handler) surfaces that to the model so it can recover."""
-        row = await self._db.get_inbox_message(inbox_id)
-        if row is None:
-            raise ValueError(f"inbox row {inbox_id} not found")
-        chat_id = str(row["chat_id"])
+        Used by the operator's `read_image` tool to feed an inbound
+        attachment back to the LLM as inline_data. Raises ValueError on
+        a missing message, missing media, or oversize file. Mime type
+        falls back to 'application/octet-stream' when telethon doesn't
+        report one (e.g. some old documents)."""
+        try:
+            msg_id_int = int(str(message_id).strip())
+        except (TypeError, ValueError):
+            raise ValueError(f"invalid message_id: {message_id!r}")
+        entity = _entity_arg(chat_id)
+        msg = None
+        async for m in self._client.iter_messages(entity, ids=[msg_id_int]):
+            msg = m
+            break
+        if msg is None:
+            raise ValueError(f"message {message_id} not found in chat {chat_id}")
+        if not getattr(msg, "media", None):
+            raise ValueError(f"message {message_id} has no attachment")
+        f = getattr(msg, "file", None)
+        declared_size = int(getattr(f, "size", 0) or 0) if f else 0
+        if declared_size and declared_size > max_bytes:
+            raise ValueError(
+                f"attachment too large: {declared_size} bytes (cap {max_bytes})"
+            )
+        data = await msg.download_media(file=bytes)
+        if not data:
+            raise ValueError(f"download returned empty for message {message_id}")
+        if len(data) > max_bytes:
+            raise ValueError(
+                f"attachment too large: {len(data)} bytes (cap {max_bytes})"
+            )
+        mime = (getattr(f, "mime_type", None) if f else None) or "application/octet-stream"
+        name = (getattr(f, "name", None) if f else None) or ""
+        return data, mime, name
+
+    async def reply_to_chat(
+        self, chat_id: str, text: str,
+    ) -> dict[str, Any]:
+        """Send `text` to `chat_id`, then clear that chat's unread state
+        (mark every unread inbox row read and stamp `replied_message_id`
+        on the latest one for audit). Used by the operator's `reply_to_dm`
+        tool for memory-authorized autonomous replies under the new
+        chat-centric drain flow.
+
+        Returns a payload the caller surfaces to the model: outbound
+        message id, the sender metadata pulled from the latest unread
+        row (best-effort; may be None if the chat had no unread row
+        when this was called — e.g. an out-of-band reply), and the
+        latest inbound body for the audit notice."""
+        # Snapshot the latest unread row BEFORE we mark it read — that's
+        # the sender/body we'll cite in the audit notice. If there's no
+        # unread row at all (e.g. operator decided to reply on a chat
+        # that's already been triaged), fall back to chat-level lookup.
+        latest = await self._latest_unread_for_chat(chat_id)
         sent = await self.send(chat_id, text)
-        await self._db.record_inbox_reply(inbox_id, sent["message_id"])
+        await self._db.record_chat_reply(chat_id, sent["message_id"])
         return {
-            "inbox_id": inbox_id,
             "chat_id": chat_id,
             "message_id": sent["message_id"],
-            "sender_username": row.get("sender_username"),
-            "sender_display_name": row.get("sender_display_name"),
-            "inbound_body": row.get("body"),
+            "sender_username": (latest or {}).get("sender_username"),
+            "sender_display_name": (latest or {}).get("sender_display_name"),
+            "inbound_body": (latest or {}).get("body"),
         }
+
+    async def _latest_unread_for_chat(
+        self, chat_id: str,
+    ) -> dict[str, Any] | None:
+        """Most-recent unread inbox row in `chat_id`. Returns None if the
+        chat is fully read. Used to attribute a `reply_to_chat` call to a
+        specific inbound message for audit purposes."""
+        rows = await self._db.list_inbox(unread_only=True, limit=200)
+        for r in rows:
+            if r["chat_id"] == chat_id:
+                return r
+        return None
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _media_placeholder(msg: Any) -> str:
+    """Synthetic body for a media-only Telegram message (no caption). The
+    operator sees this in `read_chat` / `search_messages` results alongside
+    the real `message_id`, then calls `read_image(chat_id, message_id)` to
+    actually load the bytes. Without this the message was invisible —
+    `get_chat_history` filtered it out as `if not text: continue`, leaving
+    the model to guess at nearby ids (which usually pointed at a sibling
+    text message with no media)."""
+    f = getattr(msg, "file", None)
+    mime = getattr(f, "mime_type", None) if f else None
+    name = getattr(f, "name", None) if f else None
+    if mime:
+        if mime.startswith("image/"):
+            return "[photo]"
+        if mime.startswith("video/"):
+            return "[video]"
+        if mime.startswith("audio/"):
+            return "[audio]"
+    if name:
+        return f"[file: {name}]"
+    if mime:
+        return f"[file: {mime}]"
+    return "[attachment]"
+
 
 def _display_name(sender: Any) -> str | None:
     first = getattr(sender, "first_name", None) or ""
