@@ -136,3 +136,15 @@ def token_overlap(a: str, b: str) -> float:
     if not ta or not tb:
         return 0.0
     return len(ta & tb) / len(ta | tb)
+
+
+def hybrid_score(
+    cos: float, text_a: str, text_b: str, *, alpha: float, beta: float,
+) -> float:
+    """Hybrid similarity = alpha * cosine + beta * Jaccard token overlap.
+
+    Used in two places: (a) memory retrieval scoring (query text vs each
+    stored memory), and (b) dedup-pass clustering (memory vs memory). Same
+    weights so the two contexts agree on what "similar" means.
+    """
+    return alpha * cos + beta * token_overlap(text_a, text_b)

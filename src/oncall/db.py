@@ -129,6 +129,26 @@ CREATE TABLE IF NOT EXISTS operator_memories (
 CREATE INDEX IF NOT EXISTS idx_operator_memories_lru
     ON operator_memories(last_accessed_at);
 
+-- Pairs of memory ids the periodic dedup LLM looked at and decided NOT to
+-- merge. The next dedup pass skips edges between recorded pairs so we don't
+-- burn LLM calls re-asking the same question every 5 min. id_a < id_b.
+CREATE TABLE IF NOT EXISTS memory_dedup_skip_pairs (
+    id_a INTEGER NOT NULL,
+    id_b INTEGER NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (id_a, id_b)
+);
+
+-- Inbox rows the auto-drain has shown to the operator. Decoupled from
+-- `messenger_inbox.read_at` because a silent triage outcome (operator
+-- chose STAY SILENT) does NOT mark the row read — the user still needs to
+-- see those messages themselves. Without this table the next restart's
+-- recovery would re-queue silently-triaged rows and re-burn the LLM.
+CREATE TABLE IF NOT EXISTS messenger_inbox_triaged (
+    inbox_id TEXT PRIMARY KEY,
+    triaged_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS messenger_inbox (
     id TEXT PRIMARY KEY,
     platform TEXT NOT NULL DEFAULT 'telegram',
@@ -561,15 +581,39 @@ class Database:
             return False
 
     async def list_inbox(
-        self, *, unread_only: bool = True, limit: int = 20
+        self, *,
+        unread_only: bool = True,
+        exclude_triaged: bool = False,
+        limit: int = 20,
     ) -> list[dict[str, Any]]:
+        where: list[str] = []
+        if unread_only:
+            where.append("read_at IS NULL")
+        if exclude_triaged:
+            where.append(
+                "id NOT IN (SELECT inbox_id FROM messenger_inbox_triaged)"
+            )
+        where_sql = ("WHERE " + " AND ".join(where) + " ") if where else ""
         sql = (
-            "SELECT * FROM messenger_inbox "
-            + ("WHERE read_at IS NULL " if unread_only else "")
+            "SELECT * FROM messenger_inbox " + where_sql
             + "ORDER BY received_at DESC LIMIT ?"
         )
         rows = await (await self.conn.execute(sql, (limit,))).fetchall()
         return [_row_to_inbox(r) for r in rows]
+
+    async def mark_inbox_triaged(self, inbox_ids: list[str]) -> None:
+        """Record that the auto-drain has shown these rows to the operator
+        (regardless of whether the outcome was a reply or a silent decision).
+        Used so the next-restart recovery doesn't re-queue them."""
+        if not inbox_ids:
+            return
+        now = iso(utcnow())
+        await self.conn.executemany(
+            "INSERT OR IGNORE INTO messenger_inbox_triaged "
+            "(inbox_id, triaged_at) VALUES (?, ?)",
+            [(i, now) for i in inbox_ids],
+        )
+        await self.conn.commit()
 
     async def get_inbox_message(self, inbox_id: str) -> dict[str, Any] | None:
         row = await (await self.conn.execute(

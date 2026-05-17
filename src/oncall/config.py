@@ -76,10 +76,6 @@ class Settings(BaseSettings):
     oncall_memory_hybrid_beta: float = 0.3
     oncall_memory_relevance_floor: float = 0.30
     oncall_memory_max_inject: int = 10
-    # Near-duplicate threshold for the at-store merge. New facts with cosine
-    # ≥ this against an existing entry update that entry instead of inserting.
-    oncall_memory_dedup_sim: float = 0.88
-
     # Operator backend: OpenAI-compatible HTTP via Vercel AI Gateway.
     # https://vercel.com/docs/ai-gateway/sdks-and-apis/python
     # Set ONCALL_OPERATOR_MODEL to a gateway model id like "openai/gpt-oss-20b".

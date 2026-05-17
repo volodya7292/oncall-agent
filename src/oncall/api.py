@@ -231,7 +231,6 @@ def create_app() -> FastAPI:
                 relevance_floor=settings.oncall_memory_relevance_floor,
                 hybrid_alpha=settings.oncall_memory_hybrid_alpha,
                 hybrid_beta=settings.oncall_memory_hybrid_beta,
-                dedup_sim=settings.oncall_memory_dedup_sim,
             )
             operator = Operator(
                 db=db, lifecycle=lifecycle, broker=broker,
@@ -292,10 +291,24 @@ def create_app() -> FastAPI:
         if operator is not None and telegram_bot is not None:
             inbox_drain_task = asyncio.create_task(
                 _inbox_drain_loop(
-                    events=events, operator=operator,
+                    events=events, operator=operator, db=db,
                     target_session_id=telegram_bot.session_id,
                 ),
                 name="inbox-drain",
+            )
+        # Memory dedup: write time always INSERTs (no heuristic merge).
+        # Every 5 minutes we ask the operator LLM to consolidate clusters
+        # of near-duplicates so paraphrase merges and same-template-
+        # different-entity cases are decided by reading the texts, not by
+        # cosine alone.
+        memory_dedup_task: asyncio.Task | None = None
+        if operator is not None and operator.memory is not None and llm is not None:
+            memory_dedup_task = asyncio.create_task(
+                _memory_dedup_loop(
+                    memory=operator.memory, llm=llm,
+                    model=settings.oncall_operator_model,
+                ),
+                name="memory-dedup",
             )
         # Memory-embedding rebuild: if the configured embed model differs
         # from what stored rows were last embedded with, kick off a
@@ -337,7 +350,7 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
-            for bg_task in (auto_ping_task, inbox_drain_task):
+            for bg_task in (auto_ping_task, inbox_drain_task, memory_dedup_task):
                 if bg_task is None:
                     continue
                 bg_task.cancel()
@@ -443,20 +456,25 @@ async def _auto_ping_loop(
         await events.publish_global("chat.reply", chat_reply_payload)
 
 
-_INBOX_BATCH_SIZE = 5
-_INBOX_IDLE_FLUSH_SECONDS = 300.0  # 5 minutes
+_INBOX_BATCH_SIZE = 10
+_INBOX_IDLE_FLUSH_SECONDS = 120.0  # 2 minutes
 
 
 async def _inbox_drain_loop(
-    *, events: EventBus, operator: Operator, target_session_id: str,
+    *, events: EventBus, operator: Operator, db: Database,
+    target_session_id: str,
 ) -> None:
-    """Triage inbound DMs through the operator in BATCHES so memory-backed
-    triage doesn't fire one LLM call per DM (cost + rate-limit + UX: one
-    consolidated heads-up reads better than five back-to-back pings).
+    """Triage inbound DMs through the operator in per-chat batches.
 
-    Flush rule: whichever fires first —
-      * batch reaches `_INBOX_BATCH_SIZE` (5) messages, OR
-      * `_INBOX_IDLE_FLUSH_SECONDS` (5 min) passes with no new DM.
+    Each flush carries messages from EXACTLY ONE chat (no cross-chat mixing).
+    A chat's batch flushes when whichever of these fires first for that chat:
+      * `_INBOX_BATCH_SIZE` messages have accumulated, OR
+      * `_INBOX_IDLE_FLUSH_SECONDS` elapses since its last new DM.
+
+    Round-robin fairness: when multiple chats are ready to flush at once,
+    drain in least-recently-flushed order so a chatty sender can't starve
+    quieter ones. A chat with >10 backlog flushes 10 now and waits its turn
+    again — the leftover doesn't jump the queue.
 
     Why this isn't a hard `is_important` gate: the heuristic in telegram_service
     (sender-in-allowlist OR keyword-match) is coarse — it misses "your sister
@@ -468,76 +486,151 @@ async def _inbox_drain_loop(
     when no DM in the batch is worth interrupting the user. The bot's
     chat.reply subscriber drops empty text, so nothing reaches Telegram in
     that case. The DMs still live in messenger_inbox for later inspection."""
-    pending: list[dict[str, Any]] = []
+    # Per-chat state. dict ordering is irrelevant — we always sort by
+    # last_flush_at when picking who flushes next.
+    pending: dict[str, list[dict[str, Any]]] = {}
+    last_msg_at: dict[str, float] = {}
+    last_flush_at: dict[str, float] = {}
     sub_iter = events.subscribe_global(types={"messenger.received"}).__aiter__()
+    loop = asyncio.get_event_loop()
+
+    # Recovery: pick up unread DMs that arrived while the daemon was down or
+    # that were sitting in pending when the previous process exited. The
+    # subscribe_global() iterator only yields FUTURE events, so without this
+    # rows already in messenger_inbox would never auto-triage. We exclude
+    # rows the drain has already shown to the operator (silent or replied)
+    # via `messenger_inbox_triaged` so a restart can't re-burn LLM calls
+    # on previously-decided rows.
+    try:
+        unread = await db.list_inbox(
+            unread_only=True, exclude_triaged=True, limit=200,
+        )
+    except Exception:
+        log.exception("inbox-drain: recovery query failed; starting empty")
+        unread = []
+    if unread:
+        now_t = loop.time()
+        # list_inbox returns DESC by received_at — reverse so the per-chat
+        # queue is oldest-first.
+        for row in reversed(unread):
+            chat_id = str(row.get("chat_id") or "")
+            pending.setdefault(chat_id, []).append(row)
+            last_msg_at[chat_id] = now_t
+        log.info(
+            "inbox-drain: recovered %d unread DM(s) across %d chat(s)",
+            len(unread), len(pending),
+        )
+
+    def _next_idle_deadline() -> float | None:
+        """Earliest time at which some non-empty chat hits the idle limit.
+        None means no chat is waiting — block on the next event indefinitely."""
+        deadlines = [
+            last_msg_at[c] + _INBOX_IDLE_FLUSH_SECONDS
+            for c, msgs in pending.items() if msgs
+        ]
+        return min(deadlines) if deadlines else None
+
     while True:
+        # Flush any chats already ready (at capacity or idle past deadline)
+        # BEFORE blocking on the next event. This handles recovery (29
+        # DMs preloaded on boot need to flush without waiting for a 30th
+        # message) and the general "11 DMs in a chat → flush 10 now, the
+        # 11th waits in the next iteration" case.
+        now = loop.time()
+        ready = [
+            c for c, msgs in pending.items()
+            if msgs and (
+                len(msgs) >= _INBOX_BATCH_SIZE
+                or now - last_msg_at[c] >= _INBOX_IDLE_FLUSH_SECONDS
+            )
+        ]
+        ready.sort(key=lambda c: last_flush_at.get(c, 0.0))
+        for chat_id in ready:
+            batch = pending[chat_id][:_INBOX_BATCH_SIZE]
+            remainder = pending[chat_id][_INBOX_BATCH_SIZE:]
+            if remainder:
+                pending[chat_id] = remainder
+            else:
+                pending.pop(chat_id, None)
+                last_msg_at.pop(chat_id, None)
+            await _flush_inbox_batch(events, operator, target_session_id, batch)
+            last_flush_at[chat_id] = loop.time()
+            # Mark every row in this batch as triaged so a restart's recovery
+            # doesn't re-queue them. Silent outcomes don't set read_at — only
+            # this mark distinguishes "operator has seen it" from "user has
+            # read it themselves".
+            try:
+                await db.mark_inbox_triaged(
+                    [str(r["id"]) for r in batch if r.get("id")]
+                )
+            except Exception:
+                log.exception(
+                    "inbox-drain: mark_inbox_triaged failed for batch %s",
+                    [r.get("id") for r in batch],
+                )
+
+        # Now wait for the next event, or for the earliest idle deadline.
+        deadline = _next_idle_deadline()
+        timeout = max(0.0, deadline - loop.time()) if deadline is not None else None
         try:
-            # No pending → block forever waiting for the first DM. Pending →
-            # apply the idle timer so a small batch still flushes eventually.
-            timeout = _INBOX_IDLE_FLUSH_SECONDS if pending else None
             env = await asyncio.wait_for(sub_iter.__anext__(), timeout=timeout)
+            payload = env.get("payload") or {}
+            chat_id = str(payload.get("chat_id") or "")
+            pending.setdefault(chat_id, []).append(payload)
+            last_msg_at[chat_id] = loop.time()
         except asyncio.TimeoutError:
-            await _flush_inbox_batch(events, operator, target_session_id, pending)
-            pending.clear()
-            continue
+            pass  # next loop iteration will flush idle chats
         except StopAsyncIteration:
             break
-        payload = env.get("payload") or {}
-        pending.append(payload)
-        if len(pending) >= _INBOX_BATCH_SIZE:
-            await _flush_inbox_batch(events, operator, target_session_id, pending)
-            pending.clear()
 
 
 async def _flush_inbox_batch(
     events: EventBus, operator: Operator,
     target_session_id: str, batch: list[dict[str, Any]],
 ) -> None:
-    """Format the batch into one auto-ping note and hand it to the operator.
-    Caller resets the batch list. No-op on empty input."""
+    """Format a single chat's batch into one auto-ping note and hand it to
+    the operator. All messages share `chat_id` (the loop guarantees no
+    cross-chat mixing). No-op on empty input."""
     if not batch:
         return
+    head = batch[0]
+    chat_id = head.get("chat_id") or ""
+    sender = (
+        head.get("sender_username")
+        or head.get("sender_display_name")
+        or "unknown"
+    )
     lines: list[str] = []
     for i, row in enumerate(batch, start=1):
         inbox_id = row.get("id") or ""
-        sender = (
-            row.get("sender_username")
-            or row.get("sender_display_name")
-            or "unknown"
-        )
         body = (row.get("body") or "").replace("\n", " ").strip()
         body_preview = body[:200] + ("…" if len(body) > 200 else "")
         heuristic = "yes" if row.get("is_important") else "no"
-        chat_id = row.get("chat_id") or ""
         lines.append(
-            f"  {i}. inbox_id={inbox_id} chat_id={chat_id} from=@{sender} "
+            f"  {i}. inbox_id={inbox_id} "
             f"heuristic_important={heuristic} body={body_preview!r}"
         )
     note = (
-        f"{len(batch)} inbound DM(s) since the last triage:\n"
+        f"{len(batch)} inbound DM(s) from @{sender} (chat_id={chat_id}) "
+        f"since the last triage:\n"
         + "\n".join(lines)
-        + "\n\nFor each DM you have exactly TWO options: AUTO-REPLY or "
+        + "\n\nYou have exactly TWO options for this batch: AUTO-REPLY or "
           "STAY SILENT. No heads-up to the user — the user reads their own "
           "Telegram.\n"
           "AUTO-REPLY: if the memory entries loaded into your system prompt "
           "(possibly via JOINT inference across multiple entries) authorize "
           "you to reply on the user's behalf for THIS sender on THIS topic, "
           "execute the instruction (dispatch tasks if needed for gathering) "
-          "then call `reply_to_dm` with the controlling memory's id.\n"
-          "STAY SILENT: otherwise. Emit ZERO assistant content for that DM. "
-          "Do not narrate non-events; the user already sees their inbox.\n"
-          "If NONE of the DMs is auto-replyable, emit EMPTY text overall — "
-          "no 'no instructions found' line, no 'nothing important' line, no "
-          "status. heuristic_important is a hint, not a gate."
+          "then call `reply_to_dm` with the controlling memory's id. One "
+          "reply may address the whole batch; you do not need to reply per DM.\n"
+          "STAY SILENT: otherwise. Emit ZERO assistant content. Do not "
+          "narrate non-events; the user already sees their inbox.\n"
+          "heuristic_important is a hint, not a gate."
     )
-    # Retrieval key: join the bodies (cap total) so memory hits cover any of
-    # the topics. Senders join in too — memory may key off a name.
-    senders = " ".join(
-        (r.get("sender_username") or r.get("sender_display_name") or "")
-        for r in batch
-    )
+    # Retrieval key: sender name + joined bodies (capped) so memory hits cover
+    # any topic in the batch and may key off the contact's name.
     bodies = " ".join((r.get("body") or "") for r in batch)
-    retrieval_query = (senders + " " + bodies).strip()[:1200] or None
+    retrieval_query = (sender + " " + bodies).strip()[:1200] or None
     inbox_ids = [r.get("id") for r in batch]
     try:
         result = await operator.auto_ping(
@@ -562,6 +655,26 @@ async def _flush_inbox_batch(
         "trigger": "inbox.batch",
         "task_id": None,
     })
+
+
+_MEMORY_DEDUP_INTERVAL_SECONDS = 300.0
+
+
+async def _memory_dedup_loop(
+    *, memory, llm, model: str,
+    interval_seconds: float = _MEMORY_DEDUP_INTERVAL_SECONDS,
+) -> None:
+    """Periodic intelligent dedup of stored memories. Sleeps first so a
+    fresh-booted daemon doesn't fire a pass before any memory has accrued.
+    Failures only log — the next tick retries."""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await memory.dedup_pass(
+                llm, model=model, reasoning_effort="medium",
+            )
+        except Exception:
+            log.exception("memory-dedup: pass crashed")
 
 
 async def _probe_ollama(host: str = "http://localhost:11434") -> str | None:

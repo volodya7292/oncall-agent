@@ -1,8 +1,8 @@
 """Unit tests for OperatorMemory.
 
 Cover the contract the operator depends on:
-  * `store` inserts new facts; near-duplicates (cos ≥ dedup_sim) update the
-    existing row rather than appending. Multiple candidates → closest wins.
+  * `store` always inserts a new row (write-time dedup is intentionally
+    absent — clusters are reconciled by the periodic `dedup_pass` LLM job).
   * `retrieve` ranks by hybrid score, drops below the relevance floor, and
     bumps `last_accessed_at` only for the rows actually returned.
   * LRU eviction at capacity drops the least-recently-accessed row, and a
@@ -83,7 +83,6 @@ def make_memory(
     relevance_floor: float = 0.30,
     hybrid_alpha: float = 0.7,
     hybrid_beta: float = 0.3,
-    dedup_sim: float = 0.88,
 ) -> OperatorMemory:
     return OperatorMemory(
         db, embedder,
@@ -93,7 +92,6 @@ def make_memory(
         relevance_floor=relevance_floor,
         hybrid_alpha=hybrid_alpha,
         hybrid_beta=hybrid_beta,
-        dedup_sim=dedup_sim,
     )
 
 
@@ -115,7 +113,7 @@ async def test_store_inserts_new_fact(db):
 @pytest.mark.asyncio
 async def test_store_strips_empty_and_overlong(db):
     emb = StubEmbedder()
-    big = "x" * 500
+    big = "x" * 1000
     emb.register("real fact", unit_vec(1.0))
     mem = make_memory(db, emb)
     out = await mem.store(["", "   ", big, "real fact"])
@@ -193,124 +191,6 @@ async def test_retrieve_bumps_only_returned_rows(db):
     assert after["relevant"] > before["relevant"]
     # The irrelevant row was below floor → must NOT be bumped.
     assert after["irrelevant"] == before["irrelevant"]
-
-
-# ---------------------------------------------------------------------------
-# Near-duplicate merge — the user-flagged correctness claim
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_near_duplicate_above_threshold_updates_not_inserts(db):
-    emb = StubEmbedder()
-    emb.register("staging v1", unit_vec(1.0))
-    # cos with [1, 0] = 0.92, above default dedup_sim 0.88 → merge.
-    emb.register("staging v2", unit_vec(0.92))
-    mem = make_memory(db, emb)
-    await mem.store(["staging v1"])
-    initial = await _all_rows(db)
-    assert len(initial) == 1
-    original_created = initial[0]["created_at"]
-    original_id = initial[0]["id"]
-
-    await mem.store(["staging v2"])
-    after = await _all_rows(db)
-    assert len(after) == 1, "merge should not append a second row"
-    assert after[0]["id"] == original_id, "merge updates existing row, not replaces"
-    assert after[0]["text"] == "staging v2", "newest phrasing wins"
-    assert after[0]["created_at"] == original_created, "created_at unchanged on update"
-    assert after[0]["last_accessed_at"] >= original_created, "last_accessed_at bumped"
-
-
-@pytest.mark.asyncio
-async def test_below_threshold_inserts_as_new_row(db):
-    emb = StubEmbedder()
-    emb.register("first", unit_vec(1.0))
-    emb.register("second", unit_vec(0.5))  # cos = 0.5 < 0.88
-    mem = make_memory(db, emb)
-    await mem.store(["first"])
-    await mem.store(["second"])
-    rows = await _all_rows(db)
-    assert len(rows) == 2
-
-
-@pytest.mark.asyncio
-async def test_threshold_boundary_just_above_merges_just_below_inserts(db):
-    emb = StubEmbedder()
-    emb.register("anchor", unit_vec(1.0))
-    emb.register("just below", unit_vec(0.879))
-    emb.register("just above", unit_vec(0.881))
-    mem = make_memory(db, emb)
-    await mem.store(["anchor"])
-    # 0.879 < 0.88 → insert.
-    await mem.store(["just below"])
-    assert await mem.entries_count() == 2
-    # 0.881 ≥ 0.88 → merge into whichever anchor is closer. The "just below"
-    # row is closer (cos with "just above" via the [c, +√(1-c²)] direction
-    # is approximately 0.998), so the merge updates that row.
-    await mem.store(["just above"])
-    assert await mem.entries_count() == 2  # still 2; merge consumed it
-    rows = await _all_rows(db)
-    texts = {r["text"] for r in rows}
-    assert "just above" in texts, "merge replaced text with the new phrasing"
-    assert "just below" not in texts, "the merged row's old text is gone"
-
-
-@pytest.mark.asyncio
-async def test_picks_closest_match_when_multiple_above_threshold(db):
-    # Three stored 4-D unit vectors, all individually above 0.88 cosine
-    # with the incoming candidate ([1,0,0,0]), but pairwise below 0.88 so
-    # they coexist as three separate rows. The 0.95 row must be the one
-    # picked for the merge.
-    s = lambda x: math.sqrt(max(0.0, 1.0 - x * x))
-    A = [0.90,  s(0.90), 0.0,     0.0]      # cos with candidate = 0.90
-    B = [0.95, -s(0.95), 0.0,     0.0]      # cos = 0.95, on the opposite side
-    C = [0.89,  0.0,     0.0,     s(0.89)]  # cos = 0.89, in its own plane
-    cand = [1.0, 0.0, 0.0, 0.0]
-
-    emb = StubEmbedder()
-    emb.register("near", A)
-    emb.register("nearest", B)
-    emb.register("just-in", C)
-    emb.register("candidate", cand)
-    mem = make_memory(db, emb)
-    await mem.store(["near", "nearest", "just-in"])
-    rows_before = await _all_rows(db)
-    nearest_id_before = {r["text"]: r["id"] for r in rows_before}["nearest"]
-
-    await mem.store(["candidate"])
-    rows_after = await _all_rows(db)
-    assert len(rows_after) == 3, "no new row inserted; the closest is updated"
-    texts_after = {r["text"]: r["id"] for r in rows_after}
-    assert "candidate" in texts_after, "the merged row carries the new text"
-    assert texts_after["candidate"] == nearest_id_before, "the 0.95 row was updated"
-    # The other two rows still exist with their original text.
-    assert "near" in texts_after
-    assert "just-in" in texts_after
-
-
-@pytest.mark.asyncio
-async def test_identical_text_trivially_merges(db):
-    emb = StubEmbedder()
-    emb.register("same fact", unit_vec(1.0))
-    mem = make_memory(db, emb)
-    await mem.store(["same fact"])
-    await mem.store(["same fact"])  # cos with itself = 1.0 → merge
-    assert await mem.entries_count() == 1
-
-
-@pytest.mark.asyncio
-async def test_merged_row_retrievable_under_new_text(db):
-    emb = StubEmbedder()
-    emb.register("v1", unit_vec(1.0))
-    emb.register("v2", unit_vec(0.95))   # ≥ dedup → merges into v1's row
-    emb.register("lookup", unit_vec(0.95))  # same direction as v2
-    mem = make_memory(db, emb)
-    await mem.store(["v1"])
-    await mem.store(["v2"])
-    got = await mem.retrieve("lookup")
-    assert [m.text for m in got] == ["v2"], \
-        "after merge, retrieval must surface the NEW text, not the old one"
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +364,7 @@ async def test_real_embeddings_rank_semantically_related_first(db):
         # Loosen the floor a touch — different models normalize cosine
         # differently and we don't want a brittle threshold here.
         relevance_floor=0.20,
-        hybrid_alpha=0.7, hybrid_beta=0.3, dedup_sim=0.88,
+        hybrid_alpha=0.7, hybrid_beta=0.3,
     )
     await mem.store([
         "the staging API runs at api-staging.example.com on port 8443",
@@ -495,31 +375,6 @@ async def test_real_embeddings_rank_semantically_related_first(db):
     assert got, "retrieval returned nothing — model may have changed"
     # Top hit must be the staging fact, not the alex / prod-db one.
     assert "staging" in got[0].text.lower()
-
-
-@requires_gateway
-@pytest.mark.asyncio
-async def test_real_embeddings_paraphrase_triggers_dedup_merge(db):
-    """Storing a near-paraphrase of an existing fact should consolidate
-    into one row, not produce two near-duplicates."""
-    mem = OperatorMemory(
-        db, _real_embedder(),
-        embed_model=EMBED_MODEL,
-        capacity=100, max_inject=3,
-        relevance_floor=0.20,
-        hybrid_alpha=0.7, hybrid_beta=0.3,
-        dedup_sim=0.88,
-    )
-    await mem.store(["the staging API runs at api-staging.example.com:8443"])
-    await mem.store(["staging API is at api-staging.example.com port 8443"])
-    n = await mem.entries_count()
-    # Hard assert: if the model + threshold don't make these dedup, the
-    # 0.88 default is too aggressive for paraphrase. Fail loudly so the
-    # user knows to retune `ONCALL_MEMORY_DEDUP_SIM` for this model.
-    assert n == 1, (
-        f"expected paraphrase to dedup-merge but ended up with {n} rows — "
-        f"consider lowering ONCALL_MEMORY_DEDUP_SIM for {EMBED_MODEL}"
-    )
 
 
 @pytest.mark.asyncio
@@ -552,13 +407,13 @@ async def test_rebuild_when_embed_model_changes(db):
             return out
 
     # Seed via "old" model.
-    old_mem = make_memory(db, _Stub(flavor=1), dedup_sim=0.99, relevance_floor=0.0)
+    old_mem = make_memory(db, _Stub(flavor=1), relevance_floor=0.0)
     old_mem._embed_model = "old-model"  # type: ignore[attr-defined]
     await old_mem.store(["fact alpha", "fact beta"])
     assert await old_mem.entries_count() == 2
 
     # Switch to "new" model — the old rows are now stale and invisible.
-    new_mem = make_memory(db, _Stub(flavor=2), dedup_sim=0.99, relevance_floor=0.0)
+    new_mem = make_memory(db, _Stub(flavor=2), relevance_floor=0.0)
     new_mem._embed_model = "new-model"  # type: ignore[attr-defined]
     assert await new_mem.stale_count() == 2
     assert await new_mem.entries_count() == 0, "stale rows must be hidden from retrieval"

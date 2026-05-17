@@ -759,12 +759,11 @@ class Operator:
         extract_llm: LLMClient | None = None,
         extract_model: str | None = None,
         max_history: int = 60,
-        # 10 is enough for the worst-case drain flow (3 prep tool calls +
-        # dispatch_task + tool_status poll + reply_to_dm + a few stragglers
-        # for redundant model behavior) without giving runaway loops too
-        # much room. Bumped from 6 after observing inbox-drain triage burn
-        # the cap on prep alone.
-        max_tool_rounds: int = 10,
+        # 16 leaves headroom for multi-step drain flows (query_memory ×N +
+        # dispatch_task + tool_status polls + read_chat_style + reply_to_dm +
+        # save_memory) without giving runaway loops unbounded room. Bumped
+        # from 10 after observing inbox-drain triage burn the cap on prep.
+        max_tool_rounds: int = 16,
         runner: OneShotRunner | None = None,
     ) -> None:
         self._db = db

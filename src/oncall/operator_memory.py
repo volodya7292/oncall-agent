@@ -15,6 +15,7 @@ capacity.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -27,7 +28,7 @@ from .db import Database, iso
 from .embeddings import (
     EmbeddingClient,
     cosine_matrix,
-    token_overlap,
+    hybrid_score,
     unpack,
 )
 from .models import utcnow
@@ -36,9 +37,10 @@ from .models import utcnow
 log = logging.getLogger(__name__)
 
 # Hard upper bound on a single fact's text length. The extractor's prompt
-# tells it to keep facts ≤200 chars; this is a defense-in-depth ceiling so
-# a misbehaving extractor can't bloat the prompt budget.
-MAX_ENTRY_CHARS = 400
+# tells it to keep facts short; this is a defense-in-depth ceiling so a
+# misbehaving extractor — or the dedup LLM combining several long facts —
+# can't bloat the prompt budget.
+MAX_ENTRY_CHARS = 512
 
 
 @dataclass
@@ -78,7 +80,6 @@ class OperatorMemory:
         relevance_floor: float,
         hybrid_alpha: float,
         hybrid_beta: float,
-        dedup_sim: float,
     ) -> None:
         self._db = db
         self._embed = embedder
@@ -93,19 +94,23 @@ class OperatorMemory:
         self._floor = relevance_floor
         self._alpha = hybrid_alpha
         self._beta = hybrid_beta
-        self._dedup_sim = dedup_sim
 
     # ---- writes ------------------------------------------------------------
 
     async def store(
         self, facts: list[str], *, source_turn: str | None = None,
     ) -> list[str]:
-        """Embed each fact; for each, near-duplicate-merge against existing
-        rows (cos ≥ dedup_sim) or INSERT; evict by LRU until count ≤ capacity.
+        """Embed each fact and INSERT it as a new row; evict by LRU until
+        count ≤ capacity.
 
-        Returns the texts that were actually written or updated (in input
-        order). Empty/whitespace/over-length facts are skipped silently.
-        Embedding failures raise — the caller surfaces extraction errors.
+        No write-time dedup — clusters of near-duplicates are reconciled by
+        the periodic `dedup_pass()` background job, which uses the LLM to
+        tell paraphrase merges from same-template-different-entity cases
+        that embeddings alone confuse.
+
+        Returns the texts that were actually written (in input order).
+        Empty/whitespace/over-length facts are skipped silently. Embedding
+        failures raise — the caller surfaces extraction errors.
         """
         cleaned = []
         for f in facts:
@@ -117,36 +122,16 @@ class OperatorMemory:
 
         vecs = await self._embed.embed(cleaned)
         out: list[str] = []
-        stored = 0
-        updated = 0
         for text, vec in zip(cleaned, vecs):
             qvec = np.asarray(vec, dtype=np.float32)
-            existing = await self._all_rows()
-            if existing:
-                matrix = np.vstack([unpack(r["embedding"]) for r in existing])
-                cosines = cosine_matrix(qvec, matrix)
-                if cosines.size:
-                    idx = int(np.argmax(cosines))
-                    best = float(cosines[idx])
-                    if best >= self._dedup_sim:
-                        await self._update_row(
-                            int(existing[idx]["id"]),
-                            text=text,
-                            embedding=qvec,
-                            source_turn=source_turn,
-                        )
-                        out.append(text)
-                        updated += 1
-                        continue
             await self._insert_row(
                 text=text, embedding=qvec, source_turn=source_turn,
             )
             out.append(text)
-            stored += 1
             await self._maybe_evict()
 
         operator_log.info("memory_store " + fmt(
-            stored=stored, updated=updated, capacity=self._capacity,
+            stored=len(out), capacity=self._capacity,
         ))
         return out
 
@@ -181,8 +166,10 @@ class OperatorMemory:
 
         scored: list[tuple[float, float, dict[str, Any]]] = []
         for r, c in zip(rows, cosines):
-            fuzzy = token_overlap(q, r["text"])
-            score = self._alpha * float(c) + self._beta * fuzzy
+            score = hybrid_score(
+                float(c), q, r["text"],
+                alpha=self._alpha, beta=self._beta,
+            )
             if score >= self._floor:
                 scored.append((score, float(c), r))
         scored.sort(key=lambda t: t[0], reverse=True)
@@ -254,6 +241,247 @@ class OperatorMemory:
         await self._db.conn.commit()
         return cur.rowcount > 0
 
+    async def dedup_pass(
+        self,
+        llm: Any,
+        *,
+        model: str,
+        reasoning_effort: str = "medium",
+        cluster_threshold: float = 0.80,
+        max_cluster_size: int = 8,
+    ) -> dict[str, int]:
+        """Background dedup pass. Finds connected components in the cosine
+        graph (edges ≥ `cluster_threshold`), then for each multi-row cluster
+        asks the LLM to either consolidate into one entry or keep separate.
+
+        The LLM is the arbiter, not heuristics — write-time dedup catches only
+        near-identical phrasing; this pass picks up the harder cases (templates
+        that swap one detail) and treats them correctly by reading the texts.
+
+        Returns counts for logging. Failures only log; the pass is idempotent
+        so the next run retries."""
+        rows = await self._all_rows()
+        if len(rows) < 2:
+            return {"clusters_found": 0, "merged": 0, "kept": 0, "failed": 0}
+        matrix = np.vstack([unpack(r["embedding"]) for r in rows])
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        normed = matrix / norms
+        cos = normed @ normed.T
+
+        # Hybrid similarity (same formula retrieval uses): alpha*cos + beta*
+        # Jaccard token overlap. Identifier-rich texts that embeddings rank
+        # low get a fuzzy boost; pure-template paraphrases still cluster on
+        # cosine.
+        hybrid = np.zeros_like(cos)
+        for i in range(len(rows)):
+            for j in range(i + 1, len(rows)):
+                h = hybrid_score(
+                    float(cos[i, j]), rows[i]["text"], rows[j]["text"],
+                    alpha=self._alpha, beta=self._beta,
+                )
+                hybrid[i, j] = h
+                hybrid[j, i] = h
+
+        # Pairs the LLM has previously reviewed and decided NOT to merge.
+        # Skipping these as edges avoids burning LLM calls re-asking every
+        # 5 min about the same John-vs-Jane situations. id_a < id_b.
+        skip = await self._load_skip_pairs()
+
+        n = len(rows)
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        any_edge = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                if hybrid[i, j] < cluster_threshold:
+                    continue
+                a = int(rows[i]["id"])
+                b = int(rows[j]["id"])
+                if (min(a, b), max(a, b)) in skip:
+                    continue
+                ra, rb = find(i), find(j)
+                if ra != rb:
+                    parent[ra] = rb
+                any_edge = True
+        if not any_edge:
+            return {"clusters_found": 0, "merged": 0, "kept": 0, "failed": 0}
+        groups: dict[int, list[int]] = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(i)
+        clusters = [g for g in groups.values() if len(g) >= 2]
+
+        merged_n = kept_n = failed_n = 0
+        for indices in clusters:
+            if len(indices) > max_cluster_size:
+                sub = hybrid[np.ix_(indices, indices)]
+                top = np.argsort(-sub.sum(axis=1))[:max_cluster_size]
+                indices = [indices[k] for k in top]
+            cluster_rows = [rows[i] for i in indices]
+            cluster_ids = {int(r["id"]) for r in cluster_rows}
+            try:
+                decision = await self._dedup_decide(
+                    llm, model=model, reasoning_effort=reasoning_effort,
+                    cluster_rows=cluster_rows,
+                )
+            except Exception:
+                log.exception("memory_dedup: LLM call failed for cluster %s",
+                              sorted(cluster_ids))
+                failed_n += 1
+                continue
+            raw_groups = (decision or {}).get("merge_groups") or []
+            if not isinstance(raw_groups, list):
+                raw_groups = []
+            # Validate. Each group: ids ⊆ cluster_ids, |ids| ≥ 2, text non-empty
+            # and within MAX_ENTRY_CHARS. Skip silently anything malformed —
+            # the rest of the cluster is untouched.
+            valid_groups: list[tuple[list[int], str]] = []
+            for g in raw_groups:
+                if not isinstance(g, dict):
+                    continue
+                raw_ids = g.get("ids") or []
+                if not isinstance(raw_ids, list):
+                    continue
+                try:
+                    gids = [int(i) for i in raw_ids if int(i) in cluster_ids]
+                except (TypeError, ValueError):
+                    continue
+                if len(gids) < 2:
+                    continue
+                text = (g.get("text") or "").strip()
+                if not text or len(text) > MAX_ENTRY_CHARS:
+                    operator_log.info("memory_dedup_bad_merge " + fmt(
+                        ids=sorted(gids), reason="empty-or-overlong",
+                    ))
+                    failed_n += 1
+                    continue
+                valid_groups.append((gids, text))
+            merged_ids = {i for gids, _ in valid_groups for i in gids}
+            if not valid_groups:
+                kept_n += 1
+                operator_log.info("memory_dedup_keep " + fmt(
+                    ids=sorted(cluster_ids),
+                ))
+            else:
+                for gids, text in valid_groups:
+                    try:
+                        vec = (await self._embed.embed([text]))[0]
+                    except Exception:
+                        log.exception("memory_dedup: embed failed for merged text")
+                        failed_n += 1
+                        continue
+                    await self._insert_row(
+                        text=text,
+                        embedding=np.asarray(vec, dtype=np.float32),
+                        source_turn="dedup",
+                    )
+                    for rid in gids:
+                        await self.delete_by_id(rid)
+                    merged_n += 1
+                    operator_log.info("memory_dedup_merge " + fmt(
+                        ids=sorted(gids), text=text,
+                    ))
+            # Record skip pairs for every surviving id-pair the LLM saw and
+            # did NOT merge. Survivors = cluster ids minus anything that
+            # ended up in a merge group (those rows are deleted; recording
+            # pairs that reference them is moot and would just clutter the
+            # table).
+            survivors = sorted(cluster_ids - merged_ids)
+            new_skip_pairs: list[tuple[int, int]] = []
+            for ai in range(len(survivors)):
+                for bi in range(ai + 1, len(survivors)):
+                    new_skip_pairs.append((survivors[ai], survivors[bi]))
+            if new_skip_pairs:
+                await self._record_skip_pairs(new_skip_pairs)
+        operator_log.info("memory_dedup " + fmt(
+            clusters_found=len(clusters),
+            merged=merged_n, kept=kept_n, failed=failed_n,
+        ))
+        return {
+            "clusters_found": len(clusters),
+            "merged": merged_n,
+            "kept": kept_n,
+            "failed": failed_n,
+        }
+
+    async def _load_skip_pairs(self) -> set[tuple[int, int]]:
+        rows = await (await self._db.conn.execute(
+            "SELECT id_a, id_b FROM memory_dedup_skip_pairs"
+        )).fetchall()
+        return {(int(r["id_a"]), int(r["id_b"])) for r in rows}
+
+    async def _record_skip_pairs(self, pairs: list[tuple[int, int]]) -> None:
+        now = iso(utcnow())
+        await self._db.conn.executemany(
+            "INSERT OR IGNORE INTO memory_dedup_skip_pairs "
+            "(id_a, id_b, recorded_at) VALUES (?, ?, ?)",
+            [(a, b, now) for (a, b) in pairs],
+        )
+        await self._db.conn.commit()
+
+    async def _dedup_decide(
+        self,
+        llm: Any,
+        *,
+        model: str,
+        reasoning_effort: str,
+        cluster_rows: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """One LLM call: decide merge-or-keep for one cluster. Returns the
+        parsed JSON dict or None on parse/empty response (caller logs)."""
+        items = json.dumps(
+            [{"id": int(r["id"]), "text": str(r["text"])} for r in cluster_rows],
+            ensure_ascii=False,
+        )
+        system = (
+            "You deduplicate stored memories. Return STRICT JSON, no prose.\n"
+            "Schema:\n"
+            '  {"merge_groups": [\n'
+            '    {"ids": [<int>, <int>, ...], "text": "<consolidated text '
+            "preserving every detail from each member, ≤512 chars>\"},\n"
+            "    ...\n"
+            "  ]}\n"
+            "Each entry is a SUBSET of the input memories you want to "
+            "consolidate into one new entry. The members of a group must "
+            "ALL state the SAME fact (paraphrases of one another). "
+            "Memories that refer to DIFFERENT entities (person, host, "
+            "version, identifier, scope, etc.) MUST NOT share a group. "
+            "Memories not listed in any group are kept as-is.\n"
+            "If nothing should be merged, return {\"merge_groups\": []}.\n"
+            "When in doubt, omit — losing information is worse than keeping "
+            "a duplicate."
+        )
+        resp = await llm.chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": "Memories:\n" + items},
+            ],
+            tools=[],
+            max_tokens=2048,
+            reasoning_effort=reasoning_effort,
+        )
+        content = (resp.get("content") or "").strip()
+        if not content:
+            return None
+        if content.startswith("```"):
+            stripped = content.strip("`").strip()
+            if stripped.lower().startswith("json"):
+                stripped = stripped[4:].lstrip()
+            content = stripped
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            log.warning("memory_dedup: non-JSON response %r", content[:200])
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
     async def entries_count(self) -> int:
         """Count of rows usable for retrieval — i.e., embedded with the
         currently-configured model. Rows pending a rebuild are excluded
@@ -293,26 +521,6 @@ class OperatorMemory:
         )
         await self._db.conn.commit()
         return cur.lastrowid or 0
-
-    async def _update_row(
-        self,
-        row_id: int,
-        *,
-        text: str,
-        embedding: np.ndarray,
-        source_turn: str | None,
-    ) -> None:
-        now = iso(utcnow())
-        await self._db.conn.execute(
-            "UPDATE operator_memories "
-            "SET text = ?, embedding = ?, model = ?, "
-            "    source_turn = COALESCE(?, source_turn), "
-            "    last_accessed_at = ?, "
-            "    access_count = access_count + 1 "
-            "WHERE id = ?",
-            (text, embedding.tobytes(), self._embed_model, source_turn, now, row_id),
-        )
-        await self._db.conn.commit()
 
     # ---- rebuild on model change ------------------------------------------
 
