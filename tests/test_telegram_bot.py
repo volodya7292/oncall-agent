@@ -1103,3 +1103,125 @@ async def test_owner_text_only_still_passes_attachments_none(bus):
         await svc.stop()
     assert operator.calls[0]["attachments"] is None
     assert [c[0] for c in api.calls if c[0] == "download_file"] == []
+
+
+# ---------------------------------------------------------------------------
+# DM allowlist commands (/allowdm, /denydm, /dmlist)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_allowdm_adds_chat_and_denydm_removes(bus, db):
+    """`/allowdm <chat>` writes to the allowlist table; `/denydm <chat>`
+    removes it. Both are idempotent — repeating yields a "was already" /
+    "was not" reply instead of throwing."""
+    api = FakeBotApi()
+    svc = await _make_bot_with_db(db, bus, api, FakeOperator())
+    try:
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="/allowdm 42")["message"])
+        assert await db.is_dm_allowed("42") is True
+        # Idempotent: second add reports already-present.
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="/allowdm 42")["message"])
+        assert "already" in api.sent[-1]["text"]
+
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="/denydm 42")["message"])
+        assert await db.is_dm_allowed("42") is False
+        # Idempotent: second remove reports was-not-present.
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="/denydm 42")["message"])
+        assert "not on the allowlist" in api.sent[-1]["text"]
+    finally:
+        await svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_allowdm_without_argument_prints_usage(bus, db):
+    api = FakeBotApi()
+    svc = await _make_bot_with_db(db, bus, api, FakeOperator())
+    try:
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="/allowdm")["message"])
+        assert "Usage:" in api.sent[-1]["text"]
+        # Nothing was written.
+        assert await db.list_dm_allowed() == []
+    finally:
+        await svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_dmlist_shows_allowlisted_chats(bus, db):
+    api = FakeBotApi()
+    svc = await _make_bot_with_db(db, bus, api, FakeOperator())
+    try:
+        # Empty allowlist message.
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="/dmlist")["message"])
+        assert "empty" in api.sent[-1]["text"]
+        # After adding entries, /dmlist surfaces them.
+        await db.allow_dm("12345")
+        await db.allow_dm("-100999")
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="/dmlist")["message"])
+        body = api.sent[-1]["text"]
+        assert "12345" in body and "-100999" in body
+    finally:
+        await svc.stop()
+
+
+class _FakeTelegramForResolve:
+    """Just enough surface to satisfy `_resolve_label` — only the one method
+    is called. Returns canned rows; raises for "missing" ids so we exercise
+    the graceful-fallback branch."""
+
+    def __init__(self, by_id: dict[str, dict[str, Any] | None]) -> None:
+        self._by_id = by_id
+        self.calls: list[str] = []
+
+    async def resolve_chat_name(self, chat_id: str):
+        self.calls.append(chat_id)
+        return self._by_id.get(chat_id)
+
+
+@pytest.mark.asyncio
+async def test_dmlist_resolves_names_via_userbot(bus, db):
+    """When the userbot is wired, `/dmlist` annotates each chat_id with the
+    resolved display name + @username. Unknown ids fall back to bare id —
+    no exception, no missing row."""
+    api = FakeBotApi()
+    tg = _FakeTelegramForResolve(by_id={
+        "111": {"display_name": "Jane Roe", "username": "jane", "is_user": True},
+        "-100999": {"display_name": "Ops Channel", "username": None, "is_user": False},
+        # "777" is intentionally absent — should fall back to bare id.
+    })
+    svc = TelegramBotService(
+        api=api, operator=FakeOperator(), events=bus,
+        owner_user_id=OWNER_ID, db=db, telegram=tg,
+    )
+    await svc.start()
+    try:
+        await db.allow_dm("111")
+        await db.allow_dm("-100999")
+        await db.allow_dm("777")
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="/dmlist")["message"])
+        body = api.sent[-1]["text"]
+        # User chat resolved with name + handle + id.
+        assert "Jane Roe" in body and "@jane" in body and "111" in body
+        # Channel resolved with title + id (no username).
+        assert "Ops Channel" in body and "-100999" in body
+        # Unknown id falls back to bare id without crashing.
+        assert "777" in body
+        # Resolver was queried once per row.
+        assert set(tg.calls) == {"111", "-100999", "777"}
+    finally:
+        await svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_allowlist_commands_ignore_non_owner(bus, db):
+    """Hard guardrail can't be bypassed by a stranger spoofing /allowdm —
+    the stranger gate sits above all command dispatch."""
+    api = FakeBotApi()
+    svc = await _make_bot_with_db(db, bus, api, FakeOperator())
+    try:
+        await svc._dispatch(_msg(sender_id=99, text="/allowdm 42")["message"])
+        assert await db.is_dm_allowed("42") is False
+        # No reply was sent — the bot silently ignored.
+        assert not any("Allowlisted" in s.get("text", "") for s in api.sent)
+    finally:
+        await svc.stop()

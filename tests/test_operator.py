@@ -528,6 +528,9 @@ async def test_reply_to_dm_is_chat_keyed_and_requires_authority_memory(stack):
 
     stack["memory"].get_by_id = _get_by_id  # type: ignore[assignment]
 
+    # The user must allowlist the chat — empty by default.
+    await stack["db"].allow_dm("12345")
+
     llm = ScriptedLLM(script=[
         [("reply_to_dm", {
             "chat_id": "12345", "text": "on it",
@@ -546,6 +549,51 @@ async def test_reply_to_dm_is_chat_keyed_and_requires_authority_memory(stack):
     reply_calls = [c for c in fake.calls if c[0] == "reply_to_chat"]
     assert reply_calls and reply_calls[0][1]["chat_id"] == "12345"
     assert reply_calls[0][1]["text"] == "on it"
+
+
+@pytest.mark.asyncio
+async def test_reply_to_dm_blocked_when_chat_not_on_allowlist(stack):
+    """Even with a valid authority memory, `reply_to_dm` must refuse if the
+    chat is not on the DM allowlist. This is the final hard gate against
+    prompt injection: an attacker who manages to forge both a sender and a
+    seemingly-authorizing memory cannot drain the bot to arbitrary chats."""
+    fake = FakeTelegramForOperator()
+    from oncall.operator_memory import Memory
+    stack["memory"]._by_id = {  # type: ignore[attr-defined]
+        7: Memory(
+            id=7, text="Auto-reply to @alex about staging is OK.",
+            score=0.0, cosine=0.0, last_accessed_at="2026-05-17T00:00:00+00:00",
+        ),
+    }
+
+    async def _get_by_id(mid):
+        return stack["memory"]._by_id.get(int(mid))  # type: ignore[attr-defined]
+
+    stack["memory"].get_by_id = _get_by_id  # type: ignore[assignment]
+
+    # NOTE: no `allow_dm("12345")` — default state is empty allowlist.
+
+    llm = ScriptedLLM(script=[
+        [("reply_to_dm", {
+            "chat_id": "12345", "text": "on it",
+            "authority_memory_id": 7,
+        })],
+        "blocked — staying silent",
+    ])
+    operator = Operator(
+        db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
+        settings=stack["settings"], paths=stack["paths"], llm=llm, memory=stack["memory"],
+        telegram=fake,  # type: ignore[arg-type]
+        events=stack["events"],
+    )
+    await operator.chat_turn(session_id="s_blocked", user_text="(autopinged)")
+
+    # Hard guardrail: no actual send.
+    assert not [c for c in fake.calls if c[0] == "reply_to_chat"]
+    tool_msgs = [m for m in llm.calls_made[1]["messages"] if m["role"] == "tool"]
+    payload = json.loads(tool_msgs[0]["content"])
+    assert "not on the DM allowlist" in payload["error"]
+    assert "/allowdm 12345" in payload["error"]
 
 
 @pytest.mark.asyncio
@@ -1064,7 +1112,7 @@ async def test_extractor_suggestion_ping_is_silent(stack):
         m for m in main_llm.calls_made[1]["messages"] if m["role"] == "user"
     ]
     assert any(
-        "extractor flagged candidate memories" in m["content"]
+        "extractor flagged citations from the user" in m["content"]
         for m in suggestion_call_user_msgs
     ), suggestion_call_user_msgs
 
@@ -1392,3 +1440,282 @@ async def test_session_lock_serializes_chat_turn_and_auto_ping(stack):
     release.set()
     await asyncio.gather(turn, ping)
     assert llm.order == ["chat_turn_in", "chat_turn_out", "auto_ping"]
+
+
+# ---------------------------------------------------------------------------
+# Autonomous-reply lockdown (restricted_to_chat)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_restricted_turn_allows_locked_chat_reads(stack):
+    """A turn started with restricted_to_chat=X must let read_chat /
+    read_chat_style on chat_id=X through unchanged."""
+    fake = FakeTelegramForOperator(chat_history=[
+        {"message_id": "m1", "text": "hi", "outgoing": False,
+         "sender_username": "alex", "has_media": False},
+    ])
+    llm = ScriptedLLM(script=[
+        [("read_chat", {"chat_id": "111", "limit": 5})],
+        "ok",
+    ])
+    operator = Operator(
+        db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
+        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        memory=stack["memory"], telegram=fake,  # type: ignore[arg-type]
+    )
+    await stack["db"].ensure_chat_session("s_lock")
+    await stack["db"].append_chat_message("s_lock", "user", "warmup")
+    await operator.auto_ping(
+        session_id="s_lock",
+        note="1 new DM(s) in chat_id=111 from @alex.\n…",
+        restricted_to_chat="111",
+    )
+    # telegram.get_chat_history was actually called — the lockdown didn't
+    # short-circuit a request that targets the locked chat.
+    assert [c for c in fake.calls if c[0] == "get_chat_history"]
+
+
+@pytest.mark.asyncio
+async def test_restricted_turn_refuses_other_chat_reads(stack):
+    """The whole point of the lockdown: read_chat with chat_id != locked
+    returns a `locked to chat_id=...` error and never touches telegram."""
+    fake = FakeTelegramForOperator()
+    llm = ScriptedLLM(script=[
+        [("read_chat", {"chat_id": "OTHER", "limit": 5})],
+        "stayed silent",
+    ])
+    operator = Operator(
+        db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
+        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        memory=stack["memory"], telegram=fake,  # type: ignore[arg-type]
+    )
+    await stack["db"].ensure_chat_session("s_lock")
+    await stack["db"].append_chat_message("s_lock", "user", "warmup")
+    await operator.auto_ping(
+        session_id="s_lock",
+        note="1 new DM(s) in chat_id=111 from @alex.\n…",
+        restricted_to_chat="111",
+    )
+    # No actual call to telegram.
+    assert not [c for c in fake.calls if c[0] == "get_chat_history"]
+    # The tool result fed back to the LLM was the lockdown error.
+    tool_msgs = [m for m in llm.calls_made[1]["messages"] if m["role"] == "tool"]
+    payload = json.loads(tool_msgs[0]["content"])
+    assert "locked to chat_id=111" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_restricted_turn_refuses_cross_chat_enumeration(stack):
+    """read_inbox / list_chats / search_chats enumerate ACROSS chats —
+    there's no targeted form, so they must be refused outright when the
+    turn is locked. Loops them through one ScriptedLLM and checks each."""
+    fake = FakeTelegramForOperator()
+    llm = ScriptedLLM(script=[
+        [
+            ("read_inbox", {}),
+            ("list_chats", {}),
+            ("search_chats", {"query": "alex"}),
+        ],
+        "stayed silent",
+    ])
+    operator = Operator(
+        db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
+        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        memory=stack["memory"], telegram=fake,  # type: ignore[arg-type]
+    )
+    await stack["db"].ensure_chat_session("s_lock")
+    await stack["db"].append_chat_message("s_lock", "user", "warmup")
+    await operator.auto_ping(
+        session_id="s_lock", note="1 new DM(s) in chat_id=111 from @alex.\n…",
+        restricted_to_chat="111",
+    )
+    # All three telegram methods stayed un-called.
+    assert not [c for c in fake.calls if c[0] in (
+        "list_inbox", "list_pending_chats", "list_chats", "search_chats",
+    )]
+    tool_msgs = [m for m in llm.calls_made[1]["messages"] if m["role"] == "tool"]
+    for m in tool_msgs:
+        payload = json.loads(m["content"])
+        assert "refused during an autonomous-reply turn" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_restricted_turn_refuses_local_read_image(stack):
+    """read_image(path=...) is a filesystem read; not part of the locked
+    chat. Refused. read_image(chat_id=locked) is allowed; checked
+    separately via the chat_id branch in the locked-reads test."""
+    fake = FakeTelegramForOperator()
+    llm = ScriptedLLM(script=[
+        [("read_image", {"path": "/etc/passwd"})],
+        "stayed silent",
+    ])
+    operator = Operator(
+        db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
+        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        memory=stack["memory"], telegram=fake,  # type: ignore[arg-type]
+    )
+    await stack["db"].ensure_chat_session("s_lock")
+    await stack["db"].append_chat_message("s_lock", "user", "warmup")
+    await operator.auto_ping(
+        session_id="s_lock", note="1 new DM(s) in chat_id=111 from @alex.\n…",
+        restricted_to_chat="111",
+    )
+    tool_msgs = [m for m in llm.calls_made[1]["messages"] if m["role"] == "tool"]
+    payload = json.loads(tool_msgs[0]["content"])
+    assert "filesystem reads are out of scope" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_restricted_dispatch_task_defers_and_publishes_event(stack):
+    """In a restricted turn, dispatch_task must NOT spawn directly — it
+    creates a `pending_dispatches` row, publishes a
+    `dispatch.approval_requested` event for the bot, and returns a
+    pending sentinel to the operator."""
+    fake = FakeTelegramForOperator()
+    submitted: list[dict[str, Any]] = []
+    original_submit = stack["lifecycle"].submit_task
+
+    async def spy_submit(**kwargs):
+        submitted.append(kwargs)
+        return await original_submit(**kwargs)
+    stack["lifecycle"].submit_task = spy_submit  # type: ignore[method-assign]
+
+    # Capture dispatch.approval_requested events.
+    events_seen: list[dict[str, Any]] = []
+
+    async def collect():
+        async for env in stack["events"].subscribe_global(
+            types={"dispatch.approval_requested"},
+        ):
+            events_seen.append(env)
+            return  # one is enough
+
+    collector = asyncio.create_task(collect())
+    await asyncio.sleep(0)  # let the subscriber attach
+
+    llm = ScriptedLLM(script=[
+        [("dispatch_task", {"prompt": "grep alex's project for X", "model": "haiku"})],
+        "",  # operator emits empty content after the deferred dispatch
+    ])
+    operator = Operator(
+        db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
+        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        memory=stack["memory"], telegram=fake,  # type: ignore[arg-type]
+        events=stack["events"],
+    )
+    await stack["db"].ensure_chat_session("s_lock")
+    await stack["db"].append_chat_message("s_lock", "user", "warmup")
+    await operator.auto_ping(
+        session_id="s_lock", note="1 new DM(s) in chat_id=111 from @alex.\n…",
+        restricted_to_chat="111",
+    )
+    await asyncio.wait_for(collector, timeout=2.0)
+
+    # No task was actually spawned.
+    assert not submitted
+    # An event fired with the right payload.
+    assert events_seen
+    payload = events_seen[0]["payload"]
+    assert payload["chat_session_id"] == "s_lock"
+    assert payload["restricted_to_chat"] == "111"
+    assert payload["prompt"] == "grep alex's project for X"
+    assert payload["dispatch_id"]
+    # The DB row is pending.
+    row = await stack["db"].get_pending_dispatch(payload["dispatch_id"])
+    assert row is not None
+    assert row["resolution"] is None
+    # The operator's tool_result was the pending sentinel.
+    tool_msgs = [m for m in llm.calls_made[1]["messages"] if m["role"] == "tool"]
+    result_payload = json.loads(tool_msgs[0]["content"])
+    assert result_payload["status"] == "pending_approval"
+
+
+@pytest.mark.asyncio
+async def test_resolve_dispatch_approval_allow_spawns_with_restriction(stack):
+    """When the user taps Yes, `resolve_dispatch_approval('allow')`
+    spawns the task with `restricted_to_chat` inherited so the executor
+    is also locked."""
+    submitted: list[dict[str, Any]] = []
+    original_submit = stack["lifecycle"].submit_task
+
+    async def spy_submit(**kwargs):
+        submitted.append(kwargs)
+        return await original_submit(**kwargs)
+    stack["lifecycle"].submit_task = spy_submit  # type: ignore[method-assign]
+
+    operator = Operator(
+        db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
+        settings=stack["settings"], paths=stack["paths"],
+        llm=ScriptedLLM(script=[]), memory=stack["memory"],
+        events=stack["events"],
+    )
+    await stack["db"].create_pending_dispatch(
+        dispatch_id="d1", chat_session_id="s_lock",
+        prompt="check staging", model="haiku",
+        restricted_to_chat="111",
+    )
+    out = await operator.resolve_dispatch_approval("d1", "allow")
+    assert out["status"] == "approved"
+    assert submitted and submitted[0]["restricted_to_chat"] == "111"
+    assert submitted[0]["prompt"] == "check staging"
+
+    # Idempotency: second tap is a no-op and reports already-resolved.
+    out2 = await operator.resolve_dispatch_approval("d1", "allow")
+    assert out2["status"] == "already_resolved"
+    assert len(submitted) == 1  # NOT re-spawned
+
+    # Cleanup the spawned task.
+    for tid in list(stack["lifecycle"].running.keys()):
+        await stack["lifecycle"].kill(tid, reason="test_cleanup")
+
+
+@pytest.mark.asyncio
+async def test_resolve_dispatch_approval_deny_does_not_spawn(stack):
+    submitted: list[dict[str, Any]] = []
+    original_submit = stack["lifecycle"].submit_task
+
+    async def spy_submit(**kwargs):
+        submitted.append(kwargs)
+        return await original_submit(**kwargs)
+    stack["lifecycle"].submit_task = spy_submit  # type: ignore[method-assign]
+
+    operator = Operator(
+        db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
+        settings=stack["settings"], paths=stack["paths"],
+        llm=ScriptedLLM(script=[]), memory=stack["memory"],
+        events=stack["events"],
+    )
+    await stack["db"].create_pending_dispatch(
+        dispatch_id="d2", chat_session_id="s_lock",
+        prompt="check staging", model="haiku",
+        restricted_to_chat="111",
+    )
+    out = await operator.resolve_dispatch_approval("d2", "deny")
+    assert out["status"] == "denied"
+    assert not submitted
+    # Row is marked resolved=deny.
+    row = await stack["db"].get_pending_dispatch("d2")
+    assert row is not None and row["resolution"] == "deny"
+
+
+def test_messenger_restriction_helper_blocks_cross_chat():
+    """The /internal/messenger gate is enforced by `_messenger_restriction_error`.
+    Pure function; unit-test it directly."""
+    from oncall.api import MessengerOpBody, _messenger_restriction_error
+    # `style` is in the locked-to-chat-id set: mismatch refused, match allowed.
+    refused = MessengerOpBody(op="style", chat_id="OTHER", session_id="x")
+    assert "refused" in (_messenger_restriction_error(refused, "111") or "")
+    ok = MessengerOpBody(op="style", chat_id="111", session_id="x")
+    assert _messenger_restriction_error(ok, "111") is None
+    # `list` is in the refused-when-restricted set: no chat_id can save it.
+    assert _messenger_restriction_error(
+        MessengerOpBody(op="list", chat_id="111", session_id="x"), "111",
+    ) is not None
+    # `send` requires chat_id match.
+    assert _messenger_restriction_error(
+        MessengerOpBody(op="send", chat_id="OTHER", text="hi", session_id="x"), "111",
+    ) is not None
+    assert _messenger_restriction_error(
+        MessengerOpBody(op="send", chat_id="111", text="hi", session_id="x"), "111",
+    ) is None

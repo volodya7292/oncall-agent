@@ -524,6 +524,35 @@ class TelegramService:
                 break
         return out
 
+    async def resolve_chat_name(
+        self, chat_id: str,
+    ) -> dict[str, str | None] | None:
+        """Resolve `chat_id` → `{display_name, username, is_user}` via telethon's
+        `get_entity`. Used to surface human-readable labels for chats stored
+        only by id (e.g. the DM allowlist). Returns None on any failure —
+        unknown ids, network blips, or a dropped client connection. The
+        caller falls back to showing just the id."""
+        try:
+            entity = await self._client.get_entity(_entity_arg(chat_id))
+        except Exception:
+            return None
+        if entity is None:
+            return None
+        username = getattr(entity, "username", None) or None
+        # _display_name handles first+last; for non-user entities (groups,
+        # channels) the `.title` attribute is what they expose, so fall
+        # back to that.
+        name = _display_name(entity) or getattr(entity, "title", None) or None
+        is_user = bool(getattr(entity, "first_name", None)) or bool(
+            getattr(entity, "last_name", None)
+        )
+        return {
+            "chat_id": chat_id,
+            "display_name": name,
+            "username": username,
+            "is_user": is_user,
+        }
+
     async def send(self, chat_id: str, text: str) -> dict[str, Any]:
         entity = _entity_arg(chat_id)
         sent = await self._client.send_message(entity, text)

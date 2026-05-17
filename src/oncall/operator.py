@@ -18,7 +18,7 @@ import logging
 import re
 from dataclasses import dataclass
 from typing import Any, Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from .audit import fmt, operator_log
 from .broker import Broker
@@ -886,10 +886,14 @@ class Operator:
         """Static prompt + retrieval-scoped memory snapshot. Rebuilt every
         turn; the memory section reflects only entries that scored as
         relevant for `query` (the current user message). Auto-ping turns
-        pass `query=None` to skip retrieval entirely."""
+        pass `query=None` to skip retrieval entirely. The {{owner_name}}
+        placeholder in the base prompt is substituted at every turn so
+        /setownername edits take effect without a daemon restart."""
+        from .config import read_owner_name
         memory_block = await self._memory.for_prompt(query)
+        base = self._system_prompt_base.replace("{{owner_name}}", read_owner_name())
         return (
-            f"{self._system_prompt_base}\n\n"
+            f"{base}\n\n"
             "# Your memory (auto-managed, relevant entries only)\n\n"
             "These are entries from your persistent memory that scored as "
             "relevant to this turn. Memory is auto-extracted from prior user "
@@ -939,7 +943,9 @@ class Operator:
         return result
 
     async def auto_ping(
-        self, session_id: str, note: str, *, retrieval_query: str | None = None,
+        self, session_id: str, note: str, *,
+        retrieval_query: str | None = None,
+        restricted_to_chat: str | None = None,
     ) -> OperatorTurnResult:
         """Inject a synthetic '[system note: ...]' turn into a chat session.
         Used by background tasks that re-engage the operator (task terminated,
@@ -959,6 +965,7 @@ class Operator:
             return await self._run_turn(
                 session_id, f"{AUTO_PING_PREFIX}{note}]",
                 retrieval_query=retrieval_query,
+                restricted_to_chat=restricted_to_chat,
             )
 
     async def _run_turn(
@@ -966,6 +973,7 @@ class Operator:
         language: str | None = None,
         retrieval_query: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        restricted_to_chat: str | None = None,
     ) -> OperatorTurnResult:
         await self._db.ensure_chat_session(session_id)
         await self._db.append_chat_message(session_id, "user", user_text)
@@ -1110,7 +1118,10 @@ class Operator:
                     chat=session_id, tool=tc["name"], args=json.dumps(args, ensure_ascii=False),
                 ))
                 try:
-                    result = await self._execute_tool(session_id, tc["name"], args)
+                    result = await self._execute_tool(
+                        session_id, tc["name"], args,
+                        restricted_to_chat=restricted_to_chat,
+                    )
                 except Exception as e:
                     log.exception("operator tool %s failed", tc["name"])
                     result = {"error": f"{type(e).__name__}: {e}"}
@@ -1294,6 +1305,61 @@ class Operator:
             ),
         }
 
+    # ---- deferred dispatch resolution ----
+
+    async def resolve_dispatch_approval(
+        self, dispatch_id: str, decision: str,
+    ) -> dict[str, Any]:
+        """Called by the bot when the user taps Yes/No on a deferred
+        dispatch keyboard. Resolves the `pending_dispatches` row; on
+        'allow' actually submits the task to lifecycle with the stored
+        params (and `restricted_to_chat` inherited so the executor is also
+        locked). Idempotent: a double-tap returns `{"status":
+        "already_resolved"}` without firing the task twice.
+
+        Returns a dict the bot can use to update the inline-keyboard
+        message (e.g. "Approved — task T1 dispatched")."""
+        if decision not in {"allow", "deny"}:
+            return {"status": "error", "error": f"bad decision {decision!r}"}
+        row = await self._db.get_pending_dispatch(dispatch_id)
+        if row is None:
+            return {"status": "error", "error": "unknown dispatch_id"}
+        if row["resolution"] is not None:
+            return {"status": "already_resolved", "resolution": row["resolution"]}
+        ok = await self._db.resolve_pending_dispatch(dispatch_id, decision)
+        if not ok:
+            # Raced with another tap; the other won. Report idempotent.
+            row = await self._db.get_pending_dispatch(dispatch_id)
+            return {"status": "already_resolved",
+                    "resolution": (row or {}).get("resolution")}
+        if decision == "deny":
+            operator_log.info("dispatch_task.denied " + fmt(
+                dispatch_id=dispatch_id,
+                chat=row["chat_session_id"],
+                locked_to=row["restricted_to_chat"],
+            ))
+            return {"status": "denied"}
+        # Approved → actually spawn. The new task inherits restricted_to_chat
+        # so anything the executor calls via /internal/messenger is gated
+        # to the same chat as the parent operator turn.
+        task = await self._lifecycle.submit_task(
+            prompt=row["prompt"],
+            model=row["model"],
+            chat_session_id=row["chat_session_id"],
+            restricted_to_chat=row["restricted_to_chat"],
+        )
+        operator_log.info("dispatch_task.approved " + fmt(
+            dispatch_id=dispatch_id, task=str(task.id),
+            chat=row["chat_session_id"],
+            locked_to=row["restricted_to_chat"],
+        ))
+        return {
+            "status": "approved",
+            "task_id": str(task.id),
+            "session_id": task.session_id,
+            "state": task.state.value,
+        }
+
     # ---- session reset / on-demand compression ----
 
     async def clear_session(self, session_id: str) -> dict[str, int]:
@@ -1444,10 +1510,12 @@ class Operator:
                     return text
         return None
 
-    # Note used to wrap candidate suggestions for the silent auto-ping that
+    # Note used to wrap citation suggestions for the silent auto-ping that
     # follows a user turn. The operator's prompt has a matching rule —
-    # respond only with `save_memory` calls (or nothing); never narrate.
-    _CANDIDATES_NOTE_PREFIX = "extractor flagged candidate memories"
+    # derive a clean memory from each citation worth keeping, then call
+    # `save_memory` with the DERIVED text; never save the citation verbatim,
+    # never narrate.
+    _CITATIONS_NOTE_PREFIX = "extractor flagged citations from the user"
 
     async def _extract_and_propose(
         self,
@@ -1506,9 +1574,13 @@ class Operator:
         # prompt has a matching rule telling it to emit empty content.
         bullets = "\n".join(f"  • {c}" for c in candidates)
         note = (
-            f"{self._CANDIDATES_NOTE_PREFIX} that you did not save this "
-            f"turn. Call `save_memory` for any worth keeping; ignore the "
-            f"rest. Emit empty assistant content — no text reply.\n"
+            f"{self._CITATIONS_NOTE_PREFIX}. These are RAW QUOTES, not "
+            f"memory text. For any worth keeping, derive a clean, specific, "
+            f"self-contained memory from the citation (resolve names, "
+            f"identifiers, roles into a declarative sentence) and call "
+            f"`save_memory` with the DERIVED text — not the citation "
+            f"verbatim. Ignore citations not worth keeping. Emit empty "
+            f"assistant content — no text reply.\n"
             f"{bullets}"
         )
         try:
@@ -1606,13 +1678,71 @@ class Operator:
         }
 
     async def _execute_tool(
-        self, chat_session_id: str, name: str, args: dict[str, Any]
+        self, chat_session_id: str, name: str, args: dict[str, Any],
+        *, restricted_to_chat: str | None = None,
     ) -> dict[str, Any]:
+        # Hard guardrail: when the turn was triggered by the inbox-drain
+        # autonomous-reply path, `restricted_to_chat` is the only chat this
+        # turn may read from or send to. Cross-chat enumeration tools are
+        # refused outright; per-chat tools must target the locked chat;
+        # local-file `read_image` is refused. `dispatch_task` is allowed but
+        # requires user approval (see the dispatch_task branch below). All
+        # other operator tools (memory, status, etc.) are unaffected.
+        if restricted_to_chat is not None:
+            err = _check_restricted_access(name, args, restricted_to_chat)
+            if err is not None:
+                operator_log.warning("restricted_tool_blocked " + fmt(
+                    chat=chat_session_id, tool=name,
+                    locked_to=restricted_to_chat,
+                    args=json.dumps(args, ensure_ascii=False),
+                ))
+                return err
         if name == "dispatch_task":
             model_alias = args.get("model", "sonnet")
             model = MODEL_ALIAS_MAP.get(model_alias, model_alias)
+            prompt = args["prompt"]
+            # Restricted turn: don't spawn directly. Park the dispatch in
+            # `pending_dispatches`, publish an event the bot turns into a
+            # Yes/No keyboard, and return a pending sentinel. The actual
+            # task spawns from the bot's callback handler IF the user taps
+            # Yes — inheriting `restricted_to_chat` so the executor also
+            # runs locked.
+            if restricted_to_chat is not None:
+                dispatch_id = str(uuid4())
+                await self._db.create_pending_dispatch(
+                    dispatch_id=dispatch_id,
+                    chat_session_id=chat_session_id,
+                    prompt=prompt,
+                    model=model,
+                    restricted_to_chat=restricted_to_chat,
+                )
+                if self._events is not None:
+                    await self._events.publish_global(
+                        "dispatch.approval_requested", {
+                            "dispatch_id": dispatch_id,
+                            "chat_session_id": chat_session_id,
+                            "prompt": prompt,
+                            "model": model,
+                            "restricted_to_chat": restricted_to_chat,
+                        },
+                    )
+                operator_log.info("dispatch_task.deferred " + fmt(
+                    chat=chat_session_id, dispatch_id=dispatch_id,
+                    locked_to=restricted_to_chat, model=model,
+                    prompt_preview=prompt[:120],
+                ))
+                return {
+                    "status": "pending_approval",
+                    "dispatch_id": dispatch_id,
+                    "message": (
+                        "User approval requested via the bot. If they tap "
+                        "Yes, the task will spawn (locked to the same chat) "
+                        "and its terminal state will auto-ping you. Emit "
+                        "empty assistant content now."
+                    ),
+                }
             task = await self._lifecycle.submit_task(
-                prompt=args["prompt"],
+                prompt=prompt,
                 model=model,
                 chat_session_id=chat_session_id,
             )
@@ -1890,6 +2020,19 @@ class Operator:
                 authority = await self._memory.get_by_id(authority_id)
                 if authority is None:
                     return {"error": f"authority_memory_id={authority_id} not found"}
+                # Final hard gate — independent of memory. The user explicitly
+                # allowlists each chat via `/allowdm`; empty by default. Even a
+                # fully prompt-injected operator citing a real memory cannot
+                # send a DM to a chat the user hasn't allowlisted.
+                if not await self._db.is_dm_allowed(chat_id):
+                    operator_log.warning("reply_to_dm.blocked_by_allowlist " + fmt(
+                        chat=chat_id, memory_id=authority_id,
+                    ))
+                    return {"error": (
+                        f"chat_id={chat_id} not on the DM allowlist. The user must "
+                        f"run `/allowdm {chat_id}` in the bot before autonomous "
+                        f"replies to this chat are permitted. Stay silent."
+                    )}
                 operator_log.info("reply_to_dm.authority " + fmt(
                     chat=chat_id, memory_id=authority_id,
                     memory_text=authority.text,
@@ -1935,6 +2078,59 @@ class Operator:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Per-tool policy for the autonomous-reply lockdown. Mapping is conservative:
+# the chat-reading and chat-listing tools that aren't here are NOT in
+# OPERATOR_TOOLS, so we don't have to list them. `dispatch_task` is handled
+# specially in `_execute_tool` (it goes through user approval).
+_TOOLS_LOCKED_TO_CHAT_ID = {
+    # `chat_id` arg must equal restricted_to_chat.
+    "read_chat", "read_chat_style", "search_messages", "summarize_chat",
+    "mark_chat_read", "reply_to_dm",
+}
+_TOOLS_REFUSED_WHEN_RESTRICTED = {
+    # These enumerate / search ACROSS chats. No targeted form exists.
+    "read_inbox", "list_chats", "search_chats",
+}
+
+
+def _check_restricted_access(
+    name: str, args: dict[str, Any], restricted_to_chat: str,
+) -> dict[str, Any] | None:
+    """Enforce the autonomous-reply lockdown for one tool call. Returns the
+    error dict to short-circuit `_execute_tool`, or None to proceed."""
+    if name in _TOOLS_REFUSED_WHEN_RESTRICTED:
+        return {"error": (
+            f"`{name}` is refused during an autonomous-reply turn: reads "
+            f"are locked to chat_id={restricted_to_chat}. Stay silent or "
+            f"work only within that chat."
+        )}
+    if name in _TOOLS_LOCKED_TO_CHAT_ID:
+        target = str(args.get("chat_id") or "")
+        if target != restricted_to_chat:
+            return {"error": (
+                f"`{name}` is locked to chat_id={restricted_to_chat} for "
+                f"this autonomous-reply turn; got chat_id={target!r}. "
+                f"Stay silent or work only within the locked chat."
+            )}
+        return None
+    if name == "read_image":
+        # Local-file reads are not the locked chat. Telegram-attachment
+        # reads must target the locked chat.
+        if args.get("path"):
+            return {"error": (
+                "`read_image(path=...)` is refused during an autonomous-"
+                "reply turn: filesystem reads are out of scope. Only "
+                f"attachments from chat_id={restricted_to_chat} are allowed."
+            )}
+        target = str(args.get("chat_id") or "")
+        if target and target != restricted_to_chat:
+            return {"error": (
+                f"`read_image` is locked to chat_id={restricted_to_chat} "
+                f"for this autonomous-reply turn; got chat_id={target!r}."
+            )}
+    return None
+
 
 def _uuid(value: Any) -> UUID | None:
     try:

@@ -48,6 +48,19 @@ uv run pytest tests/test_operator_memory.py -v
 
 The integration tests pin the dedup threshold (0.88) to the live model's behavior — if `ONCALL_MEMORY_DEDUP_SIM` is retuned or the embedding model changes, those tests will fail loudly with a hint to retune.
 
+## Exception handling
+
+Every `except` must log something — at minimum a one-line `log.warning(...)` / `log.info(...)` with context (what failed, which id/chat/key). Full tracebacks (`log.exception(...)`) are encouraged for unexpected paths but not required for benign/expected ones. **Never** write `except Exception: pass` or `except X: return None` with no log line — silent swallows have already cost us one stuck `inbox-drain` loop. If the failure is truly expected and uninteresting, log at debug level and say why in the message.
+
+## Long-lived background loops
+
+Any `asyncio.create_task`-launched loop in [src/oncall/api.py](src/oncall/api.py) (drain, auto-ping, dedup, …) must:
+
+1. **Self-restart on exception.** Wrap the inner body in `try / except asyncio.CancelledError: raise / except Exception: log.exception(...); notify; sleep; continue`. A transient hiccup must not kill the task.
+2. **Notify Telegram on every system error**, without a traceback (the err log has the full detail). Use `_notify_system_error(events, notify_session_id, where, exc)`.
+3. **Trip a circuit breaker at 3 consecutive crashes.** Reset the counter on any successful iteration. After 3 strikes the loop re-raises so the task dies — that is intentional: 3 in a row means it's a real bug, not a flake, and retrying just hides it. The `_supervise_bg_task` done-callback fires one final Telegram notification on exit. Service stays degraded until a human fixes the bug and restarts the daemon.
+4. **Be supervised.** Call `_supervise_bg_task(task, events, notify_sid, "<name>")` at the create_task site so a silently-dying task still leaves a loud trail.
+
 ## Inspecting SQLite state
 
 The orchestrator runs SQLite in WAL mode at `~/.oncall/state.db`. Safe inspection while the daemon is live:

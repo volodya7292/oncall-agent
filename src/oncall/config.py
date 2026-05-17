@@ -16,6 +16,32 @@ _PACKAGE_DIR = Path(__file__).resolve().parent
 # here. The project-local .env (if present) overrides — handy for dev.
 USER_CONFIG_DIR = Path("~/.oncall").expanduser()
 USER_ENV_FILE = USER_CONFIG_DIR / ".env"
+# Owner display name (set by the bot's /setownername command). Read at
+# every operator turn so updates take effect without a daemon restart.
+OWNER_NAME_FILE = USER_CONFIG_DIR / "owner_name.txt"
+OWNER_NAME_UNSET = "(unknown — ask the user to set their name with /setownername in the Telegram bot)"
+
+
+def read_owner_name() -> str:
+    """Return the owner's display name, or OWNER_NAME_UNSET if not set
+    or unreadable. Never raises."""
+    try:
+        name = OWNER_NAME_FILE.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return OWNER_NAME_UNSET
+    except OSError as e:
+        # Disk error, permission issue, etc. Log via print since this
+        # module is import-time-clean (no logger configured yet).
+        import logging
+        logging.getLogger(__name__).warning("read_owner_name failed: %s", e)
+        return OWNER_NAME_UNSET
+    return name or OWNER_NAME_UNSET
+
+
+def write_owner_name(name: str) -> None:
+    """Persist the owner's display name. Trims and caps at 80 chars."""
+    USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    OWNER_NAME_FILE.write_text(name.strip()[:80], encoding="utf-8")
 
 
 class Settings(BaseSettings):

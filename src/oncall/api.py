@@ -109,6 +109,10 @@ class MessengerOpBody(BaseModel):
     unread_only: bool | None = None
     dms_only: bool = False
     limit: int = 20
+    # Caller's executor session id. Forwarded by the MCP server from
+    # ONCALL_SESSION_ID. When the corresponding task has
+    # `restricted_to_chat` set, cross-chat ops are refused here.
+    session_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +250,8 @@ def create_app() -> FastAPI:
         telegram_bot: TelegramBotService | None = None
         if operator is not None:
             telegram_bot = await _maybe_start_telegram_bot(
-                settings, operator, events, broker=broker, db=db,
+                settings, operator, events,
+                broker=broker, db=db, telegram=telegram,
             )
         # Tell the userbot to ignore the bot's own replies — otherwise every
         # outbound the bot front-end sends would re-enter the user's inbox.
@@ -273,6 +278,7 @@ def create_app() -> FastAPI:
         # Background: when a task dispatched from a chat session reaches a
         # terminal state, auto-ping the operator so it can summarize the result
         # for the user without the user having to ask.
+        notify_sid = telegram_bot.session_id if telegram_bot is not None else None
         auto_ping_task: asyncio.Task | None = None
         if operator is not None:
             auto_ping_task = asyncio.create_task(
@@ -280,8 +286,11 @@ def create_app() -> FastAPI:
                     events=events, operator=operator, db=db,
                     runner=cli_runner,
                     summary_model=settings.oncall_compression_model,
-                )
+                    notify_session_id=notify_sid,
+                ),
+                name="auto-ping",
             )
+            _supervise_bg_task(auto_ping_task, events, notify_sid, "auto-ping")
         # Inbox drain: when the userbot lands an *important* inbound DM, push
         # it into the bot front-end's session as an auto-ping so the user
         # finds out immediately. Non-important DMs sit silently in
@@ -296,6 +305,7 @@ def create_app() -> FastAPI:
                 ),
                 name="inbox-drain",
             )
+            _supervise_bg_task(inbox_drain_task, events, notify_sid, "inbox-drain")
         # Memory dedup: write time always INSERTs (no heuristic merge).
         # Every 5 minutes we ask the operator LLM to consolidate clusters
         # of near-duplicates so paraphrase merges and same-template-
@@ -307,9 +317,12 @@ def create_app() -> FastAPI:
                 _memory_dedup_loop(
                     memory=operator.memory, llm=llm,
                     model=settings.oncall_operator_model,
+                    events=events,
+                    notify_session_id=notify_sid,
                 ),
                 name="memory-dedup",
             )
+            _supervise_bg_task(memory_dedup_task, events, notify_sid, "memory-dedup")
         # Memory-embedding rebuild: if the configured embed model differs
         # from what stored rows were last embedded with, kick off a
         # background re-embed pass. Retrieval is already filtering stale
@@ -372,10 +385,66 @@ def create_app() -> FastAPI:
 
 _TERMINAL_STATES = {"completed", "failed", "killed"}
 
+# Sleep before restarting a crashed background loop. Short enough that a
+# transient failure recovers quickly, long enough that a hot crash loop
+# doesn't spam the logs or notification channel.
+_BG_LOOP_RESTART_SLEEP_SECONDS = 5.0
+# Crash-loop circuit breaker: after this many consecutive failures with
+# no successful iteration in between, the loop gives up and lets the
+# task die. The supervise callback then notifies Telegram. Rationale:
+# 3 strikes in a row means it's a real bug, not a flake — retrying just
+# hides it. Operator restart required.
+_BG_LOOP_MAX_CONSECUTIVE_CRASHES = 3
+
+
+async def _notify_system_error(
+    events: "EventBus", session_id: str | None, where: str, exc: BaseException,
+) -> None:
+    """Push a one-line system-error notice to the bot session as a
+    chat.reply. No traceback — the err log keeps the full detail. Best-
+    effort: a failed publish logs but never re-raises into the caller."""
+    if session_id is None:
+        return
+    msg = f"⚠️ system error in {where}: {type(exc).__name__}: {str(exc)[:200]}"
+    try:
+        await events.publish_global("chat.reply", {
+            "session_id": session_id,
+            "text": msg,
+            "voice_text": "",
+            "trigger": "system.error",
+            "task_id": None,
+        })
+    except Exception:
+        log.exception("system-error notify failed for %s", where)
+
+
+def _supervise_bg_task(
+    task: asyncio.Task, events: "EventBus", session_id: str | None, where: str,
+) -> None:
+    """Attach a done-callback that logs (and notifies Telegram) if a
+    long-lived background task ever exits. With the in-loop restart
+    wrappers in place this should never fire — but if it does, we want
+    a loud trail rather than a silent dead task."""
+    def _cb(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is None:
+            log.error("bg task %s exited cleanly (should be long-lived)", where)
+            asyncio.create_task(_notify_system_error(
+                events, session_id, where,
+                RuntimeError("background loop exited unexpectedly"),
+            ))
+            return
+        log.error("bg task %s died with %s: %s", where, type(exc).__name__, exc)
+        asyncio.create_task(_notify_system_error(events, session_id, where, exc))
+    task.add_done_callback(_cb)
+
 
 async def _auto_ping_loop(
     *, events: EventBus, operator: Operator, db: Database,
     runner: ClaudeCliRunner, summary_model: str,
+    notify_session_id: str | None = None,
 ) -> None:
     """Re-engage the operator on two kinds of triggers, so the user sees
     follow-ups via the chat UI (REPL or Telegram bot) without having to ask:
@@ -390,70 +459,94 @@ async def _auto_ping_loop(
           The operator's prompt directs it to call present_pending_approval
           and read back the canonical command + challenge phrase verbatim.
 
-    Each step is fail-soft; the loop only exits on cancel."""
+    Each step is fail-soft; the loop only exits on cancel. Any uncaught
+    exception out of the subscription itself is logged, notified to the
+    bot session, and the subscription is re-established after a brief
+    sleep so the daemon doesn't lose auto-pings to a transient hiccup."""
     from uuid import UUID
-    async for env in events.subscribe_global(
-        types={"state.changed", "approval.requested"},
-    ):
-        type_ = env.get("type")
-        task_id_str = env.get("task_id")
-        if not task_id_str:
-            continue
+    consecutive_crashes = 0
+    while True:
         try:
-            task_uuid = UUID(task_id_str)
-            task = await db.get_task(task_uuid)
-        except Exception:
-            log.exception("auto-ping: failed to load task %s", task_id_str)
-            continue
-        if task is None or not task.dispatched_by_chat_session:
-            continue
-        session_id = task.dispatched_by_chat_session
-        short = task_id_str[:8]
-        payload = env.get("payload") or {}
+            async for env in events.subscribe_global(
+                types={"state.changed", "approval.requested"},
+            ):
+                consecutive_crashes = 0  # any delivered event = healthy
+                type_ = env.get("type")
+                task_id_str = env.get("task_id")
+                if not task_id_str:
+                    continue
+                try:
+                    task_uuid = UUID(task_id_str)
+                    task = await db.get_task(task_uuid)
+                except Exception:
+                    log.exception("auto-ping: failed to load task %s", task_id_str)
+                    continue
+                if task is None or not task.dispatched_by_chat_session:
+                    continue
+                session_id = task.dispatched_by_chat_session
+                short = task_id_str[:8]
+                payload = env.get("payload") or {}
 
-        if type_ == "state.changed":
-            new_state = payload.get("state")
-            if new_state not in _TERMINAL_STATES:
-                continue
-            try:
-                await summarize_task(db, runner, task_uuid, model=summary_model)
-            except Exception:
-                log.exception("auto-ping: summarize_task failed for %s", task_id_str)
-            terminal = (task.terminal_reason.value if task.terminal_reason else new_state)
-            note = f"task {short} just terminated, state={new_state}, reason={terminal}"
-            trigger = "task.terminal"
-            approval_id = None
-        elif type_ == "approval.requested":
-            approval_id = payload.get("approval_id") or ""
-            tool_name = payload.get("tool_name") or "?"
-            note = (
-                f"task {short} needs approval. approval_id={approval_id}, "
-                f"tool={tool_name}. Call present_pending_approval with that id, "
-                f"then read the canonical command, blast radius, and challenge "
-                f"phrase to the user VERBATIM. Do not paraphrase."
+                if type_ == "state.changed":
+                    new_state = payload.get("state")
+                    if new_state not in _TERMINAL_STATES:
+                        continue
+                    try:
+                        await summarize_task(db, runner, task_uuid, model=summary_model)
+                    except Exception:
+                        log.exception("auto-ping: summarize_task failed for %s", task_id_str)
+                    terminal = (task.terminal_reason.value if task.terminal_reason else new_state)
+                    note = f"task {short} just terminated, state={new_state}, reason={terminal}"
+                    trigger = "task.terminal"
+                    approval_id = None
+                elif type_ == "approval.requested":
+                    approval_id = payload.get("approval_id") or ""
+                    tool_name = payload.get("tool_name") or "?"
+                    note = (
+                        f"task {short} needs approval. approval_id={approval_id}, "
+                        f"tool={tool_name}. Call present_pending_approval with that id, "
+                        f"then read the canonical command, blast radius, and challenge "
+                        f"phrase to the user VERBATIM. Do not paraphrase."
+                    )
+                    trigger = "approval.requested"
+                else:
+                    continue
+
+                try:
+                    result = await operator.auto_ping(session_id=session_id, note=note)
+                except Exception:
+                    log.exception("auto-ping: operator.auto_ping failed for session %s", session_id)
+                    continue
+                if not result.text:
+                    continue
+
+                chat_reply_payload: dict[str, Any] = {
+                    "session_id": session_id,
+                    "text": result.text,
+                    "voice_text": to_voice_text(result.text),
+                    "trigger": trigger,
+                    "task_id": task_id_str,
+                }
+                if approval_id:
+                    chat_reply_payload["approval_id"] = approval_id
+                await events.publish_global("chat.reply", chat_reply_payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            consecutive_crashes += 1
+            log.exception(
+                "auto-ping: outer loop crashed (%d/%d consecutive)",
+                consecutive_crashes, _BG_LOOP_MAX_CONSECUTIVE_CRASHES,
             )
-            trigger = "approval.requested"
-        else:
-            continue
-
-        try:
-            result = await operator.auto_ping(session_id=session_id, note=note)
-        except Exception:
-            log.exception("auto-ping: operator.auto_ping failed for session %s", session_id)
-            continue
-        if not result.text:
-            continue
-
-        chat_reply_payload: dict[str, Any] = {
-            "session_id": session_id,
-            "text": result.text,
-            "voice_text": to_voice_text(result.text),
-            "trigger": trigger,
-            "task_id": task_id_str,
-        }
-        if approval_id:
-            chat_reply_payload["approval_id"] = approval_id
-        await events.publish_global("chat.reply", chat_reply_payload)
+            await _notify_system_error(events, notify_session_id, "auto-ping", exc)
+            if consecutive_crashes >= _BG_LOOP_MAX_CONSECUTIVE_CRASHES:
+                log.error("auto-ping: %d consecutive crashes — giving up", consecutive_crashes)
+                await _notify_system_error(
+                    events, notify_session_id, "auto-ping",
+                    RuntimeError(f"giving up after {consecutive_crashes} consecutive crashes — fix and restart"),
+                )
+                raise
+            await asyncio.sleep(_BG_LOOP_RESTART_SLEEP_SECONDS)
 
 
 # How long a chat sits dirty before its summary is flushed to the operator.
@@ -511,12 +604,16 @@ async def _inbox_drain_loop(
         log.exception("inbox-drain: recovery query failed; starting empty")
         pending = []
     if pending:
-        now_t = loop.time()
+        # Backdate so recovered chats are immediately flushable on the
+        # next loop iteration. Otherwise a DM that's been sitting unread
+        # for hours waits another _INBOX_IDLE_FLUSH_SECONDS after every
+        # reboot — wrong, the user already waited.
+        stale_t = loop.time() - _INBOX_MAX_DELAY_SECONDS - 1.0
         for row in pending:
             cid = str(row.get("chat_id") or "")
             if cid:
-                dirty_since[cid] = now_t
-                last_msg_at[cid] = now_t
+                dirty_since[cid] = stale_t
+                last_msg_at[cid] = stale_t
         log.info(
             "inbox-drain: recovered %d chat(s) with unread DM(s)",
             len(dirty_since),
@@ -535,38 +632,68 @@ async def _inbox_drain_loop(
             for c in dirty_since
         )
 
+    consecutive_crashes = 0
     while True:
-        # Drain any flushable chats BEFORE blocking on the next event so
-        # recovery (n chats pre-loaded at boot) doesn't sit waiting for an
-        # n+1th message.
-        now = loop.time()
-        ready = [
-            c for c in dirty_since
-            if now - last_msg_at[c] >= _INBOX_IDLE_FLUSH_SECONDS
-               or now - dirty_since[c] >= _INBOX_MAX_DELAY_SECONDS
-        ]
-        ready.sort(key=lambda c: last_flush_at.get(c, 0.0))
-        for chat_id in ready:
-            dirty_since.pop(chat_id, None)
-            last_msg_at.pop(chat_id, None)
-            await _flush_chat(events, operator, db, target_session_id, chat_id)
-            last_flush_at[chat_id] = loop.time()
-
-        deadline = _next_deadline()
-        timeout = max(0.0, deadline - loop.time()) if deadline is not None else None
         try:
-            env = await asyncio.wait_for(sub_iter.__anext__(), timeout=timeout)
-            payload = env.get("payload") or {}
-            chat_id = str(payload.get("chat_id") or "")
-            if not chat_id:
-                continue
-            now_t = loop.time()
-            dirty_since.setdefault(chat_id, now_t)
-            last_msg_at[chat_id] = now_t
-        except asyncio.TimeoutError:
-            pass  # next iteration flushes the chats that timed out
-        except StopAsyncIteration:
-            break
+            # Drain any flushable chats BEFORE blocking on the next event so
+            # recovery (n chats pre-loaded at boot) doesn't sit waiting for an
+            # n+1th message.
+            now = loop.time()
+            ready = [
+                c for c in dirty_since
+                if now - last_msg_at[c] >= _INBOX_IDLE_FLUSH_SECONDS
+                   or now - dirty_since[c] >= _INBOX_MAX_DELAY_SECONDS
+            ]
+            ready.sort(key=lambda c: last_flush_at.get(c, 0.0))
+            for chat_id in ready:
+                dirty_since.pop(chat_id, None)
+                last_msg_at.pop(chat_id, None)
+                await _flush_chat(events, operator, db, target_session_id, chat_id)
+                last_flush_at[chat_id] = loop.time()
+
+            deadline = _next_deadline()
+            timeout = max(0.0, deadline - loop.time()) if deadline is not None else None
+            try:
+                env = await asyncio.wait_for(sub_iter.__anext__(), timeout=timeout)
+                consecutive_crashes = 0  # successful event = healthy
+                payload = env.get("payload") or {}
+                chat_id = str(payload.get("chat_id") or "")
+                if not chat_id:
+                    continue
+                now_t = loop.time()
+                dirty_since.setdefault(chat_id, now_t)
+                last_msg_at[chat_id] = now_t
+            except asyncio.TimeoutError:
+                consecutive_crashes = 0  # idle flush path = healthy
+                pass  # next iteration flushes the chats that timed out
+            except StopAsyncIteration:
+                # Subscription ended (event bus shutting down). Re-subscribe
+                # and continue — the loop is supposed to outlive any single
+                # subscription.
+                log.warning("inbox-drain: subscription ended; re-subscribing")
+                sub_iter = events.subscribe_global(types={"messenger.received"}).__aiter__()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            consecutive_crashes += 1
+            log.exception(
+                "inbox-drain: inner iteration crashed (%d/%d consecutive)",
+                consecutive_crashes, _BG_LOOP_MAX_CONSECUTIVE_CRASHES,
+            )
+            await _notify_system_error(events, target_session_id, "inbox-drain", exc)
+            if consecutive_crashes >= _BG_LOOP_MAX_CONSECUTIVE_CRASHES:
+                log.error("inbox-drain: %d consecutive crashes — giving up", consecutive_crashes)
+                await _notify_system_error(
+                    events, target_session_id, "inbox-drain",
+                    RuntimeError(f"giving up after {consecutive_crashes} consecutive crashes — fix and restart"),
+                )
+                raise
+            await asyncio.sleep(_BG_LOOP_RESTART_SLEEP_SECONDS)
+            # Re-subscribe in case the iterator itself was the cause.
+            try:
+                sub_iter = events.subscribe_global(types={"messenger.received"}).__aiter__()
+            except Exception:
+                log.exception("inbox-drain: re-subscribe failed; will retry next loop")
 
 
 async def _flush_chat(
@@ -620,6 +747,7 @@ async def _flush_chat(
             session_id=target_session_id,
             note=note,
             retrieval_query=retrieval_query,
+            restricted_to_chat=chat_id,
         )
     except Exception:
         log.exception("inbox-drain: auto_ping failed for chat %s", chat_id)
@@ -647,18 +775,39 @@ _MEMORY_DEDUP_INTERVAL_SECONDS = 300.0
 async def _memory_dedup_loop(
     *, memory, llm, model: str,
     interval_seconds: float = _MEMORY_DEDUP_INTERVAL_SECONDS,
+    events: "EventBus | None" = None,
+    notify_session_id: str | None = None,
 ) -> None:
     """Periodic intelligent dedup of stored memories. Sleeps first so a
     fresh-booted daemon doesn't fire a pass before any memory has accrued.
-    Failures only log — the next tick retries."""
+    Single-tick failures log + notify and the next tick retries; 3
+    consecutive failures trip the circuit breaker and the task exits."""
+    consecutive_crashes = 0
     while True:
         await asyncio.sleep(interval_seconds)
         try:
             await memory.dedup_pass(
                 llm, model=model, reasoning_effort="medium",
             )
-        except Exception:
-            log.exception("memory-dedup: pass crashed")
+            consecutive_crashes = 0
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            consecutive_crashes += 1
+            log.exception(
+                "memory-dedup: pass crashed (%d/%d consecutive)",
+                consecutive_crashes, _BG_LOOP_MAX_CONSECUTIVE_CRASHES,
+            )
+            if events is not None:
+                await _notify_system_error(events, notify_session_id, "memory-dedup", exc)
+            if consecutive_crashes >= _BG_LOOP_MAX_CONSECUTIVE_CRASHES:
+                log.error("memory-dedup: %d consecutive crashes — giving up", consecutive_crashes)
+                if events is not None:
+                    await _notify_system_error(
+                        events, notify_session_id, "memory-dedup",
+                        RuntimeError(f"giving up after {consecutive_crashes} consecutive crashes — fix and restart"),
+                    )
+                raise
 
 
 async def _probe_ollama(host: str = "http://localhost:11434") -> str | None:
@@ -735,7 +884,7 @@ async def _rebuild_memory_then_notify(
 
 async def _maybe_start_telegram_bot(
     settings, operator: Operator, events: EventBus,
-    *, broker, db: Database,
+    *, broker, db: Database, telegram: TelegramService | None = None,
 ) -> TelegramBotService | None:
     """Boot the Telegram bot front-end if a token + owner_id are set. Uses
     the HTTP Bot API, so api_id/api_hash are NOT required. Logs and returns
@@ -758,7 +907,7 @@ async def _maybe_start_telegram_bot(
         api = HttpxBotApi(settings.telegram_bot_token)
         service = TelegramBotService(
             api=api, operator=operator, events=events, owner_user_id=owner_id,
-            broker=broker, db=db,
+            broker=broker, db=db, telegram=telegram,
         )
         await service.start()
         return service
@@ -982,6 +1131,20 @@ def _register_routes(app: FastAPI) -> None:
         tg: TelegramService | None = request.app.state.telegram
         if tg is None:
             raise HTTPException(503, "telegram service not configured")
+        # Autonomous-reply lockdown: if the calling executor task is
+        # locked to a specific Telegram chat, refuse any op that targets
+        # a different chat. The operator-side lockdown already restricted
+        # the parent turn; this mirror prevents the spawned executor from
+        # widening the blast radius via its own MCP calls. Missing
+        # session_id (older MCP servers, manual loopback calls) → no
+        # restriction known → pass through.
+        if body.session_id:
+            task = await _db(request).get_task_by_session(body.session_id)
+            locked = task.restricted_to_chat if task is not None else None
+            if locked is not None:
+                err = _messenger_restriction_error(body, locked)
+                if err is not None:
+                    raise HTTPException(403, err)
         if body.op == "list":
             unread_only = True if body.unread_only is None else body.unread_only
             return {"messages": await tg.list_inbox(unread_only=unread_only, limit=body.limit)}
@@ -1057,6 +1220,38 @@ def _register_routes(app: FastAPI) -> None:
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+
+# Messenger ops whose `chat_id` arg must equal the task's
+# `restricted_to_chat`. Ops that enumerate or search ACROSS chats (list,
+# search) are refused outright. `read` and `mark_read` target one inbox
+# row — we don't have the chat_id here, but the inbox row's chat_id
+# would have to match; for now the simplest defensible behaviour is to
+# refuse them too, since a restricted executor has no legitimate reason
+# to read arbitrary inbox ids it didn't itself discover.
+_MESSENGER_OPS_LOCKED_TO_CHAT_ID = {"style", "send", "history", "search_messages"}
+_MESSENGER_OPS_REFUSED_WHEN_RESTRICTED = {"list", "list_chats", "search", "read", "mark_read"}
+
+
+def _messenger_restriction_error(
+    body: "MessengerOpBody", locked_chat: str,
+) -> str | None:
+    """Return an HTTP-403 detail string if the body's op violates the
+    autonomous-reply lockdown for `locked_chat`, or None to allow."""
+    op = body.op
+    if op in _MESSENGER_OPS_REFUSED_WHEN_RESTRICTED:
+        return (
+            f"messenger op {op!r} refused: this task is locked to "
+            f"chat_id={locked_chat} (autonomous-reply lockdown). No cross-"
+            f"chat enumeration / inbox reads."
+        )
+    if op in _MESSENGER_OPS_LOCKED_TO_CHAT_ID:
+        if (body.chat_id or "") != locked_chat:
+            return (
+                f"messenger op {op!r} refused: this task is locked to "
+                f"chat_id={locked_chat}; got chat_id={body.chat_id!r}."
+            )
+    return None
 
 
 def _task_out(t) -> dict[str, Any]:

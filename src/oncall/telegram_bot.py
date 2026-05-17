@@ -89,6 +89,10 @@ _BOT_COMMANDS: list[dict[str, str]] = [
     {"command": "context",  "description": "export this session's history + summary as a markdown file"},
     {"command": "clear",    "description": "wipe this session's history (memory preserved)"},
     {"command": "compress", "description": "force-compress older messages into a summary"},
+    {"command": "allowdm",  "description": "allowlist a chat_id for autonomous DM replies"},
+    {"command": "denydm",   "description": "remove a chat_id from the DM allowlist"},
+    {"command": "dmlist",   "description": "show which chats are allowlisted for autonomous DM replies"},
+    {"command": "setownername", "description": "set your display name used in the operator's system prompt"},
     {"command": "restart",  "description": "restart the oncall service (brief downtime)"},
     {"command": "stop",     "description": "stop the oncall service entirely (bot goes silent)"},
     {"command": "help",     "description": "list commands"},
@@ -318,6 +322,7 @@ class TelegramBotService:
         owner_user_id: int,
         broker: Broker | None = None,
         db: Database | None = None,
+        telegram: Any | None = None,
     ) -> None:
         self._api = api
         self._operator = operator
@@ -328,10 +333,15 @@ class TelegramBotService:
         # the inline-keyboard Yes/No flow.
         self._broker = broker
         self._db = db
+        # Optional userbot handle; used by `/dmlist` to resolve chat_ids to
+        # human-readable names. None → /dmlist still works but shows ids only.
+        # Typed as `Any` to avoid an import cycle with telegram_service.
+        self._telegram = telegram
         self._session_id = bot_session_id(owner_user_id)
         self._poll_task: asyncio.Task | None = None
         self._reply_task: asyncio.Task | None = None
         self._approval_task: asyncio.Task | None = None
+        self._dispatch_approval_task: asyncio.Task | None = None
         self._update_offset: int = 0
         self._bot_username: str | None = None
         self._bot_user_id: int | None = None
@@ -416,6 +426,15 @@ class TelegramBotService:
                 self._approval_subscriber(), name="tg-bot-approval",
             )
             self._approval_task.add_done_callback(self._on_bg_task_done)
+        # Deferred-dispatch subscriber: operator-initiated dispatch_task
+        # calls made during an autonomous-reply turn land here. We send
+        # Yes/No buttons; on tap, `operator.resolve_dispatch_approval`
+        # spawns (or denies) the task.
+        self._dispatch_approval_task = asyncio.create_task(
+            self._dispatch_approval_subscriber(),
+            name="tg-bot-dispatch-approval",
+        )
+        self._dispatch_approval_task.add_done_callback(self._on_bg_task_done)
         self._started = True
         log.info(
             "telegram bot started (owner_user_id=%d, username=@%s, session=%s)",
@@ -460,7 +479,8 @@ class TelegramBotService:
     async def stop(self) -> None:
         if not self._started:
             return
-        for task in (self._poll_task, self._reply_task, self._approval_task):
+        for task in (self._poll_task, self._reply_task, self._approval_task,
+                     self._dispatch_approval_task):
             if task is not None and not task.done():
                 task.cancel()
                 try:
@@ -624,11 +644,40 @@ class TelegramBotService:
                 "/context — export this session's chat history + latest summary as a markdown file\n"
                 "/clear — wipe this chat session's history (memory is preserved)\n"
                 "/compress — force-compress older messages into a summary now\n"
+                "/allowdm <chat_id> — allowlist a chat for autonomous DM replies (empty by default)\n"
+                "/denydm <chat_id> — remove a chat from the DM allowlist\n"
+                "/dmlist — show allowlisted chats\n"
+                "/setownername <name> — set your display name used in the operator's system prompt\n"
                 "/restart — restart the oncall daemon via launchctl (brief downtime)\n"
                 "/stop — stop the oncall daemon via launchctl (bot goes silent until manual start)\n"
                 "/help — this\n"
                 "Anything else is a chat turn."
             ))
+            return
+        if text.startswith("/allowdm") or text.startswith("/denydm"):
+            await self._handle_allowlist(chat_id, text)
+            return
+        if text.startswith("/dmlist"):
+            await self._send(chat_id, await self._render_dmlist())
+            return
+        if text.startswith("/setownername"):
+            from .config import write_owner_name, read_owner_name
+            arg = text[len("/setownername"):].strip()
+            if not arg:
+                current = read_owner_name()
+                await self._send(chat_id, (
+                    f"Usage: /setownername <name>\nCurrent: {current}"
+                ))
+                return
+            try:
+                write_owner_name(arg)
+            except OSError as e:
+                log.warning("write_owner_name failed: %s", e)
+                await self._send(chat_id, f"Failed to write owner name: {e}")
+                return
+            saved = read_owner_name()
+            telegram_log.info("bot setownername " + fmt(name=saved))
+            await self._send(chat_id, f"Owner name set to: {saved}")
             return
         if text.startswith("/status"):
             await self._send(chat_id, await self._render_status())
@@ -735,6 +784,76 @@ class TelegramBotService:
             session=self._session_id, len=len(reply),
             tool_calls=len(result.tool_calls_made),
         ))
+
+    # ---- DM allowlist commands ----
+
+    async def _handle_allowlist(self, chat_id: Any, text: str) -> None:
+        """Handle `/allowdm <chat_id>` and `/denydm <chat_id>`.
+
+        The argument is treated as an opaque string — Telegram chat ids for
+        users are positive ints, but supergroups/channels use negative ids
+        with the `-100…` prefix and we don't want to silently coerce or
+        reject those. We DO require non-empty + no whitespace; anything else
+        is a user typo.
+        """
+        if self._db is None:
+            await self._send(chat_id, "DB not wired; allowlist unavailable.")
+            return
+        parts = text.split(None, 1)
+        cmd = parts[0]
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if not arg:
+            verb = "allowdm" if cmd.startswith("/allowdm") else "denydm"
+            await self._send(chat_id, f"Usage: /{verb} <chat_id>")
+            return
+        if any(c.isspace() for c in arg):
+            await self._send(chat_id, "chat_id must not contain whitespace.")
+            return
+        if cmd.startswith("/allowdm"):
+            added = await self._db.allow_dm(arg)
+            msg = (
+                f"Allowlisted chat_id={arg} for autonomous DM replies."
+                if added else
+                f"chat_id={arg} was already on the allowlist."
+            )
+            telegram_log.info("bot allowdm " + fmt(chat_id=arg, newly_added=added))
+        else:
+            removed = await self._db.deny_dm(arg)
+            msg = (
+                f"Removed chat_id={arg} from the DM allowlist."
+                if removed else
+                f"chat_id={arg} was not on the allowlist."
+            )
+            telegram_log.info("bot denydm " + fmt(chat_id=arg, was_present=removed))
+        await self._send(chat_id, msg)
+
+    async def _render_dmlist(self) -> str:
+        if self._db is None:
+            return "DB not wired; allowlist unavailable."
+        rows = await self._db.list_dm_allowed()
+        if not rows:
+            return (
+                "DM allowlist is empty. No chat may receive an autonomous "
+                "reply. Use /allowdm <chat_id> to add one."
+            )
+        lines = ["DM allowlist:"]
+        for r in rows:
+            chat_id = r["chat_id"]
+            label = _label_for_chat(chat_id, await self._resolve_label(chat_id))
+            lines.append(f"- {label} (added {_relative_age(r['added_at'])})")
+        return "\n".join(lines)
+
+    async def _resolve_label(self, chat_id: str) -> dict[str, Any] | None:
+        """Resolve `chat_id` via the userbot, if available. Returns the
+        raw dict from `TelegramService.resolve_chat_name`, or None on any
+        failure / when the userbot isn't wired."""
+        if self._telegram is None:
+            return None
+        try:
+            return await self._telegram.resolve_chat_name(chat_id)
+        except Exception:
+            log.exception("resolve_chat_name failed for %s", chat_id)
+            return None
 
     # ---- /status renderer ----
 
@@ -885,6 +1004,87 @@ class TelegramBotService:
             except Exception:
                 log.exception("failed to send approval prompt for %s", approval_id)
 
+    async def _dispatch_approval_subscriber(self) -> None:
+        """Listen for `dispatch.approval_requested` events. These are
+        operator-initiated dispatch_task calls made during an autonomous-
+        reply turn — we send the user a Yes/No keyboard. On tap, the
+        callback handler calls `operator.resolve_dispatch_approval` which
+        either spawns the task (locked to the same chat) or drops it."""
+        async for env in self._events.subscribe_global(
+            types={"dispatch.approval_requested"},
+        ):
+            payload = env.get("payload") or {}
+            # Filter by the bot's own session — there may be multiple chat
+            # sessions in the DB but only one bot per owner.
+            if payload.get("chat_session_id") != self._session_id:
+                continue
+            dispatch_id = payload.get("dispatch_id")
+            if not dispatch_id:
+                continue
+            prompt = (payload.get("prompt") or "").strip()
+            model = (payload.get("model") or "?").strip()
+            locked = payload.get("restricted_to_chat") or "?"
+            preview = _truncate(prompt, 400)
+            body = (
+                f"Approve autonomous dispatch_task?\n\n"
+                f"_Locked to chat {locked}; spawned task will be too._\n"
+                f"_Model: {model}_\n\n"
+                f"```\n{preview}\n```"
+            )
+            try:
+                await self._api.call("sendMessage", {
+                    "chat_id": self._owner_user_id,
+                    "text": escape_v2(body),
+                    "parse_mode": "MarkdownV2",
+                    "reply_markup": {
+                        "inline_keyboard": [[
+                            {"text": "✅ Yes", "callback_data": f"disp:{dispatch_id}:allow"},
+                            {"text": "❌ No",  "callback_data": f"disp:{dispatch_id}:deny"},
+                        ]],
+                    },
+                })
+                telegram_log.info("bot dispatch approval prompt " + fmt(
+                    session=self._session_id, dispatch_id=dispatch_id,
+                    locked_to=locked, model=model,
+                ))
+            except Exception:
+                log.exception(
+                    "failed to send dispatch approval prompt for %s", dispatch_id,
+                )
+
+    async def _handle_dispatch_callback(
+        self, cq: dict[str, Any], dispatch_id: str, decision: str,
+    ) -> None:
+        cq_id = cq.get("id")
+        try:
+            outcome = await self._operator.resolve_dispatch_approval(
+                dispatch_id, decision,
+            )
+        except Exception:
+            log.exception("resolve_dispatch_approval crashed for %s", dispatch_id)
+            if cq_id:
+                await self._safe_answer_callback(cq_id, "Internal error.")
+            return
+        status = outcome.get("status")
+        if status == "approved":
+            answer = "Approved ✓ — task dispatched"
+            edit = "allow"
+        elif status == "denied":
+            answer = "Denied ✗"
+            edit = "deny"
+        elif status == "already_resolved":
+            answer = f"Already resolved ({outcome.get('resolution')})"
+            edit = outcome.get("resolution") or "?"
+        else:
+            answer = f"Error: {outcome.get('error', 'unknown')}"
+            edit = "?"
+        telegram_log.info("bot dispatch approval resolve " + fmt(
+            dispatch_id=dispatch_id, decision=decision, status=status,
+        ))
+        if cq_id:
+            await self._safe_answer_callback(cq_id, answer)
+        await self._maybe_edit_resolved(cq, edit)
+
     # ---- callback (Yes/No tap) handler ----
 
     async def _handle_callback(self, cq: dict[str, Any]) -> None:
@@ -905,18 +1105,24 @@ class TelegramBotService:
             if cq_id:
                 await self._safe_answer_callback(cq_id, "Not authorized.")
             return
-        # Parse `appr:<approval_id>:<decision>`.
+        # Two callback shapes, distinguished by prefix:
+        #   appr:<approval_id>:<decision>  — executor-side tool approval
+        #   disp:<dispatch_id>:<decision>  — operator-initiated deferred
+        #                                    dispatch_task approval
         parts = data.split(":", 2)
-        if len(parts) != 3 or parts[0] != "appr":
+        if len(parts) != 3 or parts[0] not in ("appr", "disp"):
             if cq_id:
                 await self._safe_answer_callback(cq_id, "Unknown action.")
             return
-        approval_id_str = parts[1]
         decision = parts[2]
         if decision not in {"allow", "deny"}:
             if cq_id:
                 await self._safe_answer_callback(cq_id, "Bad decision.")
             return
+        if parts[0] == "disp":
+            await self._handle_dispatch_callback(cq, parts[1], decision)
+            return
+        approval_id_str = parts[1]
 
         if self._broker is None or self._db is None:
             if cq_id:
@@ -1013,6 +1219,25 @@ class TelegramBotService:
 # ---------------------------------------------------------------------------
 # Formatting helpers (module-scope so tests can exercise them directly)
 # ---------------------------------------------------------------------------
+
+def _label_for_chat(chat_id: str, resolved: dict[str, Any] | None) -> str:
+    """Render a chat as `Display Name (@username, chat_id)` when resolved,
+    or just `chat_id` when not. Either or both of display_name / username
+    may be missing — fall back gracefully."""
+    if not resolved:
+        return chat_id
+    name = (resolved.get("display_name") or "").strip()
+    uname = (resolved.get("username") or "").strip()
+    parts: list[str] = []
+    if name:
+        parts.append(name)
+    handle_bits: list[str] = []
+    if uname:
+        handle_bits.append(f"@{uname}")
+    handle_bits.append(chat_id)
+    parts.append(f"({', '.join(handle_bits)})")
+    return " ".join(parts) if parts and name else f"@{uname} ({chat_id})" if uname else chat_id
+
 
 def _truncate(text: str, limit: int) -> str:
     text = (text or "").replace("\n", " ").strip()

@@ -53,6 +53,7 @@ class Lifecycle:
         model: str | None = None,
         max_turns: int | None = None,
         chat_session_id: str | None = None,
+        restricted_to_chat: str | None = None,
     ) -> Task:
         task = Task(
             session_id=str(uuid4()),  # claude --session-id requires UUID format
@@ -60,6 +61,7 @@ class Lifecycle:
             model=model,
             max_turns=max_turns,
             dispatched_by_chat_session=chat_session_id,
+            restricted_to_chat=restricted_to_chat,
         )
         await self.db.insert_task(task)
         await self.events.publish(task.id, "state.changed", {"state": task.state.value})

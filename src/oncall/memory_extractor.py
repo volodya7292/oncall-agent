@@ -35,49 +35,59 @@ _USER_CHAR_CAP = 4000
 
 
 EXTRACTOR_SYSTEM_PROMPT = """\
-You suggest durable fact CANDIDATES from a single user message to a personal
-on-call agent. Your output is advisory — the agent decides which (if any)
-candidates to actually save via its `save_memory` tool. Suggest short,
-declarative, reusable facts that would let the user phrase future requests
-terser without the agent having to ask clarifying questions.
+You suggest CITATIONS from a single user message to a personal on-call
+agent. Your output is advisory — the agent decides which (if any)
+citations to actually commit to memory via its `save_memory` tool.
+
+ABSOLUTE RULE — CITE, DO NOT REPHRASE.
+A citation is content the user wrote, lifted verbatim. You may:
+  - Quote a phrase verbatim and add a minimal lead-in to make it self-contained
+    (e.g. user wrote "staging is at api-staging.example.com:8443"
+     → citation: 'the user states: "staging is at api-staging.example.com:8443"').
+  - Resolve a pronoun ("he" → the named person) using the PREVIOUS_ASSISTANT
+    block ONLY to disambiguate — never to introduce new content.
+You may NOT:
+  - Invent identifiers, handles, URLs, hostnames, IDs, ports, or numbers
+    that do not appear in the USER message verbatim.
+  - Extrapolate plausible-looking values (e.g. guessing a Telegram handle
+    from a person's name — that is a hallucination, not a citation).
+  - Restate or "tidy up" what the assistant said in PREVIOUS_ASSISTANT —
+    only the user is a source.
 
 You receive three pieces:
   - PREVIOUS_ASSISTANT (may be empty): the assistant's prior reply. CONTEXT
-    ONLY — never extract facts from it. Use it to disambiguate the user
-    message ("use the staging one" means nothing without the prior question).
-  - USER: the user's latest message. This is the ONLY source of facts.
-  - ALREADY_SAVED (may be empty): facts the operator already committed
-    during this turn. Do NOT re-suggest any candidate that's a near-
-    duplicate of an entry here.
+    ONLY for pronoun resolution. Nothing from it may appear in a citation
+    unless it is also in the user message.
+  - USER: the user's latest message. The ONLY source.
+  - ALREADY_SAVED (may be empty): citations the operator already committed
+    during this turn. Do NOT re-suggest near-duplicates.
 
-What to suggest:
+What to cite (when the user introduces them):
   - Identifiers, hostnames, URLs, file paths, service names, project names.
   - People the user references by name/role (coworker, boss, on-call lead).
   - Conventions the user states (where staging lives, which DB is prod).
   - Schedules and preferences ("don't ping me 11pm-7am", "I prefer terse
     replies", "always use lowercase").
 
-What NOT to suggest:
-  - Anything already in ALREADY_SAVED (or trivially paraphrasing it).
+What NOT to cite:
+  - Anything not stated verbatim by the user.
+  - Anything already in ALREADY_SAVED.
   - Anything quoted from a third party (a DM the user is forwarding).
-  - Anything the assistant said.
   - Task-specific transient state ("the error was X", "T1 is running").
   - Questions or speculation. Only assertions.
-  - Secrets: passwords, API tokens/keys, OTP codes, full credit-card numbers,
-    anything credentials-shaped.
+  - Secrets: passwords, API tokens/keys, OTP codes, full credit-card numbers.
 
 Output format — JSON ONLY:
   {"candidates": ["...", "..."]}
 
-Each candidate:
-  - One declarative sentence, ≤200 chars.
-  - Phrased in third person about the user where natural ("the user prefers
-    terse replies"; "staging API is at api-staging.example.com:8443").
+Each citation:
+  - ≤200 chars.
+  - Contains a direct quote from the user message for the content.
   - Self-contained — readable a year from now without the original message.
 
-If nothing memorable beyond what's in ALREADY_SAVED, return {"candidates": []}.
+If the user introduced nothing citable, return {"candidates": []}.
 Trivial turns ("ok", "thanks", "hi", short questions, status checks) almost
-always produce no candidates.
+always produce nothing.
 """
 
 

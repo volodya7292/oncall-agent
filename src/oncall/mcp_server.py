@@ -132,6 +132,13 @@ async def _proxy_broker(args: dict[str, Any]) -> dict[str, Any]:
 
 async def _proxy_messenger(args: dict[str, Any]) -> dict[str, Any]:
     payload = {k: v for k, v in args.items() if v is not None}
+    # Forward the executor's session_id so the orchestrator can look up
+    # the parent task and enforce `restricted_to_chat` (autonomous-reply
+    # lockdown). Missing is fine — the orchestrator treats it as "no
+    # restriction known".
+    sid = _session_id()
+    if sid:
+        payload.setdefault("session_id", sid)
     headers = {"X-Oncall-Token": _token(), "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:

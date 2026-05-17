@@ -42,6 +42,11 @@ class Task(BaseModel):
     max_turns: int | None = None
     consecutive_denials: int = 0
     dispatched_by_chat_session: str | None = None
+    # When set, this task was spawned from a turn locked to a specific
+    # Telegram chat (the inbox-drain autonomous-reply path). Tools the
+    # executor calls via /internal/messenger are gated against this id —
+    # cross-chat access is refused. None ⇒ no restriction.
+    restricted_to_chat: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
     terminal_reason: TerminalReason | None = None

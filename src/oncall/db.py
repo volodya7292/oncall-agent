@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     max_turns INTEGER,
     consecutive_denials INTEGER NOT NULL DEFAULT 0,
     dispatched_by_chat_session TEXT,
+    -- Telegram chat the task is locked to (autonomous-reply lockdown).
+    -- Migration adds this column on existing installs.
+    restricted_to_chat TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     terminal_reason TEXT
@@ -164,6 +167,33 @@ CREATE TABLE IF NOT EXISTS messenger_inbox (
 );
 CREATE INDEX IF NOT EXISTS idx_messenger_unread ON messenger_inbox(read_at) WHERE read_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messenger_dedup ON messenger_inbox(platform, chat_id, message_id);
+
+-- Operator-initiated `dispatch_task` calls made during an autonomous-reply
+-- turn are not auto-spawned: they sit here until the user taps Yes/No in
+-- the bot. On allow, the task is submitted with `restricted_to_chat`
+-- inherited (so the executor also runs locked to that chat). On deny,
+-- nothing further happens. Empty by default. See [operator.py]
+-- `_execute_tool` and [telegram_bot.py] `_dispatch_approval_subscriber`.
+CREATE TABLE IF NOT EXISTS pending_dispatches (
+    id TEXT PRIMARY KEY,
+    chat_session_id TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    model TEXT,
+    restricted_to_chat TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolution TEXT
+);
+
+-- Hard guardrail for `reply_to_dm`: a chat_id must be present here for the
+-- operator's autonomous-reply tool to succeed. Empty by default — the user
+-- has to explicitly `/allowdm <chat_id>` per chat. Even if the model is
+-- prompt-injected into citing a real `authority_memory_id`, this table is
+-- the final stop before bytes leave the box on the user's behalf.
+CREATE TABLE IF NOT EXISTS dm_allowlist (
+    chat_id TEXT PRIMARY KEY,
+    added_at TEXT NOT NULL
+);
 """
 
 
@@ -189,6 +219,7 @@ class Database:
         # SQLite ALTER TABLE ADD COLUMN errors if the column already exists,
         # so we swallow that specific case.
         await self._migrate_add_column("tasks", "result_summary", "TEXT")
+        await self._migrate_add_column("tasks", "restricted_to_chat", "TEXT")
         await self._migrate_add_column(
             "operator_memories", "model", "TEXT NOT NULL DEFAULT ''",
         )
@@ -220,8 +251,9 @@ class Database:
             """
             INSERT INTO tasks (id, session_id, state, prompt, model, max_turns,
                                consecutive_denials, dispatched_by_chat_session,
+                               restricted_to_chat,
                                created_at, updated_at, terminal_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(task.id),
@@ -232,6 +264,7 @@ class Database:
                 task.max_turns,
                 task.consecutive_denials,
                 task.dispatched_by_chat_session,
+                task.restricted_to_chat,
                 iso(task.created_at),
                 iso(task.updated_at),
                 task.terminal_reason.value if task.terminal_reason else None,
@@ -726,6 +759,95 @@ class Database:
         )
         await self.conn.commit()
 
+    # ---- pending dispatches (operator-initiated approval flow) ----
+
+    async def create_pending_dispatch(
+        self, *,
+        dispatch_id: str,
+        chat_session_id: str,
+        prompt: str,
+        model: str | None,
+        restricted_to_chat: str,
+    ) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO pending_dispatches
+                (id, chat_session_id, prompt, model, restricted_to_chat,
+                 created_at, resolved_at, resolution)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
+            """,
+            (dispatch_id, chat_session_id, prompt, model,
+             restricted_to_chat, iso(utcnow())),
+        )
+        await self.conn.commit()
+
+    async def get_pending_dispatch(
+        self, dispatch_id: str,
+    ) -> dict[str, Any] | None:
+        row = await (await self.conn.execute(
+            "SELECT * FROM pending_dispatches WHERE id = ?", (dispatch_id,),
+        )).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "chat_session_id": row["chat_session_id"],
+            "prompt": row["prompt"],
+            "model": row["model"],
+            "restricted_to_chat": row["restricted_to_chat"],
+            "created_at": row["created_at"],
+            "resolved_at": row["resolved_at"],
+            "resolution": row["resolution"],
+        }
+
+    async def resolve_pending_dispatch(
+        self, dispatch_id: str, resolution: str,
+    ) -> bool:
+        """Mark a pending dispatch resolved. Returns True if the row was
+        still pending and we resolved it; False if it was already resolved
+        or doesn't exist (the caller MUST treat this as a no-op so a double-
+        tap on Yes/No doesn't fire the task twice)."""
+        cur = await self.conn.execute(
+            "UPDATE pending_dispatches SET resolution = ?, resolved_at = ? "
+            "WHERE id = ? AND resolution IS NULL",
+            (resolution, iso(utcnow()), dispatch_id),
+        )
+        await self.conn.commit()
+        return (cur.rowcount or 0) > 0
+
+    # ---- dm allowlist (reply_to_dm hard guardrail) ----
+
+    async def allow_dm(self, chat_id: str) -> bool:
+        """Add `chat_id` to the autonomous-reply allowlist. Idempotent —
+        returns True if a new row was created, False if it already existed."""
+        cur = await self.conn.execute(
+            "INSERT OR IGNORE INTO dm_allowlist (chat_id, added_at) VALUES (?, ?)",
+            (chat_id, iso(utcnow())),
+        )
+        await self.conn.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def deny_dm(self, chat_id: str) -> bool:
+        """Remove `chat_id` from the allowlist. Returns True if a row was
+        deleted, False if it wasn't on the list."""
+        cur = await self.conn.execute(
+            "DELETE FROM dm_allowlist WHERE chat_id = ?", (chat_id,),
+        )
+        await self.conn.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def is_dm_allowed(self, chat_id: str) -> bool:
+        row = await (await self.conn.execute(
+            "SELECT 1 FROM dm_allowlist WHERE chat_id = ?", (chat_id,),
+        )).fetchone()
+        return row is not None
+
+    async def list_dm_allowed(self) -> list[dict[str, str]]:
+        rows = await (await self.conn.execute(
+            "SELECT chat_id, added_at FROM dm_allowlist ORDER BY added_at",
+        )).fetchall()
+        return [{"chat_id": r["chat_id"], "added_at": r["added_at"]} for r in rows]
+
     async def get_inbox_message(self, inbox_id: str) -> dict[str, Any] | None:
         row = await (await self.conn.execute(
             "SELECT * FROM messenger_inbox WHERE id = ?", (inbox_id,),
@@ -788,6 +910,7 @@ def _row_to_task(row: aiosqlite.Row) -> Task:
         max_turns=row["max_turns"],
         consecutive_denials=row["consecutive_denials"],
         dispatched_by_chat_session=row["dispatched_by_chat_session"],
+        restricted_to_chat=row["restricted_to_chat"],
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
         terminal_reason=TerminalReason(row["terminal_reason"]) if row["terminal_reason"] else None,
