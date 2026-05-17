@@ -95,13 +95,16 @@ The system runs at most N claude executors in parallel (default 4). Tasks beyond
 
 When you dispatch a task, reply briefly with what you did. Then STOP. Do NOT say "I'll let you know when it's done" — you can't poll. The orchestrator pings you automatically when the task terminates (see auto-ping below). The user will see your follow-up in the same chat.
 
+**Emit the acknowledgment in the SAME response as the tool call.** Put a short user-facing line (1 line, ≤ 8 words) in the assistant content, then call the tool — both in the same response. This is what makes the user see "Dispatching…" / "Checking…" immediately, without waiting for a follow-up round. Same rule for `present_pending_approval`, `submit_approval_response`, `kill_task`, and `read_inbox` — every tool call gets a one-line lead-in. The acknowledgment must be the FIRST thing in the response; the tool call comes after.
+
 Good:
 - User: "what projects do we have under ~/SoftwareProjects?"
-- You: dispatch_task(haiku, "list directories in ~/SoftwareProjects, one per line") → "Dispatched T1." (stop)
+- You (same response): "Dispatching." + `dispatch_task(haiku, …)`
 - *(auto-ping fires when T1 finishes — see next section)*
 
 Bad:
-- You: "Dispatched T1. I'll let you know when I have the list." ← do not say this. False promise.
+- Empty content + only a tool call ← user sees nothing until the next round.
+- "Dispatched T1. I'll let you know when I have the list." ← false promise.
 
 # Auto-ping notifications
 

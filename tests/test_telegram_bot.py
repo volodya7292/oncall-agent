@@ -230,13 +230,18 @@ async def test_owner_message_routes_through_operator(bus):
             "user_text": "check staging",
             "language": None,
         }]
-        assert api.sent == [{"chat_id": 999, "text": "staging is up."}]
+        assert len(api.sent) == 1
+        assert api.sent[0]["chat_id"] == 999
+        assert "staging is up" in api.sent[0]["text"]
+        assert api.sent[0].get("parse_mode") == "MarkdownV2"
     finally:
         await svc.stop()
 
 
 @pytest.mark.asyncio
 async def test_start_command_answered_locally(bus):
+    """/start must reply without routing to the operator. We don't pin the
+    greeting text — only the local-handling property matters here."""
     api = FakeBotApi()
     operator = FakeOperator()
     svc = await _make_bot(bus, api, operator)
@@ -244,7 +249,7 @@ async def test_start_command_answered_locally(bus):
         await svc._dispatch(_msg(sender_id=OWNER_ID, text="/start")["message"])
         assert operator.calls == []
         assert len(api.sent) == 1
-        assert "on-call operator" in api.sent[0]["text"].lower()
+        assert api.sent[0]["text"].strip()
     finally:
         await svc.stop()
 
@@ -325,7 +330,9 @@ async def test_chat_reply_for_this_session_delivered(bus):
             if api.sent:
                 break
             await asyncio.sleep(0.01)
-        assert api.sent == [{"chat_id": OWNER_ID, "text": "Found 5 projects."}]
+        assert len(api.sent) == 1
+        assert api.sent[0]["chat_id"] == OWNER_ID
+        assert "Found 5 projects" in api.sent[0]["text"]
     finally:
         await svc.stop()
 
@@ -825,6 +832,64 @@ async def test_compress_command_reports_nothing_to_compress(bus):
 
 
 @pytest.mark.asyncio
+async def test_heavy_ops_are_serialized_per_bot(bus):
+    """While /compress (or /context) is mid-flight, a second long-running
+    command must fast-fail with a busy message instead of queueing. This
+    matters because the operator's session lock would otherwise let the
+    second call merely WAIT, leaving the user typing into a black hole
+    with no signal that the first is still working.
+
+    Asserts the cross-command interaction: /context-while-/compress and
+    vice versa, plus that the gate releases on completion."""
+    api = FakeBotApi()
+
+    # An operator whose compress_now blocks until released — lets us
+    # exercise the "another command arrived while one was running" branch.
+    compress_started = asyncio.Event()
+    compress_release = asyncio.Event()
+
+    class GatedOperator(FakeOperator):
+        async def compress_now(self, session_id):  # type: ignore[override]
+            self.compress_calls.append(session_id)
+            compress_started.set()
+            await compress_release.wait()
+            return {"compressed": True, "older_rows": 1, "summary_tokens": 1}
+
+    operator = GatedOperator()
+    svc = await _make_bot(bus, api, operator)
+    try:
+        # Kick off /compress and let it park.
+        first = asyncio.create_task(
+            svc._dispatch(_msg(sender_id=OWNER_ID, text="/compress")["message"])
+        )
+        await compress_started.wait()
+
+        # Second /compress arrives — must NOT start the operator method again.
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="/compress")["message"])
+        assert len(operator.compress_calls) == 1, "second /compress should be rejected"
+        assert "still running" in api.sent[-1]["text"].lower()
+
+        # /context while /compress is in flight — also rejected, no
+        # export_context call.
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="/context")["message"])
+        assert operator.export_calls == [], "/context should not run during /compress"
+        assert api.documents == []
+        assert "still running" in api.sent[-1]["text"].lower()
+
+        # Release the first /compress; gate clears.
+        compress_release.set()
+        await first
+
+        # Now /context works again.
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="/context")["message"])
+        assert operator.export_calls == [svc.session_id]
+        assert len(api.documents) == 1
+    finally:
+        compress_release.set()
+        await svc.stop()
+
+
+@pytest.mark.asyncio
 async def test_help_lists_clear_compress_context(bus):
     api = FakeBotApi()
     svc = await _make_bot(bus, api, FakeOperator())
@@ -845,14 +910,23 @@ async def test_help_lists_clear_compress_context(bus):
 
 @pytest.mark.asyncio
 async def test_start_registers_slash_commands(bus):
-    """Booting the bot must call setMyCommands so the user sees the menu."""
+    """Booting the bot must call setMyCommands so the user sees the menu.
+
+    Telegram clients pick the most-specific scope; for an owner-DM-only
+    bot, `all_private_chats` is the scope that actually drives the
+    autocomplete in the chat. We also publish under `default` as a
+    fallback for clients that key off it. If either call is missing the
+    menu may silently fail to populate."""
     api = FakeBotApi()
     svc = await _make_bot(bus, api, FakeOperator())
     try:
         set_calls = [c for c in api.calls if c[0] == "setMyCommands"]
-        assert len(set_calls) == 1, api.calls
-        names = {c["command"] for c in set_calls[0][1]["commands"]}
-        assert {"context", "clear", "compress", "status", "help"} <= names
+        assert len(set_calls) == 2, api.calls
+        scopes = {c[1]["scope"]["type"] for c in set_calls}
+        assert scopes == {"all_private_chats", "default"}
+        for _, payload in set_calls:
+            names = {c["command"] for c in payload["commands"]}
+            assert {"context", "clear", "compress", "status", "help"} <= names
     finally:
         await svc.stop()
 

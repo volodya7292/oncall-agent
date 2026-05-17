@@ -116,6 +116,11 @@ CREATE TABLE IF NOT EXISTS operator_memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     text TEXT NOT NULL,
     embedding BLOB NOT NULL,
+    -- Name of the embedding model that produced `embedding`. When the
+    -- configured model changes, rows whose `model` doesn't match are
+    -- invisible to retrieval until a background rebuild re-embeds them.
+    -- See OperatorMemory.rebuild_stale_embeddings().
+    model TEXT NOT NULL DEFAULT '',
     source_turn TEXT,
     created_at TEXT NOT NULL,
     last_accessed_at TEXT NOT NULL,
@@ -164,6 +169,9 @@ class Database:
         # SQLite ALTER TABLE ADD COLUMN errors if the column already exists,
         # so we swallow that specific case.
         await self._migrate_add_column("tasks", "result_summary", "TEXT")
+        await self._migrate_add_column(
+            "operator_memories", "model", "TEXT NOT NULL DEFAULT ''",
+        )
         await self._conn.commit()
 
     async def _migrate_add_column(self, table: str, column: str, type_decl: str) -> None:

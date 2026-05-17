@@ -51,7 +51,7 @@ class ScriptedLLM:
     def __init__(self) -> None:
         self.calls_made: list[dict[str, Any]] = []
 
-    async def chat(self, *, model, messages, tools, max_tokens=None):
+    async def chat(self, *, model, messages, tools, max_tokens=None, reasoning_effort=None):
         self.calls_made.append({"messages": messages})
         return {"role": "assistant", "content": "ok", "tool_calls": []}
 

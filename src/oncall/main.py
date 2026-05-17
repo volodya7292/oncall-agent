@@ -26,11 +26,28 @@ ONCALL_PORT=8765
 ONCALL_DB_PATH=~/.oncall/state.db
 ONCALL_PROD_HOSTS=
 
-# Operator (Vercel AI Gateway, OpenAI-compatible)
-# Get a key at https://vercel.com/dashboard/ai-gateway/api-keys
-ONCALL_OPERATOR_MODEL=google/gemma-4-26b-a4b-it
+# Operator backend choice — see .env.example for details.
+# Default uses Google AI Studio (gemini) which preserves ack-first behavior;
+# set to "vercel" only if you need non-Google models via the AI Gateway.
+ONCALL_OPERATOR_BACKEND=gemini
+ONCALL_OPERATOR_MODEL=google/gemma-4-31b-it
+ONCALL_OPERATOR_REASONING_EFFORT=minimal
+
+# Gemini (AI Studio) — required when ONCALL_OPERATOR_BACKEND=gemini.
+# Get a key at https://aistudio.google.com/apikey
+GEMINI_API_KEY=
+
+# Vercel AI Gateway — used as the operator backend when
+# ONCALL_OPERATOR_BACKEND=vercel, or as the embeddings backend when
+# ONCALL_MEMORY_EMBED_MODEL is a vendor-prefixed slug.
+# https://vercel.com/dashboard/ai-gateway/api-keys
 AI_GATEWAY_BASE_URL=https://ai-gateway.vercel.sh/v1
 AI_GATEWAY_API_KEY=
+
+# Memory embedder. Default uses local Ollama (~30× faster). Pull first:
+#   ollama pull nomic-embed-text:137m-v1.5-fp16
+ONCALL_MEMORY_EMBED_MODEL=nomic-embed-text:137m-v1.5-fp16
+ONCALL_OLLAMA_HOST=http://localhost:11434
 
 # Executor (Claude CLI) uses whatever auth `claude` already has on this host —
 # keychain OAuth for subscription users, or ANTHROPIC_API_KEY in your shell env
@@ -71,6 +88,17 @@ def _serve_api() -> None:
         host="127.0.0.1",
         port=settings.oncall_port,
         log_level="info",
+        # Cap how long uvicorn waits for in-flight connections on SIGTERM
+        # before force-closing them and running lifespan teardown. Without
+        # this, long-lived SSE subscribers to /events block teardown
+        # indefinitely — and launchd's ExitTimeOut (default 20s) then
+        # escalates to SIGKILL, skipping our shutdown path. Skipping
+        # shutdown leaves pending approvals UNRESOLVED in the DB and lets
+        # the next daemon boot try to --resume orphan claude sessions,
+        # which fails with cli_error. Capping at 5s gives uvicorn enough
+        # time to drain real traffic but guarantees lifecycle.shutdown()
+        # runs (it denies pending approvals + marks running tasks killed).
+        timeout_graceful_shutdown=5,
     )
 
 

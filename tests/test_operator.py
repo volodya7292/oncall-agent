@@ -45,7 +45,7 @@ class ScriptedLLM:
         self.script = list(script)
         self.calls_made: list[dict[str, Any]] = []
 
-    async def chat(self, *, model, messages, tools, max_tokens=None):
+    async def chat(self, *, model, messages, tools, max_tokens=None, reasoning_effort=None):
         self.calls_made.append({"messages": messages, "tools": tools})
         if not self.script:
             return {"role": "assistant", "content": "(out of script)", "tool_calls": []}
@@ -121,7 +121,7 @@ class FakeExtractorLLM:
         self._facts_per_call = list(facts_per_call or [])
         self._raise_with = raise_with
 
-    async def chat(self, *, model, messages, tools, max_tokens=None):
+    async def chat(self, *, model, messages, tools, max_tokens=None, reasoning_effort=None):
         self.calls.append({"model": model, "messages": messages})
         if self._raise_with is not None:
             raise self._raise_with
@@ -792,7 +792,7 @@ async def test_second_turn_not_blocked_by_pending_extraction(stack):
         def __init__(self) -> None:
             self.calls = 0
 
-        async def chat(self, *, model, messages, tools, max_tokens=None):
+        async def chat(self, *, model, messages, tools, max_tokens=None, reasoning_effort=None):
             self.calls += 1
             extraction_started.set()
             await extraction_release.wait()
@@ -932,7 +932,7 @@ async def test_session_lock_serializes_chat_turn_and_auto_ping(stack):
         def __init__(self) -> None:
             self.order: list[str] = []
 
-        async def chat(self, *, model, messages, tools, max_tokens=None):
+        async def chat(self, *, model, messages, tools, max_tokens=None, reasoning_effort=None):
             # The first invocation (chat_turn) gates on `release`; the second
             # (auto_ping) records its order and returns immediately.
             if not self.order:

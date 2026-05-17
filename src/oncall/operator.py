@@ -48,9 +48,153 @@ class LLMClient(Protocol):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         max_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         """Return {role: 'assistant', content: str|None, tool_calls: list|None}."""
         ...
+
+
+class GenAILLMClient:
+    """LLM client backed by Google's native AI Studio / Gemini API
+    (`google.genai`). Translates the operator's OpenAI-Chat-style messages
+    + tools into Gemini's Contents/FunctionDeclaration shape and translates
+    the response back, so it's a drop-in for `GatewayLLMClient`.
+
+    The Vercel gateway's gemma-4-31b-it routing strips assistant text when
+    a tool call is present in the same response — that kills our ack-first
+    latency optimization. The native AI Studio API preserves both parts,
+    so we use this client by default for Gemma operator models."""
+
+    def __init__(self, api_key: str) -> None:
+        from google import genai
+        self._client = genai.Client(api_key=api_key)
+
+    async def chat(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        max_tokens: int | None = None,
+        reasoning_effort: str | None = None,
+    ) -> dict[str, Any]:
+        from google.genai import types
+        from uuid import uuid4
+
+        # Drop a "google/" prefix if the user pinned the model via the
+        # Vercel-style slug; AI Studio uses bare names.
+        gem_model = model.split("/", 1)[1] if model.startswith("google/") else model
+
+        # OpenAI → Gemini message translation.
+        # Track function-call ids → names so a later "tool" message can pair
+        # its tool_call_id back to the function it was responding to (Gemini
+        # function_response needs a name, not an id).
+        system_chunks: list[str] = []
+        contents: list[types.Content] = []
+        id_to_name: dict[str, str] = {}
+
+        for m in messages:
+            role = m.get("role")
+            if role == "system":
+                if m.get("content"):
+                    system_chunks.append(m["content"])
+            elif role == "user":
+                contents.append(types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=m.get("content") or "")],
+                ))
+            elif role == "assistant":
+                parts: list[types.Part] = []
+                if m.get("content"):
+                    parts.append(types.Part.from_text(text=m["content"]))
+                for tc in (m.get("tool_calls") or []):
+                    fn = tc.get("function", {})
+                    name = fn.get("name", "")
+                    raw = fn.get("arguments") or "{}"
+                    try:
+                        args = json.loads(raw) if raw else {}
+                    except json.JSONDecodeError:
+                        args = {}
+                    parts.append(types.Part(function_call=types.FunctionCall(
+                        name=name, args=args,
+                    )))
+                    if tc.get("id"):
+                        id_to_name[tc["id"]] = name
+                if parts:
+                    contents.append(types.Content(role="model", parts=parts))
+            elif role == "tool":
+                tc_id = m.get("tool_call_id", "")
+                name = id_to_name.get(tc_id, "unknown")
+                raw = m.get("content") or "{}"
+                try:
+                    response = json.loads(raw)
+                except json.JSONDecodeError:
+                    response = {"result": raw}
+                # Gemini's function_response expects a dict; if the result
+                # was a bare scalar/list, wrap it.
+                if not isinstance(response, dict):
+                    response = {"result": response}
+                contents.append(types.Content(
+                    role="user",
+                    parts=[types.Part.from_function_response(
+                        name=name, response=response,
+                    )],
+                ))
+
+        cfg_kwargs: dict[str, Any] = {"temperature": 0.2}
+        if system_chunks:
+            cfg_kwargs["system_instruction"] = "\n\n".join(system_chunks)
+        if max_tokens is not None:
+            cfg_kwargs["max_output_tokens"] = max_tokens
+        # OpenAI's reasoning_effort levels → Gemini thinking_level. Gemma-4
+        # only accepts MINIMAL or HIGH; other levels would 400 the call, so
+        # we skip the dial rather than fail loudly. Leaving thinking_config
+        # unset means default (HIGH) — but we never want default for the
+        # operator, hence the explicit MINIMAL when caller asks for any
+        # low-effort variant.
+        if reasoning_effort:
+            level = reasoning_effort.upper()
+            if level not in {"MINIMAL", "HIGH"}:
+                level = "MINIMAL"
+            cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=level)
+        if tools:
+            decls: list[types.FunctionDeclaration] = []
+            for t in tools:
+                fn = t.get("function", {})
+                decls.append(types.FunctionDeclaration(
+                    name=fn["name"],
+                    description=fn.get("description", ""),
+                    parameters=fn.get("parameters") or None,
+                ))
+            cfg_kwargs["tools"] = [types.Tool(function_declarations=decls)]
+
+        cfg = types.GenerateContentConfig(**cfg_kwargs)
+        resp = await self._client.aio.models.generate_content(
+            model=gem_model, contents=contents, config=cfg,
+        )
+
+        # Gemini → OpenAI response shape.
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        for c in (resp.candidates or []):
+            if c.content and c.content.parts:
+                for part in c.content.parts:
+                    if getattr(part, "thought", False):
+                        continue
+                    if part.text:
+                        text_parts.append(part.text)
+                    fc = getattr(part, "function_call", None)
+                    if fc is not None:
+                        tool_calls.append({
+                            "id": f"gemini_call_{uuid4().hex[:16]}",
+                            "name": fc.name,
+                            "arguments_json": json.dumps(dict(fc.args or {})),
+                        })
+        return {
+            "role": "assistant",
+            "content": "".join(text_parts),
+            "tool_calls": tool_calls,
+        }
 
 
 class GatewayLLMClient:
@@ -63,7 +207,7 @@ class GatewayLLMClient:
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
     async def chat(
-        self, *, model, messages, tools, max_tokens=None,
+        self, *, model, messages, tools, max_tokens=None, reasoning_effort=None,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": model,
@@ -74,6 +218,8 @@ class GatewayLLMClient:
         }
         if max_tokens is not None:
             kwargs["max_completion_tokens"] = max_tokens
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
         # OpenAI client rejects tools=None — strip if so.
         if kwargs["tools"] is None:
             kwargs.pop("tools")
@@ -486,6 +632,9 @@ class Operator:
         self._llm = llm
         self._telegram = telegram
         self._memory = memory
+        # Exposed so api.py can probe stale_count() / trigger rebuild
+        # without breaking the existing _memory private convention.
+        self.memory: MemoryStore = memory
         self._events = events
         # When extract_llm is None, auto-extraction is disabled (memory still
         # works for retrieval — it just never grows from conversation).
@@ -619,6 +768,7 @@ class Operator:
                 messages=messages,
                 tools=OPERATOR_TOOLS,
                 max_tokens=512,
+                reasoning_effort=self._settings.oncall_operator_reasoning_effort,
             )
             tc_list = resp.get("tool_calls") or []
             if not tc_list:

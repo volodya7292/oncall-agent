@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any
 from uuid import UUID, uuid4
 
 from .approval_client import HttpLongPollApprovalClient
@@ -79,16 +78,24 @@ class Lifecycle:
         if rt is None:
             return False
         # If there's a pending approval future, resolve it as deny first so
-        # the broker's await returns immediately.
+        # the broker's await returns immediately. Also write the resolved
+        # row to the DB ourselves rather than relying on the broker's
+        # post-await commit — during shutdown the broker may not survive
+        # long enough to do it. The DB row matters because the next daemon
+        # boot's recover() would otherwise see an orphan pending row.
         for approval in await self.db.list_pending_approvals():
-            if approval.task_id == task_id and self.approval_client.has_pending(approval.id):
-                from .models import ApprovalResult, utcnow
-                self.approval_client.resolve(approval.id, ApprovalResult(
-                    request_id=approval.id,
-                    behavior="deny",
-                    message=f"task killed: {reason}",
-                    responded_at=utcnow(),
-                ))
+            if approval.task_id != task_id:
+                continue
+            from .models import ApprovalResult, utcnow
+            result = ApprovalResult(
+                request_id=approval.id,
+                behavior="deny",
+                message=f"task killed: {reason}",
+                responded_at=utcnow(),
+            )
+            if self.approval_client.has_pending(approval.id):
+                self.approval_client.resolve(approval.id, result)
+            await self.db.append_approval_response(approval.id, result)
         rt.runner.cancel()
         try:
             await rt.runner

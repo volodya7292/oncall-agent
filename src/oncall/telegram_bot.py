@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Protocol
 from uuid import UUID
@@ -63,6 +64,81 @@ def bot_session_id(owner_user_id: int) -> str:
     """Deterministic chat-session id for the bot's conversation with the owner.
     One owner ↔ one session, persistent across daemon restarts."""
     return f"tg-bot-{owner_user_id}"
+
+
+# --- MarkdownV2 escaping ----------------------------------------------------
+# Telegram MarkdownV2 demands every special char be escaped UNLESS it's part
+# of a recognized formatting pair. We preserve four pairs:
+#   ```fenced```, `inline`, *bold*, _italic_
+# and escape every other special char as `\X` so the message parses cleanly.
+# The operator's model output is GFM-flavored (uses `**bold**`); we normalize
+# to V2's single-asterisk form before escaping.
+
+_V2_SPECIAL_CHARS = set("_*[]()~`>#+-=|{}.!")
+_V2_SPECIAL_RE = re.compile(r"([_*\[\]()~`>#+\-=|{}.!])")
+_GFM_BOLD_RE = re.compile(r"\*\*([^\n*]+?)\*\*")
+
+
+def _escape_code(s: str) -> str:
+    """V2 inside-code escape: only backslash and backtick."""
+    return s.replace("\\", "\\\\").replace("`", "\\`")
+
+
+def escape_v2(text: str) -> str:
+    """Render `text` as Telegram MarkdownV2 with proper escaping. Best-effort:
+    if the caller writes anything weirder than the four supported pairs above,
+    the formatting won't render — but the message will still parse and reach
+    the user. `_send` falls back to plain text on any parse error.
+    """
+    # GFM `**bold**` → V2 `*bold*` (V2 uses single asterisks).
+    text = _GFM_BOLD_RE.sub(r"*\1*", text)
+    out: list[str] = []
+    n = len(text)
+    pos = 0
+    while pos < n:
+        ch = text[pos]
+        # Fenced code block ```...```
+        if text.startswith("```", pos):
+            end = text.find("```", pos + 3)
+            if end != -1:
+                out.append("```")
+                out.append(_escape_code(text[pos + 3:end]))
+                out.append("```")
+                pos = end + 3
+                continue
+        # Inline code `...` (single line, non-empty body)
+        if ch == "`":
+            end = text.find("`", pos + 1)
+            if end != -1 and end > pos + 1 and "\n" not in text[pos + 1:end]:
+                out.append("`")
+                out.append(_escape_code(text[pos + 1:end]))
+                out.append("`")
+                pos = end + 1
+                continue
+        # Bold pair *...* (single line, non-empty body)
+        if ch == "*":
+            end = text.find("*", pos + 1)
+            if end != -1 and end > pos + 1 and "\n" not in text[pos + 1:end]:
+                out.append("*")
+                out.append(_V2_SPECIAL_RE.sub(r"\\\1", text[pos + 1:end]))
+                out.append("*")
+                pos = end + 1
+                continue
+        # Italic pair _..._ (single line, non-empty body)
+        if ch == "_":
+            end = text.find("_", pos + 1)
+            if end != -1 and end > pos + 1 and "\n" not in text[pos + 1:end]:
+                out.append("_")
+                out.append(_V2_SPECIAL_RE.sub(r"\\\1", text[pos + 1:end]))
+                out.append("_")
+                pos = end + 1
+                continue
+        # Literal char: escape if special.
+        if ch in _V2_SPECIAL_CHARS:
+            out.append("\\")
+        out.append(ch)
+        pos += 1
+    return "".join(out)
 
 
 def chunk_message(text: str, *, limit: int = _TELEGRAM_MSG_LIMIT) -> list[str]:
@@ -191,6 +267,12 @@ class TelegramBotService:
         self._bot_username: str | None = None
         self._bot_user_id: int | None = None
         self._started = False
+        # Mutual-exclusion flag for long-running owner-initiated commands
+        # (/compress, /context). asyncio is single-threaded, so a plain bool
+        # checked-then-set across an event-loop turn boundary is sufficient
+        # — no Lock required. When set, holds the user-facing name of the
+        # in-flight op so we can name it in the "busy" reply.
+        self._heavy_op_in_flight: str | None = None
 
     @property
     def session_id(self) -> str:
@@ -229,29 +311,82 @@ class TelegramBotService:
                 self._bot_user_id = None
         # Register the slash-command menu so the user gets autocomplete in
         # the Telegram client without having to set anything up via BotFather.
-        # Fail-soft: a transient network blip here must NOT block polling.
-        try:
-            await self._api.call("setMyCommands", {"commands": _BOT_COMMANDS})
-            telegram_log.info("bot commands registered " + fmt(
-                count=len(_BOT_COMMANDS),
-            ))
-        except Exception:
-            log.exception("setMyCommands failed; commands menu may be stale")
+        # Scope must be explicit — `default` is a fallback the client may
+        # ignore in favor of more-specific scopes. This bot is owner-DM only
+        # (single-user), so `all_private_chats` is the right canonical scope.
+        # We also publish under `default` so clients that read the fallback
+        # have something to display. Fail-soft: a transient network blip
+        # must not block polling.
+        for scope in (
+            {"type": "all_private_chats"},
+            {"type": "default"},
+        ):
+            try:
+                await self._api.call("setMyCommands", {
+                    "commands": _BOT_COMMANDS,
+                    "scope": scope,
+                })
+                telegram_log.info("bot commands registered " + fmt(
+                    count=len(_BOT_COMMANDS), scope=scope["type"],
+                ))
+            except Exception:
+                log.exception(
+                    "setMyCommands failed for scope=%s; menu may be stale",
+                    scope.get("type"),
+                )
         self._poll_task = asyncio.create_task(self._poll_loop(), name="tg-bot-poll")
+        self._poll_task.add_done_callback(self._on_bg_task_done)
         self._reply_task = asyncio.create_task(
             self._chat_reply_subscriber(), name="tg-bot-reply",
         )
+        self._reply_task.add_done_callback(self._on_bg_task_done)
         # Approval-request subscriber: send inline Yes/No buttons whenever a
         # task dispatched in this bot's session needs approval.
         if self._broker is not None and self._db is not None:
             self._approval_task = asyncio.create_task(
                 self._approval_subscriber(), name="tg-bot-approval",
             )
+            self._approval_task.add_done_callback(self._on_bg_task_done)
         self._started = True
         log.info(
             "telegram bot started (owner_user_id=%d, username=@%s, session=%s)",
             self._owner_user_id, self._bot_username, self._session_id,
         )
+
+    # ---- notifications ----
+
+    async def notify_owner(self, text: str) -> None:
+        """Send an out-of-band plain-text message to the owner. Used by the
+        daemon to surface startup status + background-task crashes without
+        going through the operator. No parse_mode — markdown failures must
+        not silently drop the message. Errors are swallowed: a failed
+        notification must never crash whatever was trying to surface state.
+        """
+        if not self._started or self._owner_user_id is None:
+            return
+        try:
+            await self._api.call("sendMessage", {
+                "chat_id": self._owner_user_id, "text": text,
+            })
+        except Exception:
+            log.exception("notify_owner failed")
+
+    def _on_bg_task_done(self, task: asyncio.Task) -> None:
+        """Done-callback for long-lived background subscribers. If a task
+        exits with an exception (NOT cancellation), notify the owner so the
+        daemon isn't silently degraded — those tasks are how approvals,
+        auto-pings, and inbound messages reach the user."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        log.error("background task %r exited: %r", task.get_name(), exc)
+        # Schedule the notify in the running loop; can't await here.
+        asyncio.create_task(self.notify_owner(
+            f"⚠️ background task '{task.get_name()}' crashed: "
+            f"{type(exc).__name__}: {exc}"
+        ))
 
     async def stop(self) -> None:
         if not self._started:
@@ -269,6 +404,29 @@ class TelegramBotService:
             log.exception("error closing bot api transport")
         self._started = False
         log.info("telegram bot stopped")
+
+    # ---- long-op concurrency gate ----
+
+    async def _claim_heavy_op(self, chat_id: Any, name: str) -> bool:
+        """Reserve the heavy-op slot for `name`. Returns True if the caller
+        owns the slot now (proceed); False if another long op is already
+        running (the user has been told to wait). Pair every True return
+        with a `_release_heavy_op()` call in a `finally`.
+
+        The check-then-set is non-racy because asyncio is single-threaded
+        and we don't `await` between reading `_heavy_op_in_flight` and
+        writing it."""
+        if self._heavy_op_in_flight is not None:
+            await self._send(chat_id, (
+                f"{self._heavy_op_in_flight} is still running; "
+                f"try {name} again once it finishes."
+            ))
+            return False
+        self._heavy_op_in_flight = name
+        return True
+
+    def _release_heavy_op(self) -> None:
+        self._heavy_op_in_flight = None
 
     # ---- polling ----
 
@@ -329,7 +487,7 @@ class TelegramBotService:
         # Slash commands handled locally — don't burn an operator turn on them.
         if text.startswith("/start"):
             await self._send(chat_id, (
-                "Hi. I'm your on-call operator. Tell me what you need — "
+                "Hi. Tell me what you need — "
                 "I'll dispatch tasks and ping you back when they're done."
             ))
             return
@@ -348,28 +506,33 @@ class TelegramBotService:
             await self._send(chat_id, await self._render_status())
             return
         if text.startswith("/context"):
-            try:
-                dump = await self._operator.export_context(self._session_id)
-            except Exception:
-                log.exception("operator.export_context failed")
-                await self._send(chat_id, "Failed to export context. Check logs.")
+            if not await self._claim_heavy_op(chat_id, "/context"):
                 return
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            filename = f"oncall-context-{self._session_id}-{stamp}.md"
             try:
-                await self._api.send_document(
-                    chat_id=chat_id,
-                    filename=filename,
-                    content=dump.encode("utf-8"),
-                    caption="Operator context for this session.",
-                )
-            except Exception:
-                log.exception("send_document failed for /context")
-                await self._send(chat_id, "Failed to upload context file. Check logs.")
-                return
-            telegram_log.info("bot context " + fmt(
-                session=self._session_id, bytes=len(dump),
-            ))
+                try:
+                    dump = await self._operator.export_context(self._session_id)
+                except Exception:
+                    log.exception("operator.export_context failed")
+                    await self._send(chat_id, "Failed to export context. Check logs.")
+                    return
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                filename = f"oncall-context-{self._session_id}-{stamp}.md"
+                try:
+                    await self._api.send_document(
+                        chat_id=chat_id,
+                        filename=filename,
+                        content=dump.encode("utf-8"),
+                        caption="Operator context for this session.",
+                    )
+                except Exception:
+                    log.exception("send_document failed for /context")
+                    await self._send(chat_id, "Failed to upload context file. Check logs.")
+                    return
+                telegram_log.info("bot context " + fmt(
+                    session=self._session_id, bytes=len(dump),
+                ))
+            finally:
+                self._release_heavy_op()
             return
         if text.startswith("/clear"):
             out = await self._operator.clear_session(self._session_id)
@@ -382,17 +545,22 @@ class TelegramBotService:
             ))
             return
         if text.startswith("/compress"):
-            out = await self._operator.compress_now(self._session_id)
-            if out.get("compressed"):
-                await self._send(chat_id, (
-                    f"Compressed {out['older_rows']} messages into "
-                    f"~{out['summary_tokens']} tokens of summary."
+            if not await self._claim_heavy_op(chat_id, "/compress"):
+                return
+            try:
+                out = await self._operator.compress_now(self._session_id)
+                if out.get("compressed"):
+                    await self._send(chat_id, (
+                        f"Compressed {out['older_rows']} messages into "
+                        f"~{out['summary_tokens']} tokens of summary."
+                    ))
+                else:
+                    await self._send(chat_id, f"Nothing to compress: {out.get('reason')}.")
+                telegram_log.info("bot compress " + fmt(
+                    session=self._session_id, **out,
                 ))
-            else:
-                await self._send(chat_id, f"Nothing to compress: {out.get('reason')}.")
-            telegram_log.info("bot compress " + fmt(
-                session=self._session_id, **out,
-            ))
+            finally:
+                self._release_heavy_op()
             return
 
         telegram_log.info("bot inbound " + fmt(
@@ -547,8 +715,8 @@ class TelegramBotService:
             try:
                 await self._api.call("sendMessage", {
                     "chat_id": self._owner_user_id,
-                    "text": body,
-                    "parse_mode": "Markdown",
+                    "text": escape_v2(body),
+                    "parse_mode": "MarkdownV2",
                     "reply_markup": {
                         "inline_keyboard": [[
                             {"text": "✅ Yes", "callback_data": f"appr:{approval_id}:allow"},
@@ -659,7 +827,7 @@ class TelegramBotService:
         try:
             await self._api.call("editMessageText", {
                 "chat_id": chat_id, "message_id": message_id,
-                "text": new_text, "parse_mode": "Markdown",
+                "text": escape_v2(new_text), "parse_mode": "MarkdownV2",
                 "reply_markup": {"inline_keyboard": []},
             })
         except Exception:
@@ -668,12 +836,24 @@ class TelegramBotService:
     # ---- send ----
 
     async def _send(self, chat_id: Any, text: str) -> None:
+        """Send `text` as MarkdownV2 with auto-escape; fall back to plain text
+        if Telegram rejects the parse (returns ok=false). The fallback path is
+        the safety net for anything our V2 escaper doesn't anticipate — e.g.
+        an unmatched bracket inside a long code block, or formatting the model
+        invented that we don't yet recognize."""
         if chat_id is None or not text:
             return
         for piece in chunk_message(text):
-            await self._api.call("sendMessage", {
-                "chat_id": chat_id, "text": piece,
-            })
+            try:
+                await self._api.call("sendMessage", {
+                    "chat_id": chat_id, "text": escape_v2(piece),
+                    "parse_mode": "MarkdownV2",
+                })
+            except Exception as e:
+                log.warning("MarkdownV2 send failed (%s); falling back to plain text", e)
+                await self._api.call("sendMessage", {
+                    "chat_id": chat_id, "text": piece,
+                })
 
 
 # ---------------------------------------------------------------------------

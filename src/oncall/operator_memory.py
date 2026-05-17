@@ -16,6 +16,7 @@ capacity.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -69,6 +70,7 @@ class OperatorMemory:
         db: Database,
         embedder: EmbeddingClient,
         *,
+        embed_model: str,
         capacity: int,
         max_inject: int,
         relevance_floor: float,
@@ -78,6 +80,12 @@ class OperatorMemory:
     ) -> None:
         self._db = db
         self._embed = embedder
+        # Name tag written to each row's `model` column. Retrieval filters
+        # to rows whose model matches this; rows from older models are
+        # invisible until `rebuild_stale_embeddings()` re-embeds them.
+        # Tests pass a sentinel string here — production threads the real
+        # model id from settings.oncall_memory_embed_model.
+        self._embed_model = embed_model
         self._capacity = capacity
         self._max_inject = max_inject
         self._floor = relevance_floor
@@ -157,11 +165,14 @@ class OperatorMemory:
         if not rows:
             return []
 
+        embed_start = time.monotonic()
         try:
             qvec_list = (await self._embed.embed([q]))[0]
         except Exception:
             log.exception("embedding call failed in retrieve()")
             return []
+        embed_s = time.monotonic() - embed_start
+        score_start = time.monotonic()
         qvec = np.asarray(qvec_list, dtype=np.float32)
         matrix = np.vstack([unpack(r["embedding"]) for r in rows])
         cosines = cosine_matrix(qvec, matrix)
@@ -174,6 +185,7 @@ class OperatorMemory:
                 scored.append((score, float(c), r))
         scored.sort(key=lambda t: t[0], reverse=True)
         picked = scored[:lim]
+        score_s = time.monotonic() - score_start
 
         if picked:
             await self._bump_access(*(int(p[2]["id"]) for p in picked))
@@ -182,6 +194,8 @@ class OperatorMemory:
             candidates=len(rows),
             picked=len(picked),
             max_score=round(picked[0][0], 3) if picked else 0.0,
+            embed_ms=int(embed_s * 1000),
+            score_ms=int(score_s * 1000),
         ))
         return [
             Memory(
@@ -206,17 +220,25 @@ class OperatorMemory:
         return "\n".join(f"- {m.text}" for m in memories)
 
     async def entries_count(self) -> int:
+        """Count of rows usable for retrieval — i.e., embedded with the
+        currently-configured model. Rows pending a rebuild are excluded
+        (`stale_count()` exposes that bucket separately)."""
         row = await (await self._db.conn.execute(
-            "SELECT COUNT(*) AS n FROM operator_memories"
+            "SELECT COUNT(*) AS n FROM operator_memories WHERE model = ?",
+            (self._embed_model,),
         )).fetchone()
         return int(row["n"]) if row else 0
 
     # ---- internals ---------------------------------------------------------
 
     async def _all_rows(self) -> list[dict[str, Any]]:
+        """Returns rows embedded with the CURRENT model only. Rows from older
+        models are invisible to retrieval + dedup until rebuilt — that's the
+        invariant `rebuild_stale_embeddings()` restores."""
         rows = await (await self._db.conn.execute(
             "SELECT id, text, embedding, last_accessed_at "
-            "FROM operator_memories ORDER BY id"
+            "FROM operator_memories WHERE model = ? ORDER BY id",
+            (self._embed_model,),
         )).fetchall()
         return [dict(r) for r in rows]
 
@@ -230,9 +252,9 @@ class OperatorMemory:
         now = iso(utcnow())
         cur = await self._db.conn.execute(
             "INSERT INTO operator_memories "
-            "(text, embedding, source_turn, created_at, last_accessed_at, access_count) "
-            "VALUES (?, ?, ?, ?, ?, 0)",
-            (text, embedding.tobytes(), source_turn, now, now),
+            "(text, embedding, model, source_turn, created_at, last_accessed_at, access_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0)",
+            (text, embedding.tobytes(), self._embed_model, source_turn, now, now),
         )
         await self._db.conn.commit()
         return cur.lastrowid or 0
@@ -248,14 +270,65 @@ class OperatorMemory:
         now = iso(utcnow())
         await self._db.conn.execute(
             "UPDATE operator_memories "
-            "SET text = ?, embedding = ?, "
+            "SET text = ?, embedding = ?, model = ?, "
             "    source_turn = COALESCE(?, source_turn), "
             "    last_accessed_at = ?, "
             "    access_count = access_count + 1 "
             "WHERE id = ?",
-            (text, embedding.tobytes(), source_turn, now, row_id),
+            (text, embedding.tobytes(), self._embed_model, source_turn, now, row_id),
         )
         await self._db.conn.commit()
+
+    # ---- rebuild on model change ------------------------------------------
+
+    async def stale_count(self) -> int:
+        """Rows whose `model` doesn't match the configured embedder. These
+        are skipped by retrieval until `rebuild_stale_embeddings()` runs."""
+        row = await (await self._db.conn.execute(
+            "SELECT COUNT(*) AS n FROM operator_memories WHERE model != ?",
+            (self._embed_model,),
+        )).fetchone()
+        return int(row["n"]) if row else 0
+
+    async def rebuild_stale_embeddings(self, *, batch: int = 32) -> dict[str, int]:
+        """Re-embed every row whose stored model differs from the configured
+        one. Walks in batches so a long-running call doesn't load the whole
+        table into memory and so a partial failure leaves the unconverted
+        tail recoverable on next startup. Returns counts for the notifier.
+        """
+        rebuilt = 0
+        failed = 0
+        while True:
+            stale = await (await self._db.conn.execute(
+                "SELECT id, text FROM operator_memories "
+                "WHERE model != ? ORDER BY id LIMIT ?",
+                (self._embed_model, batch),
+            )).fetchall()
+            if not stale:
+                break
+            texts = [r["text"] for r in stale]
+            try:
+                vecs = await self._embed.embed(texts)
+            except Exception:
+                log.exception("rebuild_stale_embeddings: embed call failed (batch of %d)", len(texts))
+                failed += len(texts)
+                # Don't loop forever on a persistent failure — bail and let
+                # the next startup retry.
+                break
+            for r, v in zip(stale, vecs):
+                vec = np.asarray(v, dtype=np.float32)
+                await self._db.conn.execute(
+                    "UPDATE operator_memories SET embedding = ?, model = ? WHERE id = ?",
+                    (vec.tobytes(), self._embed_model, int(r["id"])),
+                )
+                rebuilt += 1
+            await self._db.conn.commit()
+        operator_log.info(
+            "memory_rebuild " + fmt(
+                rebuilt=rebuilt, failed=failed, model=self._embed_model,
+            )
+        )
+        return {"rebuilt": rebuilt, "failed": failed}
 
     async def _bump_access(self, *row_ids: int) -> None:
         if not row_ids:

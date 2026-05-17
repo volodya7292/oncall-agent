@@ -289,12 +289,45 @@ def test_bash_psql_cte_with_select_readonly() -> None:
 
 
 # --- SSH via Bash ---
+#
+# The SSH transport itself isn't the blast surface; the remote command is.
+# The classifier strips ssh's flags + host and recursively classifies the
+# inner command. These tests lock down the recursion contract plus a few
+# edge cases that have bitten us in practice (the `docker ps --format
+# "table {{.ID}}..."` request that originally surfaced this fix).
 
-def test_bash_ssh_to_remote_readonly() -> None:
-    v = classify("Bash", {"command": "ssh user@dev1.example 'ls /etc'"})
-    # ssh isn't allowlisted as a program; treat the whole as mutating until we
-    # add SSH parsing. Default-deny posture.
-    assert v.kind == ClassifierVerdict.MUTATING
+
+@pytest.mark.parametrize("cmd, expected_kind, reason_marker", [
+    # Plain readonly inner.
+    ("ssh user@dev1.example 'ls /etc'",
+     ClassifierVerdict.READONLY, None),
+    # The motivating real-world example: docker ps over ssh with a
+    # complex --format containing braces, tabs, quotes.
+    ("""ssh myserver 'docker ps --format "table {{.ID}}\\t{{.Image}}\\t{{.Status}}\\t{{.Names}}"'""",
+     ClassifierVerdict.READONLY, None),
+    # Mutating inner → mutating overall; reason names the inner cause.
+    ("ssh host 'rm -rf /tmp/work'",
+     ClassifierVerdict.MUTATING, "ssh_inner"),
+    # Interactive login (no remote command) is not auto-allowable.
+    ("ssh user@host",
+     ClassifierVerdict.MUTATING, "ssh_interactive_session"),
+    # Flags with values must be skipped so the host is correctly identified.
+    ("ssh -i ~/.ssh/key -p 2222 -o StrictHostKeyChecking=no host 'kubectl get pods'",
+     ClassifierVerdict.READONLY, None),
+    # Valueless flags (combined short flags like -tt, verbosity).
+    ("ssh -tt -vvv host 'git status'",
+     ClassifierVerdict.READONLY, None),
+    # Catastrophic inner is still blocked even when wrapped in ssh.
+    ("ssh host 'rm -rf /'",
+     ClassifierVerdict.MUTATING, "ssh_inner_catastrophic"),
+])
+def test_bash_ssh_recurses_into_remote_command(
+    cmd: str, expected_kind, reason_marker: str | None,
+) -> None:
+    v = classify("Bash", {"command": cmd})
+    assert v.kind == expected_kind, (cmd, v.reason)
+    if reason_marker is not None:
+        assert v.reason and reason_marker in v.reason, v.reason
 
 
 # ---------------------------------------------------------------------------

@@ -492,6 +492,8 @@ def _program_is_readonly(program: str, args: list[str]) -> tuple[bool, str | Non
         return _kubectl_readonly(args)
     if program == "docker":
         return _docker_readonly(args)
+    if program == "ssh":
+        return _ssh_readonly(args)
     if program == "aws":
         return _aws_readonly(args)
     if program == "gcloud":
@@ -631,6 +633,69 @@ def _kubectl_readonly(args: list[str]) -> tuple[bool, str | None]:
         if len(rest) >= 2 and rest[1] not in ("can-i", "whoami"):
             return False, "kubectl_auth_mutating"
     return True, None
+
+
+# SSH flags that take an argument (the value after the flag) per OpenSSH's
+# manpage. Anything not in this set, but starts with `-`, is treated as a
+# valueless flag (-A, -C, -tt, -v, …). Conservative: if a new flag arrived
+# upstream and takes an arg, we'd over-skip the host — the only consequence
+# is that ssh's remote command gets classified as "no_host" and we land
+# mutating, which is the safe failure mode.
+_SSH_FLAG_TAKES_ARG: frozenset[str] = frozenset({
+    "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l",
+    "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w",
+})
+
+
+def _ssh_readonly(args: list[str]) -> tuple[bool, str | None]:
+    """`ssh <flags> <host> <remote command…>` — the SSH transport itself
+    isn't the blast surface; the *remote command* is. Strip ssh's own
+    flags and host, then recursively run the remote command back through
+    `_classify_bash`. The same rules that auto-allow `docker ps` locally
+    will auto-allow it over SSH.
+
+    `ssh host` with no remote command (= interactive login) is treated as
+    mutating: an agent opening an interactive remote shell is not what we
+    want auto-allowed, even though it doesn't "modify" anything by itself."""
+    i = 0
+    host: str | None = None
+    cmd_parts: list[str] = []
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            i += 1
+            continue
+        if a in _SSH_FLAG_TAKES_ARG:
+            # Flag + value pair; skip both. If `-iname.pem` (joined form)
+            # showed up, it'd already not match _SSH_FLAG_TAKES_ARG and
+            # fall through to the generic short-flag branch below.
+            i += 2
+            continue
+        if a.startswith("-") and len(a) > 1:
+            i += 1
+            continue
+        if host is None:
+            host = a
+            i += 1
+            continue
+        cmd_parts.append(a)
+        i += 1
+    if host is None:
+        return False, "ssh_no_host"
+    if not cmd_parts:
+        return False, "ssh_interactive_session"
+    # If the shell quoted the remote command as a single arg (the usual
+    # case: `ssh host 'docker ps'`), cmd_parts is a one-element list with
+    # the inner shell line. If the caller passed multiple unquoted words
+    # (`ssh host docker ps`), join restores what the remote shell will
+    # actually execute.
+    remote_cmd = " ".join(cmd_parts)
+    inner = _classify_bash(remote_cmd)
+    if inner.kind == ClassifierVerdict.READONLY:
+        return True, None
+    if inner.kind == ClassifierVerdict.CATASTROPHIC:
+        return False, f"ssh_inner_catastrophic:{inner.reason}"
+    return False, f"ssh_inner:{inner.reason or 'mutating'}"
 
 
 def _docker_readonly(args: list[str]) -> tuple[bool, str | None]:

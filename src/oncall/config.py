@@ -59,7 +59,15 @@ class Settings(BaseSettings):
     # at retrieval time is `alpha * cosine + beta * token_overlap`, candidates
     # below `relevance_floor` are not injected.
     oncall_memory_capacity: int = 500
-    oncall_memory_embed_model: str = "alibaba/qwen3-embedding-8b"
+    # Default embedder: local Ollama with nomic-embed-text. Picked over the
+    # Vercel-hosted qwen3-embedding-8b because of ~30× lower latency (12ms
+    # vs 1.8s median) and no rate limits. The same dedup threshold (0.88)
+    # transfers cleanly per the live integration tests. Override to e.g.
+    # "alibaba/qwen3-embedding-8b" to send embeddings via the Vercel gateway
+    # instead — useful if you don't want to run Ollama on this host.
+    oncall_memory_embed_model: str = "nomic-embed-text:137m-v1.5-fp16"
+    # Where to find the Ollama daemon when the embed model is an Ollama tag.
+    oncall_ollama_host: str = "http://localhost:11434"
     # Cheap conversational model for extracting facts from the user's turn.
     # Empty string disables auto-extraction (operator memory still works for
     # retrieval, just never grows). Defaults to the operator model.
@@ -75,7 +83,21 @@ class Settings(BaseSettings):
     # Operator backend: OpenAI-compatible HTTP via Vercel AI Gateway.
     # https://vercel.com/docs/ai-gateway/sdks-and-apis/python
     # Set ONCALL_OPERATOR_MODEL to a gateway model id like "openai/gpt-oss-20b".
-    oncall_operator_model: str = "google/gemma-4-26b-a4b-it"
+    oncall_operator_model: str = "google/gemma-4-31b-it"
+    # Reasoning level. "minimal" cuts TTFA dramatically on gemma-4-31b-it
+    # (7s → 1s) by suppressing the model's default ~150-300-token internal
+    # monologue, which we don't need for routing/dispatch decisions. Set to
+    # None to leave the dial unset.
+    oncall_operator_reasoning_effort: str | None = "minimal"
+    # Which API surface to use for the operator's LLM.
+    #   "gemini" → native Google AI Studio API (google-genai SDK). Required
+    #              for ack-first behavior (model emits user-facing text in
+    #              the same response as tool calls) — the Vercel gateway's
+    #              routing strips that on gemma-4-31b-it.
+    #   "vercel" → OpenAI-compatible via Vercel AI Gateway. Useful for
+    #              non-Google models (zai/, minimax/, etc).
+    oncall_operator_backend: str = "gemini"
+    gemini_api_key: str = ""               # AI Studio key (oncall_operator_backend=gemini)
     ai_gateway_base_url: str = "https://ai-gateway.vercel.sh/v1"
     ai_gateway_api_key: str = ""           # local dev
     vercel_oidc_token: str = ""            # Vercel deployments — fallback

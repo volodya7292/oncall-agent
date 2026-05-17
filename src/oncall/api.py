@@ -18,6 +18,8 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
+
+import httpx
 from typing import Any, Literal
 from uuid import UUID
 
@@ -29,11 +31,11 @@ from .approval_client import HttpLongPollApprovalClient, is_kill_phrase
 from .broker import Broker
 from .config import get_paths, get_settings
 from .db import Database
-from .embeddings import GatewayEmbeddingClient
+from .embeddings import GatewayEmbeddingClient, OllamaEmbeddingClient, is_ollama_model
 from .events import EventBus
 from .lifecycle import Lifecycle
 from .local_claude import ClaudeCliRunner
-from .operator import GatewayLLMClient, Operator
+from .operator import GatewayLLMClient, GenAILLMClient, Operator
 from .operator_memory import OperatorMemory
 from .task_summary import summarize_task
 from .telegram_bot import HttpxBotApi, TelegramBotService
@@ -150,13 +152,35 @@ def create_app() -> FastAPI:
             db=db, broker=broker, approval_client=approval_client,
             events=events, settings=settings, paths=paths,
         )
-        # Operator — only set up if a gateway key is configured. If not, /chat
-        # returns a clear 503 explaining how to set AI_GATEWAY_API_KEY.
+        # Operator LLM backend choice. "gemini" uses the native AI Studio
+        # API and is the default — it preserves ack-first (text + tool_call
+        # in the same response) which the Vercel gateway's gemma routing
+        # silently strips. "vercel" keeps the OpenAI-compatible gateway path.
+        # The operator is only set up if the backend's auth is configured;
+        # otherwise /chat returns a clear 503.
         operator: Operator | None = None
-        if settings.gateway_key:
+        llm: GenAILLMClient | GatewayLLMClient | None = None
+        if settings.oncall_operator_backend == "gemini" and settings.gemini_api_key:
+            llm = GenAILLMClient(api_key=settings.gemini_api_key)
+            log.info("operator LLM backend: gemini (AI Studio)")
+        elif settings.oncall_operator_backend == "vercel" and settings.gateway_key:
             llm = GatewayLLMClient(
                 base_url=settings.ai_gateway_base_url,
                 api_key=settings.gateway_key,
+            )
+            log.info("operator LLM backend: vercel (AI Gateway)")
+        elif settings.gateway_key:
+            # Fallback: backend was set to "gemini" but key missing — and
+            # vercel key happens to be there. Use vercel so the daemon still
+            # boots with a working operator.
+            llm = GatewayLLMClient(
+                base_url=settings.ai_gateway_base_url,
+                api_key=settings.gateway_key,
+            )
+            log.warning(
+                "ONCALL_OPERATOR_BACKEND=%s but its key is unset; "
+                "falling back to vercel gateway",
+                settings.oncall_operator_backend,
             )
         # Telegram userbot — only set up if api_id/hash + session file are
         # all present. Inbound DMs from senders listed in
@@ -169,14 +193,39 @@ def create_app() -> FastAPI:
         # context compression and by the auto-ping loop for per-task summaries.
         # Single instance: it's a fresh subprocess per call, no shared state.
         cli_runner = ClaudeCliRunner()
-        if settings.gateway_key:
-            embedder = GatewayEmbeddingClient(
-                base_url=settings.ai_gateway_base_url,
-                api_key=settings.gateway_key,
-                model=settings.oncall_memory_embed_model,
-            )
+        # Operator construction requires (a) an LLM client and (b) an
+        # embedder. Embedder backend is chosen by the model name shape:
+        # ollama tags ("nomic-embed-text:...") route to the local daemon,
+        # vendor-prefixed slugs ("alibaba/...") go through the Vercel
+        # gateway. Local Ollama is the default — ~30× lower latency.
+        embedder: GatewayEmbeddingClient | OllamaEmbeddingClient | None = None
+        if llm is not None:
+            if is_ollama_model(settings.oncall_memory_embed_model):
+                embedder = OllamaEmbeddingClient(
+                    host=settings.oncall_ollama_host,
+                    model=settings.oncall_memory_embed_model,
+                )
+                log.info("memory embedder: ollama / %s",
+                         settings.oncall_memory_embed_model)
+            elif settings.gateway_key:
+                embedder = GatewayEmbeddingClient(
+                    base_url=settings.ai_gateway_base_url,
+                    api_key=settings.gateway_key,
+                    model=settings.oncall_memory_embed_model,
+                )
+                log.info("memory embedder: vercel gateway / %s",
+                         settings.oncall_memory_embed_model)
+            else:
+                log.warning(
+                    "no embedder configured: model %r looks like a gateway "
+                    "slug but AI_GATEWAY_API_KEY is unset; operator memory "
+                    "will be disabled",
+                    settings.oncall_memory_embed_model,
+                )
+        if embedder is not None:
             memory = OperatorMemory(
                 db, embedder,
+                embed_model=settings.oncall_memory_embed_model,
                 capacity=settings.oncall_memory_capacity,
                 max_inject=settings.oncall_memory_max_inject,
                 relevance_floor=settings.oncall_memory_relevance_floor,
@@ -234,6 +283,43 @@ def create_app() -> FastAPI:
                     summary_model=settings.oncall_compression_model,
                 )
             )
+        # Memory-embedding rebuild: if the configured embed model differs
+        # from what stored rows were last embedded with, kick off a
+        # background re-embed pass. Retrieval is already filtering stale
+        # rows out, so the operator just sees fewer memories until this
+        # task completes — no data loss either way.
+        stale_before = 0
+        if operator is not None and operator.memory is not None:
+            stale_before = await operator.memory.stale_count()
+            if stale_before > 0:
+                log.info(
+                    "scheduling memory rebuild: %d row(s) embedded with a "
+                    "different model than the configured %s",
+                    stale_before, settings.oncall_memory_embed_model,
+                )
+                # Fire-and-forget — the task notifies on completion via the
+                # bot; nothing in the lifespan waits on it.
+                asyncio.create_task(
+                    _rebuild_memory_then_notify(
+                        operator.memory, telegram_bot,
+                        stale=stale_before,
+                        model=settings.oncall_memory_embed_model,
+                    ),
+                    name="memory-rebuild",
+                )
+
+        # Startup notification to the owner — single message summarizing what
+        # came up cleanly and what's degraded. Sent only if the bot is up
+        # (no bot → no way to notify). The probes are best-effort: a failed
+        # probe means "couldn't verify", not "definitely broken".
+        if telegram_bot is not None:
+            status = await _build_startup_status(
+                settings=settings, operator=operator,
+                telegram_userbot=telegram is not None,
+                lifecycle=lifecycle,
+                stale_memories=stale_before,
+            )
+            await telegram_bot.notify_owner(status)
         try:
             yield
         finally:
@@ -339,6 +425,78 @@ async def _auto_ping_loop(
         if approval_id:
             chat_reply_payload["approval_id"] = approval_id
         await events.publish_global("chat.reply", chat_reply_payload)
+
+
+async def _probe_ollama(host: str = "http://localhost:11434") -> str | None:
+    """Return the Ollama version string if reachable, None otherwise. Best-
+    effort, 1s timeout — we use this in the startup notification only."""
+    try:
+        async with httpx.AsyncClient(timeout=1.0) as c:
+            r = await c.get(f"{host}/api/version")
+            r.raise_for_status()
+            return r.json().get("version", "?")
+    except Exception:
+        return None
+
+
+async def _build_startup_status(
+    *, settings, operator: Operator | None,
+    telegram_userbot: bool, lifecycle: Lifecycle,
+    stale_memories: int = 0,
+) -> str:
+    """Compose the startup ping. On a fully clean boot it's just one line —
+    `✅ oncall up`. Anything degraded gets its own ⚠️ line; informational
+    follow-ups (recovered tasks, pending rebuild) get a ↻ line. The signal
+    a user scans for is *whether there's anything below the headline*."""
+    lines: list[str] = ["✅ oncall up"]
+    if operator is None:
+        lines.append("⚠️ operator: NOT configured (no LLM key)")
+    if is_ollama_model(settings.oncall_memory_embed_model):
+        if await _probe_ollama(settings.oncall_ollama_host) is None:
+            lines.append(
+                f"⚠️ ollama: unreachable at {settings.oncall_ollama_host} "
+                f"(memory embedder won't work)"
+            )
+    if not telegram_userbot:
+        lines.append("⚠️ telegram userbot: disabled (DM triage unavailable)")
+    recovered = len(lifecycle.running)
+    if recovered:
+        lines.append(f"↻ recovered {recovered} in-flight task(s)")
+    if stale_memories:
+        lines.append(
+            f"↻ re-embedding {stale_memories} memory rows in the background"
+        )
+    return "\n".join(lines)
+
+
+async def _rebuild_memory_then_notify(
+    memory, telegram_bot, *, stale: int, model: str,
+) -> None:
+    """Background task: re-embed all rows whose stored model differs from
+    `model`, then ping the owner with the result. Errors are surfaced as a
+    notification so the user isn't left wondering why memory looks empty."""
+    try:
+        result = await memory.rebuild_stale_embeddings()
+    except Exception as e:
+        log.exception("memory rebuild crashed")
+        if telegram_bot is not None:
+            await telegram_bot.notify_owner(
+                f"⚠️ memory rebuild crashed: {type(e).__name__}: {e}"
+            )
+        return
+    if telegram_bot is None:
+        return
+    rebuilt = result.get("rebuilt", 0)
+    failed = result.get("failed", 0)
+    if failed:
+        await telegram_bot.notify_owner(
+            f"⚠️ memory rebuild partial: {rebuilt}/{stale} rebuilt, "
+            f"{failed} failed (model={model}). Will retry next boot."
+        )
+    else:
+        await telegram_bot.notify_owner(
+            f"✅ memory rebuilt: {rebuilt} row(s) re-embedded with {model}"
+        )
 
 
 async def _maybe_start_telegram_bot(

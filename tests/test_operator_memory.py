@@ -87,6 +87,7 @@ def make_memory(
 ) -> OperatorMemory:
     return OperatorMemory(
         db, embedder,
+        embed_model="test-embedder",
         capacity=capacity,
         max_inject=max_inject,
         relevance_floor=relevance_floor,
@@ -388,16 +389,64 @@ GATEWAY_BASE_URL = os.environ.get(
 EMBED_MODEL = os.environ.get(
     "ONCALL_MEMORY_EMBED_MODEL", "alibaba/qwen3-embedding-8b",
 )
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
+
+def _is_ollama_tag(model: str) -> bool:
+    """Heuristic: gateway slugs are vendor-prefixed (e.g. "alibaba/...");
+    Ollama tags carry a `:` version suffix without a slash before it."""
+    return ":" in model and "/" not in model.split(":", 1)[0]
+
+
+def _embed_backend_available() -> bool:
+    if _is_ollama_tag(EMBED_MODEL):
+        try:
+            import httpx
+            with httpx.Client(timeout=2.0) as c:
+                return c.get(f"{OLLAMA_BASE_URL}/api/tags").status_code == 200
+        except Exception:
+            return False
+    return bool(GATEWAY_KEY)
+
 
 requires_gateway = pytest.mark.skipif(
-    not GATEWAY_KEY,
-    reason="AI_GATEWAY_API_KEY not set; skipping live embeddings test",
+    not _embed_backend_available(),
+    reason=(
+        f"embedding backend for {EMBED_MODEL!r} not reachable; "
+        f"set AI_GATEWAY_API_KEY (gateway) or start Ollama at {OLLAMA_BASE_URL}"
+    ),
 )
+
+
+class _OllamaEmbedder:
+    """Test-only EmbeddingClient that hits a local Ollama. Used to run the
+    integration tests against any embedding model Ollama has pulled, without
+    growing the production `oncall.embeddings` API surface."""
+
+    def __init__(self, model: str, base_url: str = OLLAMA_BASE_URL) -> None:
+        self._model = model
+        self._base = base_url
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        import httpx
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            out: list[list[float]] = []
+            for t in texts:
+                r = await http.post(
+                    f"{self._base}/api/embed",
+                    json={"model": self._model, "input": t},
+                )
+                r.raise_for_status()
+                out.append(r.json()["embeddings"][0])
+            return out
 
 
 def _real_embedder():
     # Imported lazily so the package import chain isn't needed unless the
-    # test actually runs.
+    # test actually runs. Pick backend by model name — ollama tags route to
+    # the local daemon, everything else goes through the Vercel gateway.
+    if _is_ollama_tag(EMBED_MODEL):
+        return _OllamaEmbedder(model=EMBED_MODEL)
     from oncall.embeddings import GatewayEmbeddingClient
     return GatewayEmbeddingClient(
         base_url=GATEWAY_BASE_URL,
@@ -429,6 +478,7 @@ async def test_real_embeddings_rank_semantically_related_first(db):
     query for one of them paraphrased — the matching fact must come back."""
     mem = OperatorMemory(
         db, _real_embedder(),
+        embed_model=EMBED_MODEL,
         capacity=100,
         max_inject=3,
         # Loosen the floor a touch — different models normalize cosine
@@ -454,6 +504,7 @@ async def test_real_embeddings_paraphrase_triggers_dedup_merge(db):
     into one row, not produce two near-duplicates."""
     mem = OperatorMemory(
         db, _real_embedder(),
+        embed_model=EMBED_MODEL,
         capacity=100, max_inject=3,
         relevance_floor=0.20,
         hybrid_alpha=0.7, hybrid_beta=0.3,
@@ -469,6 +520,57 @@ async def test_real_embeddings_paraphrase_triggers_dedup_merge(db):
         f"expected paraphrase to dedup-merge but ended up with {n} rows — "
         f"consider lowering ONCALL_MEMORY_DEDUP_SIM for {EMBED_MODEL}"
     )
+
+
+@pytest.mark.asyncio
+async def test_rebuild_when_embed_model_changes(db):
+    """Switching `embed_model` should:
+      - hide existing rows from retrieve()/dedup until rebuilt,
+      - leave the row count unchanged in the DB,
+      - restore visibility after rebuild_stale_embeddings() runs.
+    Captures the upgrade path the production lifespan uses when the user
+    swaps embedders.
+    """
+    # Stub embedder: each distinct text gets a fresh near-orthogonal unit
+    # vector so dedup never merges them. `flavor` distinguishes the "old"
+    # vs "new" model so we can verify the rebuild actually re-embeds.
+    class _Stub:
+        def __init__(self, flavor: int) -> None:
+            self.flavor = flavor
+            self._known: dict[str, int] = {}
+        async def embed(self, texts):
+            out = []
+            for t in texts:
+                idx = self._known.setdefault(t, len(self._known))
+                vec = [0.0] * 16
+                vec[idx % 16] = 1.0
+                # Tilt the vector slightly per-flavor so old/new models
+                # produce different (but still near-orthogonal between
+                # distinct texts) embeddings.
+                vec[(idx + 8) % 16] = 0.01 * self.flavor
+                out.append(vec)
+            return out
+
+    # Seed via "old" model.
+    old_mem = make_memory(db, _Stub(flavor=1), dedup_sim=0.99, relevance_floor=0.0)
+    old_mem._embed_model = "old-model"  # type: ignore[attr-defined]
+    await old_mem.store(["fact alpha", "fact beta"])
+    assert await old_mem.entries_count() == 2
+
+    # Switch to "new" model — the old rows are now stale and invisible.
+    new_mem = make_memory(db, _Stub(flavor=2), dedup_sim=0.99, relevance_floor=0.0)
+    new_mem._embed_model = "new-model"  # type: ignore[attr-defined]
+    assert await new_mem.stale_count() == 2
+    assert await new_mem.entries_count() == 0, "stale rows must be hidden from retrieval"
+    # DB row count unchanged — we don't delete, we re-embed.
+    raw = await _all_rows(db)
+    assert len(raw) == 2
+
+    # Rebuild: re-embeds via the new stub, retags model column.
+    result = await new_mem.rebuild_stale_embeddings()
+    assert result == {"rebuilt": 2, "failed": 0}
+    assert await new_mem.stale_count() == 0
+    assert await new_mem.entries_count() == 2
 
 
 async def _all_rows(db: Database) -> list[dict]:

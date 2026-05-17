@@ -156,6 +156,59 @@ async def test_recover_registers_running_dict(stack):
 
 
 @pytest.mark.asyncio
+async def test_shutdown_denies_pending_approvals_and_kills_tasks(stack):
+    """Safety invariant: when the daemon shuts down with tasks parked at a
+    broker approval, every pending approval must be resolved as `deny` AND
+    its task must move to `killed` in the DB. Otherwise the next daemon
+    boot's recover() would try `claude --resume <session>` against an
+    orphan session — exactly the cli_error failure mode we hit on
+    2026-05-17.
+    """
+    from oncall.models import ApprovalRequest, ClassifierVerdict
+
+    db = stack["db"]
+    lc = stack["lc"]
+
+    # Submit a task and let the supervisor "spawn" (FakeSupervisor parks
+    # on its release event).
+    task = await lc.submit_task(prompt="ssh myserver 'docker ps'", model=None)
+    await asyncio.sleep(0)  # let the spawned runner register itself
+
+    # Create a pending approval as if the broker had parked one.
+    pending = ApprovalRequest(
+        task_id=task.id, session_id=task.session_id,
+        tool_use_id="tu_shutdown",
+        tool_name="Bash",
+        tool_input={"command": "ssh myserver 'docker ps'"},
+        classifier_verdict=ClassifierVerdict.MUTATING,
+        canonical_command="ssh myserver 'docker ps'",
+        blast_radius="ssh.",
+        challenge_phrase="amber paper compass",
+    )
+    await db.create_pending_approval(pending)
+    # Park a future on the approval client too — kill() resolves it.
+    fut = asyncio.get_event_loop().create_future()
+    stack["lc"].approval_client._pending[pending.id] = fut
+
+    await lc.shutdown()
+
+    # Future was resolved deny.
+    assert fut.done()
+    result = fut.result()
+    assert result.behavior == "deny", "shutdown must coerce pending approvals to deny"
+
+    # DB approval row is no longer pending.
+    assert await db.list_pending_approvals() == []
+
+    # Task ended up in KILLED, so the next boot's recover() skips it
+    # instead of trying to --resume an orphan session.
+    refreshed = await db.get_task(task.id)
+    assert refreshed is not None
+    assert refreshed.state == TaskState.KILLED
+    assert refreshed.terminal_reason == TerminalReason.KILLED
+
+
+@pytest.mark.asyncio
 async def test_resume_reattach_to_pending_approval(stack):
     """If the daemon crashed BEFORE the user responded, the approval row is
     still `pending`. On --resume, broker.decide must re-attach to it (re-publish
