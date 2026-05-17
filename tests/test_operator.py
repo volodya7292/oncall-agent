@@ -26,6 +26,7 @@ from oncall.db import Database
 from oncall.events import EventBus
 from oncall.lifecycle import Lifecycle
 from oncall.operator import LLMClient, Operator
+from oncall.operator_memory import Memory
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +63,78 @@ class ScriptedLLM:
         return {"role": "assistant", "content": "", "tool_calls": tool_calls}
 
 
+class StubMemory:
+    """Minimal MemoryStore stub. retrieve() returns nothing by default
+    (so the system prompt's memory section is always the fallback).
+    store() records what was offered AND keeps an in-memory list so
+    entries_count() reports it. Tests that care about retrieved content
+    can override `_canned_retrieval` per query."""
+
+    def __init__(self) -> None:
+        self.stored_batches: list[list[str]] = []
+        self.retrieve_calls: list[str] = []
+        self.for_prompt_calls: list[str | None] = []
+        self._entries: list[str] = []
+        self._canned_retrieval: dict[str, list[Memory]] = {}
+
+    def set_retrieval(self, query: str, memories: list[Memory]) -> None:
+        self._canned_retrieval[query] = list(memories)
+
+    async def store(self, facts, *, source_turn=None):
+        kept = [f.strip() for f in facts if f and f.strip()]
+        if not kept:
+            return []
+        self.stored_batches.append(kept)
+        self._entries.extend(kept)
+        return list(kept)
+
+    async def retrieve(self, query, *, limit=None):
+        self.retrieve_calls.append(query)
+        return list(self._canned_retrieval.get(query, []))
+
+    async def for_prompt(self, query):
+        self.for_prompt_calls.append(query)
+        if query is None:
+            return "(no relevant entries this turn)"
+        mems = self._canned_retrieval.get(query, [])
+        if not mems:
+            return "(no relevant entries this turn)"
+        return "\n".join(f"- {m.text}" for m in mems)
+
+    async def entries_count(self):
+        return len(self._entries)
+
+
+class FakeExtractorLLM:
+    """Stub LLM used as the extractor. Each `chat` call returns the next
+    pre-canned facts list as a JSON-payload assistant turn. If `raise_with`
+    is set, the call raises that exception instead — for testing the
+    failure-breadcrumb path."""
+
+    def __init__(
+        self,
+        facts_per_call: list[list[str]] | None = None,
+        *,
+        raise_with: BaseException | None = None,
+    ) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._facts_per_call = list(facts_per_call or [])
+        self._raise_with = raise_with
+
+    async def chat(self, *, model, messages, tools, max_tokens=None):
+        self.calls.append({"model": model, "messages": messages})
+        if self._raise_with is not None:
+            raise self._raise_with
+        facts = (
+            self._facts_per_call.pop(0) if self._facts_per_call else []
+        )
+        return {
+            "role": "assistant",
+            "content": json.dumps({"facts": facts}),
+            "tool_calls": [],
+        }
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -71,7 +144,6 @@ def settings(tmp_path):
     return Settings(
         oncall_token="t",
         oncall_db_path=tmp_path / "db.sqlite",
-        oncall_memory_path=tmp_path / "memory.md",
         oncall_operator_model="openai/test",
         ai_gateway_api_key="x",
     )
@@ -83,7 +155,6 @@ def test_tilde_path_is_expanded_by_settings(tmp_path, monkeypatch):
     validator must normalize before the value is stored."""
     monkeypatch.setenv("TELEGRAM_SESSION_PATH", "~/.oncall/telegram.session")
     monkeypatch.setenv("ONCALL_DB_PATH", "~/.oncall/state.db")
-    monkeypatch.setenv("ONCALL_MEMORY_PATH", "~/.oncall/memory.md")
     monkeypatch.setenv("TELEGRAM_BOT_SESSION_PATH", "~/.oncall/telegram_bot.session")
     monkeypatch.setattr("oncall.config.USER_ENV_FILE", tmp_path / "nonexistent.env")
     s = Settings(_env_file=None)  # don't read project .env, avoid pollution
@@ -91,7 +162,6 @@ def test_tilde_path_is_expanded_by_settings(tmp_path, monkeypatch):
     assert str(s.telegram_session_path).startswith(str(home))
     assert "~" not in str(s.telegram_session_path)
     assert str(s.oncall_db_path).startswith(str(home))
-    assert str(s.oncall_memory_path).startswith(str(home))
     assert str(s.telegram_bot_session_path).startswith(str(home))
 
 
@@ -111,10 +181,12 @@ async def stack(settings, paths):
         db=db, broker=broker, approval_client=approval_client,
         events=events, settings=settings, paths=paths,
     )
+    memory = StubMemory()
     try:
         yield {"db": db, "events": events, "approval_client": approval_client,
                "broker": broker, "lifecycle": lifecycle,
-               "settings": settings, "paths": paths}
+               "settings": settings, "paths": paths,
+               "memory": memory}
     finally:
         await db.close()
 
@@ -144,7 +216,7 @@ async def test_dispatch_task_via_operator_tool(stack):
 
     operator = Operator(
         db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
-        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        settings=stack["settings"], paths=stack["paths"], llm=llm, memory=stack["memory"],
     )
 
     result = await operator.chat_turn(session_id="s1", user_text="please check if staging is up")
@@ -194,7 +266,7 @@ async def test_present_pending_approval_surfaces_verbatim(stack):
     ])
     operator = Operator(
         db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
-        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        settings=stack["settings"], paths=stack["paths"], llm=llm, memory=stack["memory"],
     )
     await operator.chat_turn(session_id="s2", user_text="approval pls")
 
@@ -250,7 +322,7 @@ async def test_submit_approval_response_routes_to_broker_not_operator(stack):
     ])
     operator = Operator(
         db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
-        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        settings=stack["settings"], paths=stack["paths"], llm=llm, memory=stack["memory"],
     )
     await operator.chat_turn(session_id="s3", user_text="say the phrase: " + challenge)
 
@@ -287,7 +359,7 @@ async def test_operator_cannot_bypass_phrase_match(stack):
     ])
     operator = Operator(
         db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
-        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        settings=stack["settings"], paths=stack["paths"], llm=llm, memory=stack["memory"],
     )
     await operator.chat_turn(session_id="s4", user_text="approve it")
 
@@ -359,7 +431,7 @@ async def test_read_chat_style_routes_to_telegram(stack):
     ])
     operator = Operator(
         db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
-        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        settings=stack["settings"], paths=stack["paths"], llm=llm, memory=stack["memory"],
         telegram=fake,  # type: ignore[arg-type]
     )
     await operator.chat_turn(session_id="s_style", user_text="reply to alex")
@@ -391,7 +463,7 @@ async def test_read_inbox_returns_data_not_instructions(stack):
     ])
     operator = Operator(
         db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
-        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        settings=stack["settings"], paths=stack["paths"], llm=llm, memory=stack["memory"],
         telegram=fake,  # type: ignore[arg-type]
     )
     result = await operator.chat_turn(session_id="s_inbox", user_text="any dms?")
@@ -411,6 +483,7 @@ async def test_get_status_reports_session_size_and_compression(stack):
     operator = Operator(
         db=db, lifecycle=stack["lifecycle"], broker=stack["broker"],
         settings=settings, paths=stack["paths"], llm=ScriptedLLM(script=[]),
+        memory=stack["memory"],
     )
 
     await db.ensure_chat_session("s_stat")
@@ -451,7 +524,7 @@ async def test_list_chats_routes_to_telegram_with_filters(stack):
     ])
     operator = Operator(
         db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
-        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        settings=stack["settings"], paths=stack["paths"], llm=llm, memory=stack["memory"],
         telegram=fake,  # type: ignore[arg-type]
     )
     await operator.chat_turn(session_id="s_list", user_text="show me dms")
@@ -482,7 +555,7 @@ async def test_summarize_chat_runs_runner_with_chat_history(stack):
     ])
     operator = Operator(
         db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
-        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        settings=stack["settings"], paths=stack["paths"], llm=llm, memory=stack["memory"],
         telegram=fake,  # type: ignore[arg-type]
         runner=runner,  # type: ignore[arg-type]
     )
@@ -513,7 +586,7 @@ async def test_summarize_chat_returns_error_when_runner_unavailable(stack):
     ])
     operator = Operator(
         db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
-        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        settings=stack["settings"], paths=stack["paths"], llm=llm, memory=stack["memory"],
         telegram=fake,  # type: ignore[arg-type]
         runner=runner,  # type: ignore[arg-type]
     )
@@ -533,7 +606,7 @@ async def test_telegram_tools_error_when_unconfigured(stack):
     ])
     operator = Operator(
         db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
-        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        settings=stack["settings"], paths=stack["paths"], llm=llm, memory=stack["memory"],
         telegram=None,
     )
     await operator.chat_turn(session_id="s_no_tg", user_text="check dms")
@@ -542,54 +615,244 @@ async def test_telegram_tools_error_when_unconfigured(stack):
     assert payload == {"error": "telegram not configured"}
 
 
+# ---------------------------------------------------------------------------
+# Auto-extraction (background) and breadcrumb publishing
+# ---------------------------------------------------------------------------
+
+
+async def _drain_extractions(operator: Operator) -> None:
+    """Wait until every background extraction task this operator has spawned
+    has finished. Reads the private set directly because we don't want to
+    expose a 'shut down extraction' API on the production class."""
+    while operator._extraction_tasks:
+        await asyncio.gather(*operator._extraction_tasks, return_exceptions=True)
+
+
 @pytest.mark.asyncio
-async def test_remember_tool_persists_and_appears_in_system_prompt(stack):
-    """Calling `remember` via the operator must write to ~/.oncall/memory.md
-    (here: tmp) AND the next turn's system prompt must include it."""
+async def test_extraction_writes_facts_and_emits_breadcrumb(stack):
+    """Happy path: extractor returns facts → memory.store sees them →
+    breadcrumb assistant row appended → chat.reply event fired."""
+    main_llm = ScriptedLLM(script=["ok"])
+    extractor = FakeExtractorLLM(facts_per_call=[
+        ["staging api lives at api-staging.example.com:8443"],
+    ])
+    received: list[dict[str, Any]] = []
+
+    async def consume_events() -> None:
+        async for env in stack["events"].subscribe_global(types={"chat.reply"}):
+            received.append(env)
+
+    consumer = asyncio.create_task(consume_events())
+    try:
+        operator = Operator(
+            db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
+            settings=stack["settings"], paths=stack["paths"], llm=main_llm,
+            memory=stack["memory"],
+            events=stack["events"],
+            extract_llm=extractor,
+            extract_model="test-extractor",
+        )
+        result = await operator.chat_turn(
+            session_id="s_ex", user_text="staging api lives at api-staging:8443",
+        )
+        # Main reply is the script string; breadcrumb is delivered out-of-band.
+        assert result.text == "ok"
+        await _drain_extractions(operator)
+        await asyncio.sleep(0)  # let event-loop drain the publish_global push
+    finally:
+        consumer.cancel()
+        try:
+            await consumer
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    # The extractor saw exactly one chat call, with the right model.
+    assert len(extractor.calls) == 1
+    assert extractor.calls[0]["model"] == "test-extractor"
+
+    # memory.store received the extracted facts.
+    assert stack["memory"].stored_batches == [
+        ["staging api lives at api-staging.example.com:8443"],
+    ]
+
+    # Breadcrumb row exists in chat history.
+    history = await stack["db"].load_chat_history("s_ex")
+    breadcrumb_rows = [
+        r for r in history
+        if r["role"] == "assistant" and r["content"].startswith("_Remembered:")
+    ]
+    assert len(breadcrumb_rows) == 1
+    assert "staging api" in breadcrumb_rows[0]["content"]
+
+    # chat.reply event with the memory.breadcrumb trigger was published.
+    assert any(
+        env["type"] == "chat.reply"
+        and env["payload"].get("trigger") == "memory.breadcrumb"
+        and env["payload"].get("session_id") == "s_ex"
+        for env in received
+    ), received
+
+
+@pytest.mark.asyncio
+async def test_no_facts_extracted_emits_no_breadcrumb(stack):
+    """Trivial turn ('hi') → extractor returns [] → no breadcrumb."""
+    main_llm = ScriptedLLM(script=["hello"])
+    extractor = FakeExtractorLLM(facts_per_call=[[]])
+
+    operator = Operator(
+        db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
+        settings=stack["settings"], paths=stack["paths"], llm=main_llm,
+        memory=stack["memory"],
+        events=stack["events"],
+        extract_llm=extractor,
+    )
+    await operator.chat_turn(session_id="s_trivial", user_text="hi")
+    await _drain_extractions(operator)
+
+    assert stack["memory"].stored_batches == [] or all(
+        b == [] for b in stack["memory"].stored_batches
+    )
+    history = await stack["db"].load_chat_history("s_trivial")
+    assert not any(
+        r["role"] == "assistant" and r["content"].startswith("_Remembered:")
+        for r in history
+    )
+
+
+@pytest.mark.asyncio
+async def test_extraction_failure_surfaces_breadcrumb(stack):
+    """Extractor raises → user sees a `_Memory extraction failed:_`
+    breadcrumb. Silent failures would let memory degrade unnoticed."""
+    main_llm = ScriptedLLM(script=["ok"])
+    extractor = FakeExtractorLLM(raise_with=RuntimeError("gateway 503"))
+
+    operator = Operator(
+        db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
+        settings=stack["settings"], paths=stack["paths"], llm=main_llm,
+        memory=stack["memory"],
+        events=stack["events"],
+        extract_llm=extractor,
+    )
+    await operator.chat_turn(session_id="s_fail", user_text="some request")
+    await _drain_extractions(operator)
+
+    history = await stack["db"].load_chat_history("s_fail")
+    err_rows = [
+        r for r in history
+        if r["role"] == "assistant"
+        and r["content"].startswith("_Memory extraction failed:")
+    ]
+    assert len(err_rows) == 1
+    assert "RuntimeError" in err_rows[0]["content"]
+    assert "gateway 503" in err_rows[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_extractor_receives_previous_assistant_turn_as_context(stack):
+    """Two-turn scenario: the second user turn refers to the first
+    assistant turn. The extractor's input must include the previous
+    assistant reply (clearly labeled as CONTEXT, never a source of facts)
+    so it can resolve referents."""
+    main_llm = ScriptedLLM(script=["which staging?", "ok"])
+    extractor = FakeExtractorLLM(facts_per_call=[[], []])
+
+    operator = Operator(
+        db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
+        settings=stack["settings"], paths=stack["paths"], llm=main_llm,
+        memory=stack["memory"],
+        events=stack["events"],
+        extract_llm=extractor,
+    )
+    await operator.chat_turn(session_id="s_ctx", user_text="check staging")
+    await _drain_extractions(operator)
+    await operator.chat_turn(session_id="s_ctx", user_text="the one at api-staging")
+    await _drain_extractions(operator)
+
+    # Two extractor calls. The second one should have the previous
+    # assistant text ("which staging?") embedded in its user message.
+    assert len(extractor.calls) == 2
+    second_call_msgs = extractor.calls[1]["messages"]
+    user_body = next(m for m in second_call_msgs if m["role"] == "user")["content"]
+    assert "PREVIOUS_ASSISTANT" in user_body
+    assert "which staging?" in user_body
+    assert "the one at api-staging" in user_body
+
+
+@pytest.mark.asyncio
+async def test_second_turn_not_blocked_by_pending_extraction(stack):
+    """A new user turn arriving while the previous turn's extraction is
+    still running must NOT block on it — the reply ships on its normal
+    latency. Achieved by running extraction off-lock."""
+    main_llm = ScriptedLLM(script=["reply 1", "reply 2"])
+
+    extraction_started = asyncio.Event()
+    extraction_release = asyncio.Event()
+
+    class SlowExtractor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, *, model, messages, tools, max_tokens=None):
+            self.calls += 1
+            extraction_started.set()
+            await extraction_release.wait()
+            return {
+                "role": "assistant",
+                "content": json.dumps({"facts": []}),
+                "tool_calls": [],
+            }
+
+    slow = SlowExtractor()
+    operator = Operator(
+        db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
+        settings=stack["settings"], paths=stack["paths"], llm=main_llm,
+        memory=stack["memory"],
+        events=stack["events"],
+        extract_llm=slow,
+    )
+
+    r1 = await operator.chat_turn(session_id="s_par", user_text="first")
+    assert r1.text == "reply 1"
+    await extraction_started.wait()
+    # The extraction is parked on `extraction_release`. A second chat_turn
+    # must still complete promptly.
+    r2 = await asyncio.wait_for(
+        operator.chat_turn(session_id="s_par", user_text="second"),
+        timeout=2.0,
+    )
+    assert r2.text == "reply 2"
+    extraction_release.set()
+    await _drain_extractions(operator)
+
+
+@pytest.mark.asyncio
+async def test_query_memory_tool_returns_canned_results(stack):
+    """The `query_memory` tool is the operator's explicit handle into
+    memory. It should reach memory.retrieve and surface results to the
+    LLM as a tool_result payload."""
+    stack["memory"].set_retrieval(
+        "do we have a staging DB?",
+        [Memory(
+            id=1, text="staging DB is staging-db.example.com",
+            score=0.85, cosine=0.9, last_accessed_at="2026-01-01T00:00:00",
+        )],
+    )
     llm = ScriptedLLM(script=[
-        [("remember", {"text": "user prefers lowercase replies"})],
-        "ok",
-        # Next turn — verify the memory snapshot is in the system prompt below.
-        "ok again",
+        [("query_memory", {"query": "do we have a staging DB?", "limit": 3})],
+        "yes — staging-db.example.com.",
     ])
     operator = Operator(
         db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
         settings=stack["settings"], paths=stack["paths"], llm=llm,
+        memory=stack["memory"],
     )
-    await operator.chat_turn(session_id="s_mem", user_text="remember that I want lowercase replies")
-    # On-disk write happened
-    text = stack["settings"].oncall_memory_path.read_text()
-    assert "user prefers lowercase replies" in text
+    await operator.chat_turn(session_id="s_qm", user_text="staging DB?")
 
-    # Second turn — system prompt must surface the new entry.
-    await operator.chat_turn(session_id="s_mem", user_text="still there?")
-    # 4 LLM calls so far (2 + tool result; then 1 for the second turn — but
-    # actually the second turn is 1 more call since no tool was called).
-    last_system = llm.calls_made[-1]["messages"][0]
-    assert last_system["role"] == "system"
-    assert "user prefers lowercase replies" in last_system["content"]
-
-
-@pytest.mark.asyncio
-async def test_forget_tool_removes_entry(stack, tmp_path):
-    from oncall.operator_memory import OperatorMemory
-    # Pre-seed memory
-    mem = OperatorMemory(stack["settings"].oncall_memory_path)
-    mem.remember("alex is a coworker")
-    mem.remember("boss is carol")
-    llm = ScriptedLLM(script=[
-        [("forget", {"substring": "alex"})],
-        "done",
-    ])
-    operator = Operator(
-        db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
-        settings=stack["settings"], paths=stack["paths"], llm=llm,
-        memory=mem,
-    )
-    await operator.chat_turn(session_id="s_forget", user_text="forget what I said about alex")
-    remaining = mem.entries()
-    assert len(remaining) == 1
-    assert "alex" not in remaining[0][1]
+    # The tool_result returned to the LLM in turn 2 contains the canned memory.
+    tool_msgs = [m for m in llm.calls_made[1]["messages"] if m["role"] == "tool"]
+    payload = json.loads(tool_msgs[0]["content"])
+    assert payload["query"] == "do we have a staging DB?"
+    assert payload["memories"][0]["text"] == "staging DB is staging-db.example.com"
 
 
 @pytest.mark.asyncio
@@ -606,7 +869,7 @@ async def test_tool_round_cap_prevents_loops(stack):
     ])
     operator = Operator(
         db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
-        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        settings=stack["settings"], paths=stack["paths"], llm=llm, memory=stack["memory"],
         max_tool_rounds=3,
     )
     result = await operator.chat_turn(session_id="loop", user_text="loop forever")
@@ -626,7 +889,7 @@ async def test_auto_ping_no_history_is_noop(stack):
     llm = ScriptedLLM(script=["should-not-be-called"])
     operator = Operator(
         db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
-        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        settings=stack["settings"], paths=stack["paths"], llm=llm, memory=stack["memory"],
     )
     result = await operator.auto_ping(session_id="empty", note="task abc terminated")
     assert result.text == ""
@@ -643,7 +906,7 @@ async def test_auto_ping_injects_system_note_and_replies(stack):
     ])
     operator = Operator(
         db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
-        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        settings=stack["settings"], paths=stack["paths"], llm=llm, memory=stack["memory"],
     )
     await operator.chat_turn(session_id="s1", user_text="what projects?")
     result = await operator.auto_ping(session_id="s1", note="task abc terminated, state=completed")
@@ -684,7 +947,7 @@ async def test_session_lock_serializes_chat_turn_and_auto_ping(stack):
     llm = GatedLLM()
     operator = Operator(
         db=stack["db"], lifecycle=stack["lifecycle"], broker=stack["broker"],
-        settings=stack["settings"], paths=stack["paths"], llm=llm,
+        settings=stack["settings"], paths=stack["paths"], llm=llm, memory=stack["memory"],
     )
     # Need at least one history row for auto_ping to act.
     await stack["db"].ensure_chat_session("s1")

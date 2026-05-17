@@ -54,6 +54,7 @@ class FakeBotApi:
         self._getupdates_script = list(getupdates_script or [])
         self.calls: list[tuple[str, dict]] = []
         self.sent: list[dict] = []
+        self.documents: list[dict] = []
         self.closed = False
 
     async def call(self, method: str, payload: dict[str, Any] | None = None) -> Any:
@@ -70,7 +71,16 @@ class FakeBotApi:
         if method == "sendMessage":
             self.sent.append(payload or {})
             return {"message_id": len(self.sent)}
+        if method == "setMyCommands":
+            return True
         raise AssertionError(f"unexpected bot API method: {method}")
+
+    async def send_document(self, *, chat_id, filename, content, caption=None):
+        self.documents.append({
+            "chat_id": chat_id, "filename": filename,
+            "content": content, "caption": caption,
+        })
+        return {"message_id": 9000 + len(self.documents)}
 
     async def aclose(self) -> None:
         self.closed = True
@@ -80,15 +90,36 @@ class FakeOperator:
     def __init__(
         self, reply_text: str = "got it",
         status: dict[str, Any] | None = None,
+        clear_result: dict[str, int] | None = None,
+        compress_result: dict[str, Any] | None = None,
+        export_payload: str = "# Operator context\n\n_(stub)_\n",
     ) -> None:
         self.reply_text = reply_text
         self.calls: list[dict[str, Any]] = []
         self.status_payload = status
         self.status_calls: list[str] = []
+        self.clear_calls: list[str] = []
+        self.compress_calls: list[str] = []
+        self.export_calls: list[str] = []
+        self._clear_result = clear_result or {"messages_deleted": 0, "summaries_deleted": 0}
+        self._compress_result = compress_result or {"compressed": False, "reason": "not enough history"}
+        self._export_payload = export_payload
 
     async def chat_turn(self, *, session_id: str, user_text: str, language=None) -> OperatorTurnResult:
         self.calls.append({"session_id": session_id, "user_text": user_text, "language": language})
         return OperatorTurnResult(text=self.reply_text, tool_calls_made=[])
+
+    async def clear_session(self, session_id: str) -> dict[str, int]:
+        self.clear_calls.append(session_id)
+        return dict(self._clear_result)
+
+    async def compress_now(self, session_id: str) -> dict[str, Any]:
+        self.compress_calls.append(session_id)
+        return dict(self._compress_result)
+
+    async def export_context(self, session_id: str) -> str:
+        self.export_calls.append(session_id)
+        return self._export_payload
 
     async def get_status(self, session_id: str) -> dict[str, Any]:
         self.status_calls.append(session_id)
@@ -728,6 +759,142 @@ async def test_status_command_dispatches_locally_without_operator_turn(db, bus):
         assert len(api.sent) == 1
         body = api.sent[0]["text"]
         assert "oncall status" in body or "All quiet" in body
+    finally:
+        await svc.stop()
+
+
+# ---------------------------------------------------------------------------
+# /clear and /compress commands
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_clear_command_calls_operator_and_reports(bus):
+    api = FakeBotApi()
+    operator = FakeOperator(
+        clear_result={"messages_deleted": 7, "summaries_deleted": 1},
+    )
+    svc = await _make_bot(bus, api, operator)
+    try:
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="/clear")["message"])
+        assert operator.clear_calls == [svc.session_id]
+        # Bot must NOT route /clear through chat_turn.
+        assert operator.calls == []
+        assert len(api.sent) == 1
+        body = api.sent[0]["text"]
+        assert "Context cleared" in body
+        assert "7 messages" in body and "1 summaries" in body
+        assert "Memory preserved" in body
+    finally:
+        await svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_compress_command_reports_success(bus):
+    api = FakeBotApi()
+    operator = FakeOperator(compress_result={
+        "compressed": True, "older_rows": 12,
+        "summary_tokens": 84, "through_message_id": 99,
+    })
+    svc = await _make_bot(bus, api, operator)
+    try:
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="/compress")["message"])
+        assert operator.compress_calls == [svc.session_id]
+        assert len(api.sent) == 1
+        body = api.sent[0]["text"]
+        assert "Compressed 12 messages" in body
+        assert "84 tokens" in body
+    finally:
+        await svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_compress_command_reports_nothing_to_compress(bus):
+    api = FakeBotApi()
+    operator = FakeOperator(compress_result={
+        "compressed": False, "reason": "not enough history",
+    })
+    svc = await _make_bot(bus, api, operator)
+    try:
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="/compress")["message"])
+        assert len(api.sent) == 1
+        assert "Nothing to compress" in api.sent[0]["text"]
+        assert "not enough history" in api.sent[0]["text"]
+    finally:
+        await svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_help_lists_clear_compress_context(bus):
+    api = FakeBotApi()
+    svc = await _make_bot(bus, api, FakeOperator())
+    try:
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="/help")["message"])
+        body = api.sent[0]["text"]
+        assert "/clear" in body
+        assert "/compress" in body
+        assert "/context" in body
+    finally:
+        await svc.stop()
+
+
+# ---------------------------------------------------------------------------
+# /context — operator context export as a Telegram document
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_registers_slash_commands(bus):
+    """Booting the bot must call setMyCommands so the user sees the menu."""
+    api = FakeBotApi()
+    svc = await _make_bot(bus, api, FakeOperator())
+    try:
+        set_calls = [c for c in api.calls if c[0] == "setMyCommands"]
+        assert len(set_calls) == 1, api.calls
+        names = {c["command"] for c in set_calls[0][1]["commands"]}
+        assert {"context", "clear", "compress", "status", "help"} <= names
+    finally:
+        await svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_context_command_uploads_markdown_document(bus):
+    payload = "# Operator context — session tg-bot-99\n\nfoo bar"
+    api = FakeBotApi()
+    operator = FakeOperator(export_payload=payload)
+    svc = await _make_bot(bus, api, operator)
+    try:
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="/context")["message"])
+        # Routed to the operator, not chat_turn.
+        assert operator.export_calls == [svc.session_id]
+        assert operator.calls == []
+        # No inline sendMessage for /context — the payload goes via sendDocument.
+        assert api.sent == []
+        assert len(api.documents) == 1
+        doc = api.documents[0]
+        assert doc["filename"].startswith(f"oncall-context-{svc.session_id}-")
+        assert doc["filename"].endswith(".md")
+        assert doc["content"] == payload.encode("utf-8")
+        assert doc["caption"]
+    finally:
+        await svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_context_command_handles_export_failure(bus):
+    api = FakeBotApi()
+
+    class BoomOperator(FakeOperator):
+        async def export_context(self, session_id):  # type: ignore[override]
+            raise RuntimeError("db locked")
+
+    svc = await _make_bot(bus, api, BoomOperator())
+    try:
+        await svc._dispatch(_msg(sender_id=OWNER_ID, text="/context")["message"])
+        # User got an inline error, no document uploaded.
+        assert api.documents == []
+        assert len(api.sent) == 1
+        assert "Failed to export" in api.sent[0]["text"]
     finally:
         await svc.stop()
 

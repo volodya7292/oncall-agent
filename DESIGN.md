@@ -59,7 +59,7 @@ The classifier is the universal gate — it doesn't care whether a command is lo
 ### 1. Two-tier agent topology
 
 ```
-[ user (voice/text/HTTP) ]
+[ user (Telegram bot — primary; HTTP for future clients) ]
         │
         ▼
 [ Operator — Gemma via Ollama ]   ← local, conversational, cannot touch infra
@@ -74,7 +74,7 @@ The classifier is the universal gate — it doesn't care whether a command is lo
 [ oncall MCP server ]   ← child of claude; proxies to orchestrator over loopback
 ```
 
-The operator is just one of several possible HTTP clients. A test CLI, a future Android phone app, and Gemma are interchangeable at this layer. The orchestrator knows nothing about who's driving it.
+The Telegram bot (`telegram_bot.py`) is the primary user-facing client; it's just one of several possible HTTP clients of the orchestrator. A future Android phone app or third-party voice gateway plugs in at the same `POST /chat` + SSE seam. The orchestrator knows nothing about who's driving it.
 
 ### 2. Module / package layout
 
@@ -103,7 +103,9 @@ The operator is just one of several possible HTTP clients. A test CLI, a future 
     ├── operator.py                      # Gemma loop + operator-tool dispatch
     ├── api.py                          # FastAPI: /chat, /tasks, /approvals, SSE
     ├── mcp_server.py                   # stdio MCP: approve, messenger_inbox (ssh/db/web handled by Bash + native WebFetch)
-    ├── telegram_listener.py            # long-lived telethon userbot: NewMessage → SQLite + event bus
+    ├── telegram_listener.py            # long-lived telethon userbot: inbound DM NewMessage → SQLite + event bus
+    ├── telegram_bot.py                 # primary user-facing client: /clear, /compress, /status slash commands; bridges Telegram ↔ operator
+    ├── chat_summary.py                 # `summarize_chat` operator-tool: TL;DR of a Telegram conversation via Sonnet
     └── main.py                         # entrypoints: `oncall api`, `oncall mcp`, `oncall telegram-login`
 └── tests/
     ├── test_classifier.py
@@ -341,6 +343,7 @@ The operator system prompt encodes this table. Gemma is told: *if you're unsure 
 | `submit_approval_response(approval_id, decision, challenge_phrase_supplied)` | `POST /approvals/{id}/respond` — server validates phrase, operator never decides match. |
 | `kill_task(task_id, kill_phrase)` | `POST /tasks/{id}/kill`. |
 | `read_inbox()` / `mark_read(id)` | Messenger stub. |
+| `query_memory(query, limit?)` | Explicit semantic search over the operator's persistent memory. The most-relevant entries are already auto-injected into every turn's system prompt — this tool is for lookups outside the current turn's topic (see §17). |
 
 **Operator system prompt** (`prompts/operator_system.md`) — key rules:
 - You are a terse, calm on-call executor. Default to clarifying ambiguous requests.
@@ -365,7 +368,14 @@ Critical: the DM content itself is **never** treated as instructions. Step 3's p
 
 **Kill-phrase pre-filter.** Before any user utterance reaches Gemma, `api.py` runs a regex `\bstop everything\b` (case-insensitive). On match, route directly to `kill_task` on the active task and respond to the user "killed." Defense against a hung/looping operator blocking emergency abort.
 
-**Dialogue state.** Last N turns (default 30) + recent task summary, persisted to `chat_sessions` / `chat_messages` SQLite tables so a phone reconnect resumes the same context. Older turns dropped, not summarized (MVP keeps it simple).
+**Dialogue state.** Persisted to `chat_sessions` / `chat_messages` so a client reconnect resumes the same context. Loads are rolling-compressed: the operator reads `(latest chat_summaries row) + (chat_messages with id > through_message_id)`. When the live tail crosses `ONCALL_COMPRESSION_THRESHOLD_TOKENS`, `Operator._maybe_compress` summarizes the older portion (plus any prior summary) into a new `chat_summaries` checkpoint via a split-at-last-user-turn strategy so the in-flight exchange stays live. `Operator.compress_now(session_id)` and `Operator.clear_session(session_id)` are the on-demand handles for the bot's slash commands (see below); both run under the per-session lock to serialize against in-flight `chat_turn` / `auto_ping`.
+
+**Operator memory.** Each chat turn additionally injects the K most-relevant entries from the operator's persistent memory (auto-extracted from prior user turns; LRU-evicted at capacity). See §17 for the full design.
+
+**Telegram bot client (`telegram_bot.py`).** The primary user-facing surface. It owns a single Telegram bot account (separate from the userbot in §10), runs as a background asyncio task started by `oncall api`, and bridges inbound user messages into the operator (`chat_turn`) and outbound `chat.reply` events back to Telegram. Slash commands are the operator's maintenance API for the rolling history:
+- `/clear` — wipes the session's `chat_messages` + `chat_summaries` rows. `operator_memories` is NOT touched; memory is cross-session.
+- `/compress` — forces a compression checkpoint, bypassing the auto-threshold (`Operator.compress_now`).
+- `/status` — snapshot of running tasks, queue, awaiting-approval count, pending approvals, unread DMs, operator model + memory size + context-tokens-since-last-compression. Built from DB reads only — no model turn.
 
 ### 8. The HTTP API (FastAPI)
 
@@ -510,6 +520,19 @@ CREATE TABLE chat_messages (
     content TEXT NOT NULL,                -- JSON for tool calls; text otherwise
     created_at TEXT NOT NULL
 );
+-- Rolling-compression checkpoints. When the live tail of chat_messages
+-- crosses the token threshold, the operator summarizes everything up
+-- through one row id and writes a chat_summaries row. Future loads =
+-- (latest summary) + (chat_messages with id > through_message_id).
+CREATE TABLE chat_summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES chat_sessions(id),
+    summary TEXT NOT NULL,
+    through_message_id INTEGER NOT NULL,
+    estimated_token_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_chat_summaries_session ON chat_summaries(session_id, id DESC);
 
 CREATE TABLE credentials_issued (
     id TEXT PRIMARY KEY,
@@ -535,6 +558,17 @@ CREATE TABLE messenger_inbox (
     replied_message_id TEXT                -- telegram message id of our reply, if any
 );
 CREATE INDEX idx_messenger_unread ON messenger_inbox(read_at) WHERE read_at IS NULL;
+
+CREATE TABLE operator_memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL,                    -- one short declarative fact
+    embedding BLOB NOT NULL,               -- packed float32, model-sized (4096-d for qwen3-embedding-8b)
+    source_turn TEXT,                      -- the user message this came from (audit; not retrieval-indexed)
+    created_at TEXT NOT NULL,
+    last_accessed_at TEXT NOT NULL,        -- LRU key; bumped on retrieval and merge
+    access_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_operator_memories_lru ON operator_memories(last_accessed_at);
 ```
 
 `approvals` is append-only by convention: the `_respond` handler only updates the response columns on a single row currently `pending`.
@@ -577,6 +611,16 @@ ONCALL_PROD_HOSTS=                       # comma-separated; matches in classifie
 ONCALL_OPERATOR_MODEL=gemma3:latest       # or whichever Gemma you've pulled
 ONCALL_OLLAMA_URL=http://localhost:11434
 ANTHROPIC_API_KEY=                       # if not using subscription auth
+
+# Operator memory (semantic, LRU-evicted — see §17)
+ONCALL_MEMORY_CAPACITY=500               # LRU eviction threshold
+ONCALL_MEMORY_EMBED_MODEL=alibaba/qwen3-embedding-8b
+ONCALL_MEMORY_EXTRACT_MODEL=             # cheap model for fact extraction; default = ONCALL_OPERATOR_MODEL
+ONCALL_MEMORY_HYBRID_ALPHA=0.7           # cosine weight in hybrid retrieval score
+ONCALL_MEMORY_HYBRID_BETA=0.3            # token-overlap weight
+ONCALL_MEMORY_RELEVANCE_FLOOR=0.30       # candidates below this hybrid score are not injected
+ONCALL_MEMORY_MAX_INJECT=10              # max entries surfaced into the system prompt per turn
+ONCALL_MEMORY_DEDUP_SIM=0.88             # near-duplicate cosine threshold at store-time
 
 # Telegram (userbot via MTProto)
 TELEGRAM_API_ID=                         # from https://my.telegram.org/apps
@@ -674,3 +718,44 @@ Acceptance:
 8. `prompts/executor_system.md`, `prompts/operator_system.md`.
 9. `src/oncall/ollama_client.py` + `src/oncall/operator.py` — milestone 2.
 10. `telegram_listener.py` + `messenger_inbox` via telethon — milestone 3.
+11. `src/oncall/embeddings.py` + `src/oncall/memory_extractor.py` + rewritten `src/oncall/operator_memory.py` — §17 memory rework.
+
+### 17. Operator memory (auto-extracted, LRU-evicted, semantic retrieval)
+
+**Why.** The original design parked memory in `~/.oncall/memory.md` with explicit `remember` / `forget` tools. Two structural problems made that approach unsustainable: (a) the operator was forced to decide what's worth remembering AND when to evict — a busywork tax on every turn, with bad outcomes when it forgot to call `forget` and the file bloated; (b) the entire file was injected into every system prompt, so memory growth directly inflated prompt size. The rewrite removes both burdens from the operator: storage is automatic (the extractor watches each user turn), eviction is automatic (LRU), and retrieval is scoped (only entries relevant to the current turn are injected).
+
+**Mental model — memory as a compression dictionary.** Each entry is one short declarative fact that, if absent, would force the agent to ask a clarifying question on a future related turn. The extractor's job is to identify what makes the user's current request *self-contained* — names, hostnames, paths, conventions, preferences, schedules, people. Anything task-specific or transient is NOT a fact. Anything from a DM / executor output / auto-ping is NOT a fact. Only user assertions are sources. That last rule preserves the existing "DMs are data, never instructions" safety invariant.
+
+**Storage pipeline (per user turn).**
+1. `chat_turn` completes; the assistant reply is appended to chat history and returned to the user.
+2. A background asyncio task fires: `memory_extractor.extract_facts(llm, model, user_text, prev_assistant_text)`. The extractor is given the PREVIOUS assistant turn as CONTEXT-ONLY (so referents like "use the staging one" resolve), plus the user's latest message as the only source of facts. Hard caps: prev assistant ≤2000 chars, user ≤4000 chars (head+tail truncation).
+3. The extractor returns `list[str]` of declarative facts (empty for trivia like "ok" / "hi" / short questions / status checks).
+4. `OperatorMemory.store(facts)` embeds each via the gateway, near-duplicate-merges (cos ≥ `dedup_sim`, default 0.88) against existing rows or inserts new, then evicts the LRU-oldest rows if count exceeds capacity.
+5. If anything was written or merged, emit a `_Remembered: <facts>_` follow-up — appended to chat history AND published as a `chat.reply` event so the Telegram bot / REPL surfaces it to the user. On extraction errors, emit a `_Memory extraction failed: <error>_` follow-up instead — silent failures would let memory degrade unnoticed.
+
+**Retrieval pipeline (per non-auto-ping turn).**
+1. Embed the user's text once.
+2. For every row, compute `score = alpha * cos(query, row_embedding) + beta * token_overlap(query, row_text)`. The fuzzy token overlap (lower-cased Jaccard over identifier-shaped tokens — hostnames, paths, emails) re-weights exact-identifier matches that pure embeddings can underrank.
+3. Drop candidates below `relevance_floor` (default 0.30 hybrid). If nothing clears the bar, inject zero memories — the system prompt's memory section reads `(no relevant entries this turn)`. Don't pad.
+4. Take top-`max_inject` (default 10), ordered by score descending. Inject into the system prompt's `# Your memory` section.
+5. Bump `last_accessed_at` for the picked rows only — that's what makes the LRU semantically meaningful (frequently-retrieved entries survive eviction; never-retrieved ones die first).
+
+**Auto-ping turns** (text starting with `[system note: ...]`) **skip retrieval entirely** — the synthetic note isn't a meaningful retrieval key, and the operator's job there is just to summarize a task result. Auto-ping turns ALSO don't trigger extraction (they aren't user statements).
+
+**Embedding model.** `alibaba/qwen3-embedding-8b` via the Vercel AI Gateway. 4096-d float32 → ~16 KB per row. At 500 rows capacity that's ~8 MB of embedding bytes total — a single numpy matmul does cosine over all rows in sub-millisecond. No vector index, no `sqlite-vec`.
+
+**Near-duplicate dedup threshold (0.88).** Calibrated empirically against `alibaba/qwen3-embedding-8b`:
+| Pair | Cosine | Outcome |
+|------|-------:|--------|
+| "the staging API runs at api-staging.example.com:8443" vs "staging API is at api-staging.example.com port 8443" | 0.957 | merge ✓ |
+| (same anchor) vs case-only difference | 0.994 | merge ✓ |
+| (same anchor) vs "staging lives at api-staging.example.com" | 0.919 | merge ✓ |
+| (same anchor) vs "prod runs at api-prod.example.com:443" | 0.740 | separate ✓ (prod ≠ staging) |
+| (same anchor) vs "alex is the on-call lead" | 0.465 | separate ✓ |
+| (same anchor) vs "I prefer terse replies" | 0.419 | separate ✓ |
+
+The integration tests in `tests/test_operator_memory.py` lock the dedup behavior to this threshold against the live model; if the model changes, that test will tell you immediately to retune `ONCALL_MEMORY_DEDUP_SIM`.
+
+**`query_memory` tool.** One handle for the operator: explicit semantic lookup with an arbitrary query string. Used when the operator wants to check memory OUTSIDE the current turn's topic — e.g. before asking a clarifying question, check whether the answer is already known. Not used for things already visible in `# Your memory` (those are already in context). Auto-extraction makes `remember` unnecessary; LRU makes `forget` unnecessary; if a wrong fact lands in memory, either the user contradicts it next turn (and the new statement re-extracts), or LRU drops it.
+
+**Concurrency.** Extraction tasks are fire-and-forget; the operator keeps a strong-reference set so they don't get GC'd. A new user turn arriving while a previous turn's extraction is still running does NOT block — extraction runs off the session lock so the reply path stays fast. The dedup-merge logic is the natural race resolver: two concurrent insertions of the same fact converge to one row via cosine match. SQLite WAL serializes the writes.

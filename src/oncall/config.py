@@ -51,10 +51,26 @@ class Settings(BaseSettings):
     # that resolves to the latest Sonnet on the user's subscription.
     oncall_compression_model: str = "sonnet"
     oncall_db_path: Path = Field(default_factory=lambda: Path("~/.oncall/state.db").expanduser())
-    oncall_memory_path: Path = Field(
-        default_factory=lambda: Path("~/.oncall/memory.md").expanduser()
-    )
     oncall_prod_hosts: str = ""
+
+    # Operator memory — semantic, LRU-evicted. Stored in SQLite alongside the
+    # rest of state. Capacity caps the number of rows; when extraction would
+    # exceed it, the least-recently-retrieved rows are dropped. Hybrid score
+    # at retrieval time is `alpha * cosine + beta * token_overlap`, candidates
+    # below `relevance_floor` are not injected.
+    oncall_memory_capacity: int = 500
+    oncall_memory_embed_model: str = "alibaba/qwen3-embedding-8b"
+    # Cheap conversational model for extracting facts from the user's turn.
+    # Empty string disables auto-extraction (operator memory still works for
+    # retrieval, just never grows). Defaults to the operator model.
+    oncall_memory_extract_model: str = ""
+    oncall_memory_hybrid_alpha: float = 0.7
+    oncall_memory_hybrid_beta: float = 0.3
+    oncall_memory_relevance_floor: float = 0.30
+    oncall_memory_max_inject: int = 10
+    # Near-duplicate threshold for the at-store merge. New facts with cosine
+    # ≥ this against an existing entry update that entry instead of inserting.
+    oncall_memory_dedup_sim: float = 0.88
 
     # Operator backend: OpenAI-compatible HTTP via Vercel AI Gateway.
     # https://vercel.com/docs/ai-gateway/sdks-and-apis/python
@@ -66,7 +82,6 @@ class Settings(BaseSettings):
 
     @field_validator(
         "oncall_db_path",
-        "oncall_memory_path",
         "telegram_session_path",
         "telegram_bot_session_path",
         mode="before",
@@ -105,7 +120,7 @@ class Settings(BaseSettings):
     telegram_userbot_ignore_usernames: str = ""
 
     # Telegram BOT front-end (separate from the userbot above). Talk to the
-    # operator over Telegram instead of (or in addition to) `oncall chat`.
+    # operator over Telegram. This is the primary client.
     # Get the token from @BotFather. OWNER_ID is the Telegram numeric user_id
     # of the only person allowed to talk to this bot — fetch it from
     # @userinfobot, or temporarily start the bot without OWNER_ID set and

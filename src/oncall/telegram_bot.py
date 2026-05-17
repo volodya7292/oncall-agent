@@ -45,6 +45,19 @@ _LONG_POLL_SECONDS = 25
 # Backoff between failed getUpdates calls (network issues, 5xx, rate limits).
 _RETRY_DELAY_SECONDS = 3.0
 
+# Bot menu definition. Pushed to Telegram via setMyCommands at startup so
+# the user gets autocomplete + the slash-command menu without having to
+# configure anything via @BotFather. Keep descriptions ≤256 chars (Telegram
+# limit) and start lowercase per Telegram convention.
+_BOT_COMMANDS: list[dict[str, str]] = [
+    {"command": "start",    "description": "greeting"},
+    {"command": "status",   "description": "running tasks, queue, approvals, unread DMs"},
+    {"command": "context",  "description": "export this session's history + summary as a markdown file"},
+    {"command": "clear",    "description": "wipe this session's history (memory preserved)"},
+    {"command": "compress", "description": "force-compress older messages into a summary"},
+    {"command": "help",     "description": "list commands"},
+]
+
 
 def bot_session_id(owner_user_id: int) -> str:
     """Deterministic chat-session id for the bot's conversation with the owner.
@@ -79,6 +92,14 @@ class BotApi(Protocol):
     production uses HttpxBotApi (real network)."""
 
     async def call(self, method: str, payload: dict[str, Any] | None = None) -> Any: ...
+    async def send_document(
+        self,
+        *,
+        chat_id: Any,
+        filename: str,
+        content: bytes,
+        caption: str | None = None,
+    ) -> Any: ...
     async def aclose(self) -> None: ...
 
 
@@ -103,6 +124,36 @@ class HttpxBotApi:
                 f"bot API {method} failed: {data.get('description')} (HTTP {r.status_code})"
             )
         return data.get("result")
+
+    async def send_document(
+        self,
+        *,
+        chat_id: Any,
+        filename: str,
+        content: bytes,
+        caption: str | None = None,
+    ) -> Any:
+        """Multipart upload via /sendDocument. Used to ship things that are
+        too long or too noisy for an inline message — e.g. `/context`
+        exports. Telegram caps documents at 50 MB for bots; we're well
+        under that for any plausible chat history."""
+        data: dict[str, str] = {"chat_id": str(chat_id)}
+        if caption:
+            data["caption"] = caption
+        files = {"document": (filename, content, "text/markdown")}
+        r = await self._http.post("/sendDocument", data=data, files=files)
+        try:
+            body = r.json()
+        except Exception as e:
+            raise RuntimeError(
+                f"sendDocument: non-JSON response (HTTP {r.status_code})"
+            ) from e
+        if not body.get("ok"):
+            raise RuntimeError(
+                f"sendDocument failed: {body.get('description')} "
+                f"(HTTP {r.status_code})"
+            )
+        return body.get("result")
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -176,6 +227,16 @@ class TelegramBotService:
                 self._bot_user_id = int(me["id"]) if me.get("id") is not None else None
             except (TypeError, ValueError):
                 self._bot_user_id = None
+        # Register the slash-command menu so the user gets autocomplete in
+        # the Telegram client without having to set anything up via BotFather.
+        # Fail-soft: a transient network blip here must NOT block polling.
+        try:
+            await self._api.call("setMyCommands", {"commands": _BOT_COMMANDS})
+            telegram_log.info("bot commands registered " + fmt(
+                count=len(_BOT_COMMANDS),
+            ))
+        except Exception:
+            log.exception("setMyCommands failed; commands menu may be stale")
         self._poll_task = asyncio.create_task(self._poll_loop(), name="tg-bot-poll")
         self._reply_task = asyncio.create_task(
             self._chat_reply_subscriber(), name="tg-bot-reply",
@@ -276,12 +337,62 @@ class TelegramBotService:
             await self._send(chat_id, (
                 "/start — greeting\n"
                 "/status — snapshot of running tasks, queue, approvals, unread DMs\n"
+                "/context — export this session's chat history + latest summary as a markdown file\n"
+                "/clear — wipe this chat session's history (memory is preserved)\n"
+                "/compress — force-compress older messages into a summary now\n"
                 "/help — this\n"
                 "Anything else is a chat turn."
             ))
             return
         if text.startswith("/status"):
             await self._send(chat_id, await self._render_status())
+            return
+        if text.startswith("/context"):
+            try:
+                dump = await self._operator.export_context(self._session_id)
+            except Exception:
+                log.exception("operator.export_context failed")
+                await self._send(chat_id, "Failed to export context. Check logs.")
+                return
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            filename = f"oncall-context-{self._session_id}-{stamp}.md"
+            try:
+                await self._api.send_document(
+                    chat_id=chat_id,
+                    filename=filename,
+                    content=dump.encode("utf-8"),
+                    caption="Operator context for this session.",
+                )
+            except Exception:
+                log.exception("send_document failed for /context")
+                await self._send(chat_id, "Failed to upload context file. Check logs.")
+                return
+            telegram_log.info("bot context " + fmt(
+                session=self._session_id, bytes=len(dump),
+            ))
+            return
+        if text.startswith("/clear"):
+            out = await self._operator.clear_session(self._session_id)
+            await self._send(chat_id, (
+                f"Context cleared ({out['messages_deleted']} messages, "
+                f"{out['summaries_deleted']} summaries). Memory preserved."
+            ))
+            telegram_log.info("bot clear " + fmt(
+                session=self._session_id, **out,
+            ))
+            return
+        if text.startswith("/compress"):
+            out = await self._operator.compress_now(self._session_id)
+            if out.get("compressed"):
+                await self._send(chat_id, (
+                    f"Compressed {out['older_rows']} messages into "
+                    f"~{out['summary_tokens']} tokens of summary."
+                ))
+            else:
+                await self._send(chat_id, f"Nothing to compress: {out.get('reason')}.")
+            telegram_log.info("bot compress " + fmt(
+                session=self._session_id, **out,
+            ))
             return
 
         telegram_log.info("bot inbound " + fmt(

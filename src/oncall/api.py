@@ -29,10 +29,12 @@ from .approval_client import HttpLongPollApprovalClient, is_kill_phrase
 from .broker import Broker
 from .config import get_paths, get_settings
 from .db import Database
+from .embeddings import GatewayEmbeddingClient
 from .events import EventBus
 from .lifecycle import Lifecycle
 from .local_claude import ClaudeCliRunner
 from .operator import GatewayLLMClient, Operator
+from .operator_memory import OperatorMemory
 from .task_summary import summarize_task
 from .telegram_bot import HttpxBotApi, TelegramBotService
 from .telegram_service import TelegramService, make_telethon_client
@@ -168,10 +170,28 @@ def create_app() -> FastAPI:
         # Single instance: it's a fresh subprocess per call, no shared state.
         cli_runner = ClaudeCliRunner()
         if settings.gateway_key:
+            embedder = GatewayEmbeddingClient(
+                base_url=settings.ai_gateway_base_url,
+                api_key=settings.gateway_key,
+                model=settings.oncall_memory_embed_model,
+            )
+            memory = OperatorMemory(
+                db, embedder,
+                capacity=settings.oncall_memory_capacity,
+                max_inject=settings.oncall_memory_max_inject,
+                relevance_floor=settings.oncall_memory_relevance_floor,
+                hybrid_alpha=settings.oncall_memory_hybrid_alpha,
+                hybrid_beta=settings.oncall_memory_hybrid_beta,
+                dedup_sim=settings.oncall_memory_dedup_sim,
+            )
             operator = Operator(
                 db=db, lifecycle=lifecycle, broker=broker,
                 settings=settings, paths=paths, llm=llm,
+                memory=memory,
                 telegram=telegram,
+                events=events,
+                extract_llm=llm,  # share the gateway client; extractor uses
+                                  # the configured cheap model via Settings
                 runner=cli_runner,
             )
         # Telegram bot front-end (optional, separate from userbot above).
@@ -448,8 +468,9 @@ def _register_routes(app: FastAPI) -> None:
         request: Request,
         types: str = "approval.requested,approval.resolved,result.final,messenger.received,state.changed",
     ):
-        """Live global SSE feed for clients like the `oncall chat` REPL.
-        `types` is a comma-separated filter; pass empty to receive everything."""
+        """Live global SSE feed (public API surface — third-party clients,
+        future voice gateway). `types` is a comma-separated filter; pass
+        empty to receive everything."""
         ev = _events(request)
         wanted = {t.strip() for t in types.split(",") if t.strip()} or None
 

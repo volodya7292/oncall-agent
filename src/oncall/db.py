@@ -108,6 +108,22 @@ CREATE TABLE IF NOT EXISTS credentials_issued (
     revoked_at TEXT
 );
 
+-- Operator memory. Each row is one short declarative fact extracted from a
+-- user turn, with a packed-float32 embedding for semantic retrieval. LRU is
+-- maintained via last_accessed_at (bumped both at retrieval and at near-
+-- duplicate merge).
+CREATE TABLE IF NOT EXISTS operator_memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    source_turn TEXT,
+    created_at TEXT NOT NULL,
+    last_accessed_at TEXT NOT NULL,
+    access_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_operator_memories_lru
+    ON operator_memories(last_accessed_at);
+
 CREATE TABLE IF NOT EXISTS messenger_inbox (
     id TEXT PRIMARY KEY,
     platform TEXT NOT NULL DEFAULT 'telegram',
@@ -428,6 +444,25 @@ class Database:
              "created_at": r["created_at"]}
             for r in reversed(rows)
         ]
+
+    async def delete_chat_messages(self, session_id: str) -> int:
+        """Wipe every chat_messages row for this session. Returns the
+        number of rows removed. Used by the bot's /clear command. Does
+        NOT touch chat_summaries, chat_sessions, or operator_memories —
+        callers compose these as needed."""
+        cur = await self.conn.execute(
+            "DELETE FROM chat_messages WHERE session_id = ?", (session_id,),
+        )
+        await self.conn.commit()
+        return cur.rowcount
+
+    async def delete_chat_summaries(self, session_id: str) -> int:
+        """Wipe every compression checkpoint for this session."""
+        cur = await self.conn.execute(
+            "DELETE FROM chat_summaries WHERE session_id = ?", (session_id,),
+        )
+        await self.conn.commit()
+        return cur.rowcount
 
     # ---- chat compression checkpoints ----
 

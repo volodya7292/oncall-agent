@@ -142,16 +142,6 @@ def main() -> None:
                         help="Overwrite an existing ~/.oncall/.env.")
     sub.add_parser("api", help="Run the orchestrator HTTP API")
     sub.add_parser("mcp", help="Run the stdio MCP server (used by claude subprocesses)")
-    chat_p = sub.add_parser(
-        "chat",
-        help="Interactive text mode — chat with the operator over the running daemon.",
-    )
-    chat_p.add_argument("--new", action="store_true",
-                        help="Start a fresh chat session instead of resuming the last one.")
-    chat_p.add_argument("--session", metavar="ID", default=None,
-                        help="Resume a specific chat session id.")
-    chat_p.add_argument("--debug", action="store_true",
-                        help="Stream state.changed events too (chatty).")
     tg_login_p = sub.add_parser(
         "telegram-login",
         help="One-time interactive Telegram userbot login (writes session file).",
@@ -200,16 +190,6 @@ def main() -> None:
             verbose=getattr(args, "verbose", False),
             qr=getattr(args, "qr", False),
         )
-    elif args.cmd == "chat":
-        from . import repl
-        from .config import get_settings
-        code = asyncio.run(repl.run(
-            get_settings(),
-            new_session=args.new,
-            session_override=args.session,
-            debug=args.debug,
-        ))
-        sys.exit(code)
     elif args.cmd == "service":
         from . import service
         fn = getattr(service, args.action)

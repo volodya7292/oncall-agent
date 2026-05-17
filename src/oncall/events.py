@@ -4,11 +4,12 @@ Per-task events are also appended to `task_events` (via db.append_event) so an
 SSE subscriber connecting late can replay history from a cursor before tailing
 the live stream.
 
-A second, global channel exists for clients (e.g. the `oncall chat` REPL) that
-want to see events across all tasks without picking a single task_id. The
-global channel is live-only — no replay. Global subscribers receive envelopes
-shaped {task_id: str|None, type: str, payload: dict, seq: int}; per-task
-subscribers continue to receive the original {seq, type, payload} shape.
+A second, global channel exists for clients (the Telegram bot, future voice
+gateway, etc.) that want to see events across all tasks without picking a
+single task_id. The global channel is live-only — no replay. Global
+subscribers receive envelopes shaped {task_id: str|None, type: str,
+payload: dict, seq: int}; per-task subscribers continue to receive the
+original {seq, type, payload} shape.
 """
 
 from __future__ import annotations
