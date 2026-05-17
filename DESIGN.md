@@ -31,7 +31,7 @@ The classifier is the universal gate — it doesn't care whether a command is lo
 - **Operator runtime: Ollama-hosted Gemma**, local. Default model `gemma3:latest` (user said "gemma4" — Gemma 4 isn't a widely-released ID yet; the model is a config knob via `ONCALL_OPERATOR_MODEL`, swap freely). HTTP `/api/chat` with tool-calling. Operator handles dialogue, status questions, reading inbox, dispatching tasks, presenting approvals.
 - **Executor runtime: the `claude` CLI, NOT the Agent SDK.** The orchestrator spawns `claude` as a subprocess per task with `--print --output-format stream-json --input-format stream-json`, parses streaming JSON events, and supervises session lifecycle via `--session-id` / `--resume`. Rationale per user directive (2026-05-16): fewer dependencies, no SDK version drift, the CLI already implements the full permission pipeline.
 - **Permission chokepoint = CLI flags.** Deterministic gate is `.claude/settings.json` `permissions.deny` + `permissions.allow` + `--permission-mode`. The escalation hook is `--permission-prompt-tool mcp__oncall__approve`, pointing at an MCP tool we own (the broker). That MCP tool implements the read-back / challenge-phrase contract.
-- **MCP servers we provide** (registered via `.mcp.json` or `--mcp-config`): `oncall` (the approval broker + domain tools like `ssh_exec`, `web_search`, `messenger_read`). Built-in CLI tools (Bash, Read, Edit, Write, Grep, Glob) are used directly with the allow/deny rules; mutations route through the broker via `--permission-prompt-tool`.
+- **MCP servers we provide** (registered inline via `--mcp-config <json>` at spawn time by the supervisor): `oncall` (the approval broker + domain tools like `ssh_exec`, `web_search`, `messenger_read`). Built-in CLI tools (Bash, Read, Edit, Write, Grep, Glob) are used directly with the allow/deny rules; mutations route through the broker via `--permission-prompt-tool`.
 - **Durable state:** SQLite file (single-user; migrate to Postgres later if needed).
 - **Telephony:** deferred — defined behind an interface so any client (Android app, future SIP gateway, CLI) can drive approvals.
 - **Messenger: Telegram is the primary** (per user, 2026-05-16) — and it's a *userbot*, not a bot account. The agent reads and sends as the user's own Telegram account via MTProto (`telethon`). Bot accounts can't see inbound DMs from arbitrary people; only userbots can, which is what this flow requires. Other messengers (Slack/Discord/etc.) bolt on later via the `MessengerProvider` Protocol.
@@ -86,7 +86,6 @@ The operator is just one of several possible HTTP clients. A test CLI, a future 
 ├── README.md
 ├── DESIGN.md                           # context section of this plan, checked-in
 ├── .claude/settings.json               # catastrophic deny list, defaultMode "default"
-├── .mcp.json                           # dev-time MCP registration
 ├── prompts/
 │   ├── operator_system.md               # Gemma operator prompt (terse, read-back discipline)
 │   └── executor_system.md              # appended to claude CLI's system prompt
