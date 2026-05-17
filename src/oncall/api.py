@@ -752,12 +752,21 @@ async def _flush_chat(
     except Exception:
         log.exception("inbox-drain: auto_ping failed for chat %s", chat_id)
         return
-    # Mark the chat triaged so a restart doesn't re-fire on the same rows.
-    # Runs whether the outcome was a reply or a silent decision.
+    # Mark the chat triaged so a restart doesn't re-fire on the same rows,
+    # AND mark every unread row as read so /status' "Unread DMs" count
+    # reflects reality. The drain has already decided this chat is handled
+    # (whether the operator replied or stayed silent) — leaving rows unread
+    # creates a confusing split between "triaged" (we acted on it) and
+    # "unread" (the user still sees a 1). Runs only after the operator
+    # turn fully completes (auto_ping returned above).
     try:
         await db.mark_chat_triaged(chat_id)
     except Exception:
         log.exception("inbox-drain: mark_chat_triaged failed for %s", chat_id)
+    try:
+        await db.mark_chat_read(chat_id)
+    except Exception:
+        log.exception("inbox-drain: mark_chat_read failed for %s", chat_id)
     if not result.text:
         return
     await events.publish_global("chat.reply", {

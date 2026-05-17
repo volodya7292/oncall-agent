@@ -69,11 +69,59 @@ class Lifecycle:
         return task
 
     async def recover(self) -> None:
-        """On boot, re-spawn any tasks left in {running, awaiting_approval}."""
+        """On boot, re-spawn any tasks left in {running, awaiting_approval},
+        and sweep orphaned approvals — pending approval rows whose parent
+        task already transitioned to a terminal state (failed/killed/
+        completed) and will never decide them. Without the sweep, /status
+        would show 'Approvals pending: N' forever for those orphans."""
         alive = await self.db.list_tasks_in_states(TaskState.RUNNING, TaskState.AWAITING_APPROVAL)
         for task in alive:
             log.info("recovering task %s (state=%s)", task.id, task.state)
             self._spawn(task, resuming=True)
+        await self._sweep_orphan_approvals()
+
+    async def _sweep_orphan_approvals(self) -> None:
+        """Resolve any pending approval whose parent task is in a terminal
+        state. Called on boot and from `_run`'s finally so transient
+        terminations (supervisor crash, kill) don't leave the count stuck."""
+        from .models import ApprovalResult, utcnow
+        try:
+            pending = await self.db.list_pending_approvals()
+        except Exception:
+            log.exception("orphan-approval sweep: list_pending_approvals failed")
+            return
+        for approval in pending:
+            try:
+                task = await self.db.get_task(approval.task_id)
+            except Exception:
+                log.warning(
+                    "orphan-approval sweep: get_task failed for %s",
+                    approval.task_id,
+                )
+                continue
+            if task is None or task.state not in (
+                TaskState.FAILED, TaskState.KILLED, TaskState.COMPLETED,
+            ):
+                continue
+            log.info(
+                "orphan-approval sweep: resolving %s (task %s state=%s)",
+                approval.id, approval.task_id, task.state.value,
+            )
+            result = ApprovalResult(
+                request_id=approval.id,
+                behavior="deny",
+                message=f"orphaned: task terminated in state={task.state.value}",
+                responded_at=utcnow(),
+            )
+            try:
+                if self.approval_client.has_pending(approval.id):
+                    self.approval_client.resolve(approval.id, result)
+                await self.db.append_approval_response(approval.id, result)
+            except Exception:
+                log.exception(
+                    "orphan-approval sweep: failed to resolve %s",
+                    approval.id,
+                )
 
     async def kill(self, task_id: UUID, *, reason: str = "killed") -> bool:
         rt = self.running.get(task_id)
@@ -143,3 +191,8 @@ class Lifecycle:
             return TerminalReason.CLI_ERROR
         finally:
             self.running.pop(task.id, None)
+            # If the task ended without going through `kill()` (e.g. normal
+            # supervisor completion, or the crash path above), any pending
+            # approval rows it left behind are now orphans. Sweep them so
+            # /status' pending-approval count reflects reality.
+            await self._sweep_orphan_approvals()
