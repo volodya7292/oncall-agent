@@ -139,6 +139,13 @@ def classify(tool_name: str, tool_input: dict[str, Any]) -> Verdict:
         return _classify_messenger(tool_input)
     if tool_name == "mcp__oncall__memory":
         return _classify_memory(tool_input)
+    if tool_name == "mcp__oncall__ask_user":
+        q = str(tool_input.get("question", ""))[:80]
+        return Verdict(
+            kind=ClassifierVerdict.READONLY,
+            canonical=f"ask_user({q!r})",
+            blast_radius="Relays a question to the human; no external mutation.",
+        )
     # Unknown tool → mutating (default-deny posture).
     return Verdict(
         kind=ClassifierVerdict.MUTATING,

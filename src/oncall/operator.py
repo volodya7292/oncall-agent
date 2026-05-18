@@ -687,6 +687,7 @@ class Operator:
         memory: MemoryStore,
         telegram: TelegramService | None = None,
         events: EventBus | None = None,
+        ask_futures: dict[str, asyncio.Future[str]] | None = None,
         extract_llm: LLMClient | None = None,
         extract_model: str | None = None,
         max_history: int = 60,
@@ -709,6 +710,9 @@ class Operator:
         # without breaking the existing _memory private convention.
         self.memory: MemoryStore = memory
         self._events = events
+        self._ask_futures: dict[str, asyncio.Future[str]] = (
+            ask_futures if ask_futures is not None else {}
+        )
         # When extract_llm is None, auto-extraction is disabled (memory still
         # works for retrieval — it just never grows from conversation).
         self._extract_llm = extract_llm
@@ -810,6 +814,17 @@ class Operator:
         # show the extractor. Reading outside the lock is safe: the lock
         # only serializes writes via _run_turn / auto_ping.
         prev_assistant_text = await self._latest_assistant_text(session_id)
+        # If a `presented` ask is open for this chat, the user's message is
+        # the answer — relay to the waiting executor, then run the operator
+        # turn on a synthetic `[system note: relayed your answer ...]`
+        # instead of the raw user text. The operator never sees the raw
+        # text directly; the ask_request row holds it for audit.
+        ask_relay_note = await self._maybe_relay_ask_answer(
+            session_id, user_text,
+        )
+        if ask_relay_note is not None:
+            user_text = ask_relay_note
+            attachments = None
         async with self._lock_for(session_id):
             result = await self._run_turn(
                 session_id, user_text, language=language,
@@ -836,6 +851,53 @@ class Operator:
             self._extraction_tasks.add(task)
             task.add_done_callback(self._extraction_tasks.discard)
         return result
+
+    async def _maybe_relay_ask_answer(
+        self, session_id: str, user_text: str,
+    ) -> str | None:
+        """If a `presented` ask is open for this chat, treat the user's
+        message as its answer: resolve the executor's future, mark
+        answered, surface the next pending ask (if any) by appending it
+        to the system note. Returns the synthetic `[system note: ...]`
+        text to feed the operator INSTEAD of the raw user text, or None
+        if no ask is open and the message should pass through normally."""
+        row = await self._db.get_presented_ask_for_chat(session_id)
+        if row is None:
+            return None
+        ask_id = row["id"]
+        task_id_short = (row["task_id"] or "")[:8]
+        ok = await self._db.mark_ask_answered(ask_id, user_text)
+        if not ok:
+            log.warning("ask_user: race marking ask=%s answered", ask_id)
+            return None
+        fut = self._ask_futures.pop(ask_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result(user_text)
+        elif fut is None:
+            log.warning(
+                "ask_user: no future for ask=%s (daemon restart?)",
+                ask_id,
+            )
+        clipped = user_text.replace("\n", " ").strip()
+        if len(clipped) > 200:
+            clipped = clipped[:200] + "…"
+        note = (
+            f"relayed the user's answer {clipped!r} to task "
+            f"{task_id_short}. The user is NOT addressing you — they "
+            f"answered the task's question. Acknowledge briefly (one line, "
+            f"e.g. 'relayed.') or stay silent. Do not re-engage with the "
+            f"answer's content unless the user separately addresses you."
+        )
+        # Advance the queue: surface the next pending ask in the same note.
+        nxt = await self._db.next_pending_ask_for_chat(session_id)
+        if nxt is not None:
+            await self._db.mark_ask_presented(nxt["id"])
+            note += (
+                f" Next: task {nxt['task_id'][:8]} is asking "
+                f"(ask_id={nxt['id']}): {nxt['question']!r}. Relay this "
+                f"verbatim to the user."
+            )
+        return f"{AUTO_PING_PREFIX}{note}]"
 
     async def auto_ping(
         self, session_id: str, note: str, *,
@@ -1069,6 +1131,7 @@ class Operator:
                     result = await self._execute_tool(
                         session_id, tc["name"], args,
                         restricted_to_chat=restricted_to_chat,
+                        tool_calls_made=tool_calls_made,
                     )
                 except Exception as e:
                     log.exception("operator tool %s failed", tc["name"])
@@ -1659,6 +1722,7 @@ class Operator:
     async def _execute_tool(
         self, chat_session_id: str, name: str, args: dict[str, Any],
         *, restricted_to_chat: str | None = None,
+        tool_calls_made: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         # Hard guardrail: when the turn was triggered by the inbox-drain
         # autonomous-reply path, `restricted_to_chat` is the only chat this
@@ -1834,6 +1898,24 @@ class Operator:
             task = await self._db.get_task(tid)
             if task is None:
                 return {"error": "no such task"}
+            # Anti-spiral guard: refuse repeated polls in the same turn.
+            # The operator has been observed calling get_task_status 16x
+            # in a single turn waiting for a still-running task to finish.
+            # The orchestrator auto-pings on terminal state — there is
+            # zero value in polling. One call per turn is plenty.
+            already = sum(
+                1 for c in (tool_calls_made or [])
+                if c.get("name") == "get_task_status"
+            )
+            if already >= 1:
+                return {
+                    "error": (
+                        "do_not_poll: get_task_status was already called this "
+                        "turn. The orchestrator auto-pings you the moment the "
+                        "task terminates — there is no value in polling. End "
+                        "your turn with a short message to the user instead."
+                    ),
+                }
             events = await self._db.list_events(tid)
             latest_text = next(
                 (e["payload"].get("text", "") for e in reversed(events)

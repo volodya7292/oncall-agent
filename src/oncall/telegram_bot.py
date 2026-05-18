@@ -982,9 +982,7 @@ class TelegramBotService:
                 continue
             canonical = (payload.get("canonical_command") or "").strip()
             blast = (payload.get("blast_radius") or "").strip()
-            body = f"Approve this command?\n\n`{canonical}`"
-            if blast:
-                body += f"\n\n{blast}"
+            body = self._build_approval_body(canonical, blast)
             try:
                 await self._api.call("sendMessage", {
                     "chat_id": self._owner_user_id,
@@ -1141,10 +1139,15 @@ class TelegramBotService:
             if cq_id:
                 await self._safe_answer_callback(cq_id, "Unknown approval.")
             return
+        original_md = self._build_approval_body(
+            row.get("canonical_command") or "", row.get("blast_radius") or "",
+        )
         if row["state"] != "pending":
             if cq_id:
                 await self._safe_answer_callback(cq_id, "Already resolved.")
-            await self._maybe_edit_resolved(cq, row["decision"] or "?")
+            await self._maybe_edit_resolved(
+                cq, row["decision"] or "?", original_markdown=original_md,
+            )
             return
 
         phrase = row["challenge_phrase"] or ""
@@ -1163,7 +1166,7 @@ class TelegramBotService:
                 cq_id,
                 "Approved ✓" if approved else "Denied ✗",
             )
-        await self._maybe_edit_resolved(cq, outcome)
+        await self._maybe_edit_resolved(cq, outcome, original_markdown=original_md)
 
     async def _safe_answer_callback(self, callback_id: str, text: str) -> None:
         try:
@@ -1173,15 +1176,21 @@ class TelegramBotService:
         except Exception:
             log.exception("answerCallbackQuery failed")
 
-    async def _maybe_edit_resolved(self, cq: dict[str, Any], outcome: str) -> None:
+    async def _maybe_edit_resolved(
+        self, cq: dict[str, Any], outcome: str,
+        *, original_markdown: str | None = None,
+    ) -> None:
         """Strip the buttons off the original prompt + annotate the outcome
-        so the chat scrollback reflects what happened."""
+        so the chat scrollback reflects what happened. `original_markdown`
+        is the raw markdown source we sent (e.g. with `` ` ``-fenced code);
+        if omitted we fall back to Telegram's plain-text echo, which loses
+        all formatting — pass the source whenever it's available."""
         msg = cq.get("message") or {}
         chat_id = (msg.get("chat") or {}).get("id")
         message_id = msg.get("message_id")
-        original = msg.get("text") or ""
         if chat_id is None or message_id is None:
             return
+        original = original_markdown if original_markdown is not None else (msg.get("text") or "")
         marker = "✅ Approved" if outcome == "allow" else "❌ Denied"
         new_text = f"{original}\n\n_{marker}._"
         try:
@@ -1192,6 +1201,13 @@ class TelegramBotService:
             })
         except Exception:
             log.exception("editMessageText failed for resolved approval")
+
+    @staticmethod
+    def _build_approval_body(canonical: str, blast: str) -> str:
+        body = f"Approve this command?\n\n`{canonical.strip()}`"
+        if blast.strip():
+            body += f"\n\n{blast.strip()}"
+        return body
 
     # ---- send ----
 

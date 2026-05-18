@@ -72,14 +72,37 @@ class Lifecycle:
 
     async def recover(self) -> None:
         """On boot, re-spawn any tasks left in {running, awaiting_approval},
-        and sweep orphaned approvals — pending approval rows whose parent
-        task already transitioned to a terminal state (failed/killed/
-        completed) and will never decide them. Without the sweep, /status
-        would show 'Approvals pending: N' forever for those orphans."""
+        re-surface any pending approvals so the operator's bot UI shows
+        them again (the in-memory event bus + button keyboards were lost
+        on shutdown), and sweep orphans whose parent already terminated."""
         alive = await self.db.list_tasks_in_states(TaskState.RUNNING, TaskState.AWAITING_APPROVAL)
         for task in alive:
             log.info("recovering task %s (state=%s)", task.id, task.state)
             self._spawn(task, resuming=True)
+        # Re-publish approval.requested for any pending approval whose
+        # parent task we just recovered. The broker also re-publishes on
+        # the reattach path when claude --resume re-calls the approve
+        # tool, but that depends on the CLI's resume behavior; this
+        # ensures the bot UI re-surfaces the keyboard regardless.
+        alive_ids = {t.id for t in alive}
+        try:
+            for approval in await self.db.list_pending_approvals():
+                if approval.task_id not in alive_ids:
+                    continue
+                await self.events.publish(approval.task_id, "approval.requested", {
+                    "approval_id": str(approval.id),
+                    "tool_name": approval.tool_name,
+                    "canonical_command": approval.canonical_command,
+                    "blast_radius": approval.blast_radius,
+                    "challenge_phrase": approval.challenge_phrase,
+                    "reattach": True,
+                })
+                log.info(
+                    "recover: re-published approval.requested approval=%s task=%s",
+                    approval.id, approval.task_id,
+                )
+        except Exception:
+            log.exception("recover: re-publish of pending approvals failed")
         await self._sweep_orphan_approvals()
 
     async def _sweep_orphan_approvals(self) -> None:
@@ -160,8 +183,19 @@ class Lifecycle:
         return True
 
     async def shutdown(self) -> None:
-        for task_id in list(self.running.keys()):
-            await self.kill(task_id, reason="shutdown")
+        """Graceful daemon shutdown: cancel the in-process runners but
+        LEAVE task state alone in the DB. On the next boot, recover()
+        sees these as RUNNING/AWAITING_APPROVAL and re-spawns them via
+        claude --resume. The broker's (session_id, tool_use_id) dedup
+        re-attaches any in-flight approvals."""
+        for task_id, rt in list(self.running.items()):
+            rt.runner.cancel()
+            try:
+                await rt.runner
+            except (asyncio.CancelledError, Exception):
+                pass
+            self.running.pop(task_id, None)
+            log.info("shutdown: cancelled runner for task %s (state preserved for resume)", task_id)
 
     # ---- internals ----
 

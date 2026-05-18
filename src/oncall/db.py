@@ -211,6 +211,25 @@ CREATE TABLE IF NOT EXISTS dm_allowlist (
     chat_id TEXT PRIMARY KEY,
     added_at TEXT NOT NULL
 );
+
+-- Executor's `ask_user` tool: long-poll question from an executor task,
+-- relayed by the operator to the human. The HTTP proxy parks on an
+-- in-memory Future keyed by id; this table is the durable record (also
+-- used to enforce per-chat queue ordering — only one "presented" ask
+-- per chat at a time).
+CREATE TABLE IF NOT EXISTS ask_requests (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    chat_session_id TEXT NOT NULL,
+    question TEXT NOT NULL,
+    answer TEXT,
+    state TEXT NOT NULL,  -- pending | presented | answered | cancelled
+    created_at TEXT NOT NULL,
+    presented_at TEXT,
+    answered_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ask_requests_chat_state
+  ON ask_requests(chat_session_id, state);
 """
 
 
@@ -912,6 +931,77 @@ class Database:
             "SELECT chat_id, added_at FROM dm_allowlist ORDER BY added_at",
         )).fetchall()
         return [{"chat_id": r["chat_id"], "added_at": r["added_at"]} for r in rows]
+
+    # ---- ask_user (executor → human via operator) ----
+
+    async def create_ask_request(
+        self, *, ask_id: str, task_id: str, chat_session_id: str, question: str,
+    ) -> None:
+        await self.conn.execute(
+            "INSERT INTO ask_requests (id, task_id, chat_session_id, question, "
+            "state, created_at) VALUES (?, ?, ?, ?, 'pending', ?)",
+            (ask_id, task_id, chat_session_id, question, iso(utcnow())),
+        )
+        await self.conn.commit()
+
+    async def get_ask_request(self, ask_id: str) -> dict[str, Any] | None:
+        row = await (await self.conn.execute(
+            "SELECT * FROM ask_requests WHERE id = ?", (ask_id,),
+        )).fetchone()
+        return dict(row) if row else None
+
+    async def has_presented_ask_for_chat(self, chat_session_id: str) -> bool:
+        row = await (await self.conn.execute(
+            "SELECT 1 FROM ask_requests WHERE chat_session_id = ? "
+            "AND state = 'presented' LIMIT 1",
+            (chat_session_id,),
+        )).fetchone()
+        return row is not None
+
+    async def get_presented_ask_for_chat(self, chat_session_id: str) -> dict[str, Any] | None:
+        row = await (await self.conn.execute(
+            "SELECT * FROM ask_requests WHERE chat_session_id = ? "
+            "AND state = 'presented' ORDER BY presented_at ASC LIMIT 1",
+            (chat_session_id,),
+        )).fetchone()
+        return dict(row) if row else None
+
+    async def next_pending_ask_for_chat(self, chat_session_id: str) -> dict[str, Any] | None:
+        row = await (await self.conn.execute(
+            "SELECT * FROM ask_requests WHERE chat_session_id = ? "
+            "AND state = 'pending' ORDER BY created_at ASC LIMIT 1",
+            (chat_session_id,),
+        )).fetchone()
+        return dict(row) if row else None
+
+    async def mark_ask_presented(self, ask_id: str) -> None:
+        await self.conn.execute(
+            "UPDATE ask_requests SET state = 'presented', presented_at = ? "
+            "WHERE id = ? AND state = 'pending'",
+            (iso(utcnow()), ask_id),
+        )
+        await self.conn.commit()
+
+    async def mark_ask_answered(self, ask_id: str, answer: str) -> bool:
+        cur = await self.conn.execute(
+            "UPDATE ask_requests SET state = 'answered', answer = ?, "
+            "answered_at = ? WHERE id = ? AND state IN ('pending', 'presented')",
+            (answer, iso(utcnow()), ask_id),
+        )
+        await self.conn.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def cancel_stale_asks(self) -> int:
+        """Mark every non-terminal ask as cancelled. Run on startup — the
+        executor processes that owned the in-flight futures died with
+        the previous daemon, so the rows are orphans."""
+        cur = await self.conn.execute(
+            "UPDATE ask_requests SET state = 'cancelled', answered_at = ? "
+            "WHERE state IN ('pending', 'presented')",
+            (iso(utcnow()),),
+        )
+        await self.conn.commit()
+        return cur.rowcount or 0
 
     async def get_inbox_message(self, inbox_id: str) -> dict[str, Any] | None:
         row = await (await self.conn.execute(

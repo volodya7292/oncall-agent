@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from typing import Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel
@@ -92,6 +92,11 @@ class BrokerDecideBody(BaseModel):
     tool_use_id: str
     tool_name: str
     tool_input: dict[str, Any]
+
+
+class AskUserBody(BaseModel):
+    session_id: str  # executor's session_id (resolves to its task → chat)
+    question: str
 
 
 class MemoryOpBody(BaseModel):
@@ -249,12 +254,14 @@ def create_app() -> FastAPI:
                 hybrid_alpha=settings.oncall_memory_hybrid_alpha,
                 hybrid_beta=settings.oncall_memory_hybrid_beta,
             )
+            ask_futures: dict[str, asyncio.Future[str]] = {}
             operator = Operator(
                 db=db, lifecycle=lifecycle, broker=broker,
                 settings=settings, paths=paths, llm=llm,
                 memory=memory,
                 telegram=telegram,
                 events=events,
+                ask_futures=ask_futures,
                 extract_llm=llm,  # share the gateway client; extractor uses
                                   # the configured cheap model via Settings
                 runner=cli_runner,
@@ -284,6 +291,16 @@ def create_app() -> FastAPI:
         app.state.memory = memory
         app.state.telegram = telegram
         app.state.telegram_bot = telegram_bot
+        app.state.ask_futures = ask_futures if operator is not None else {}
+        # Orphaned asks from a previous run cannot be resolved (the
+        # executor processes that owned the futures died with the
+        # daemon). Cancel them so they don't sit at queue heads forever.
+        try:
+            n = await db.cancel_stale_asks()
+            if n:
+                log.info("cancelled %d stale ask_requests from previous run", n)
+        except Exception:
+            log.exception("ask_user: cancel_stale_asks on startup failed")
         # Recover any tasks left running / awaiting_approval from a prior
         # orchestrator process. The CLI's session JSONL is on disk; we
         # re-spawn with --resume and the broker's (session_id, tool_use_id)
@@ -1288,6 +1305,52 @@ def _register_routes(app: FastAPI) -> None:
                 raise HTTPException(500, f"{type(e).__name__}: {e}")
             return {"saved": written}
         raise HTTPException(400, f"unknown op {body.op!r}")
+
+    @app.post("/internal/ask_user", dependencies=[Depends(verify_loopback)])
+    async def ask_user(body: AskUserBody, request: Request) -> dict[str, Any]:
+        """Long-poll: executor asks a question, blocks until human answers."""
+        operator: Operator | None = request.app.state.operator
+        db: Database = request.app.state.db
+        ask_futures: dict[str, asyncio.Future[str]] = request.app.state.ask_futures
+        if operator is None:
+            raise HTTPException(503, "operator not configured")
+        question = (body.question or "").strip()
+        if not question:
+            raise HTTPException(400, "question required")
+        task = await db.get_task_by_session(body.session_id)
+        if task is None:
+            raise HTTPException(404, "task not found for session_id")
+        chat_session_id = task.chat_session_id
+        if not chat_session_id:
+            raise HTTPException(409, "task has no chat_session_id; cannot ask")
+        ask_id = str(uuid4())
+        await db.create_ask_request(
+            ask_id=ask_id, task_id=str(task.id),
+            chat_session_id=chat_session_id, question=question,
+        )
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[str] = loop.create_future()
+        ask_futures[ask_id] = fut
+        # If nothing else is currently presented in this chat, surface this
+        # one. Otherwise it stays pending and the operator picks it up after
+        # the current ask resolves (see respond_to_task).
+        if not await db.has_presented_ask_for_chat(chat_session_id):
+            await db.mark_ask_presented(ask_id)
+            note = (
+                f"task {str(task.id)[:8]} is asking: {question!r}. "
+                f"Relay this question to the user verbatim. The user's next "
+                f"message in this chat will be auto-relayed back to the "
+                f"task — no tool call needed."
+            )
+            try:
+                await operator.auto_ping(session_id=chat_session_id, note=note)
+            except Exception:
+                log.exception("ask_user: initial auto_ping failed")
+        try:
+            answer = await fut
+        finally:
+            ask_futures.pop(ask_id, None)
+        return {"ask_id": ask_id, "answer": answer}
 
     # ---- Operator / chat ----
 

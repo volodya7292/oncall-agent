@@ -164,6 +164,7 @@ class Supervisor:
             "--setting-sources", "project",  # only our executor/settings.json, not user-level
             "--permission-mode", "default",
             "--permission-prompt-tool", "mcp__oncall__approve",
+            "--effort", "medium",
             "--append-system-prompt", self._paths.executor_prompt.read_text(encoding="utf-8"),
             "--no-session-persistence",
         ]
