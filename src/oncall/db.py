@@ -217,6 +217,17 @@ CREATE TABLE IF NOT EXISTS dm_allowlist (
 -- in-memory Future keyed by id; this table is the durable record (also
 -- used to enforce per-chat queue ordering — only one "presented" ask
 -- per chat at a time).
+-- Per-task allowlist of directories the user pre-approved Write into.
+-- Populated when the user taps "Yes (and folder)" on a Write-tool approval
+-- card; subsequent Write calls to files under any allowed dir auto-allow.
+-- Scope is per-task on purpose: when the task ends the trust ends.
+CREATE TABLE IF NOT EXISTS task_write_dir_allowlist (
+    task_id TEXT NOT NULL,
+    dir TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, dir)
+);
+
 CREATE TABLE IF NOT EXISTS ask_requests (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,
@@ -931,6 +942,23 @@ class Database:
             "SELECT chat_id, added_at FROM dm_allowlist ORDER BY added_at",
         )).fetchall()
         return [{"chat_id": r["chat_id"], "added_at": r["added_at"]} for r in rows]
+
+    # ---- per-task Write-dir allowlist ----
+
+    async def allow_write_dir(self, task_id: str, dir_path: str) -> None:
+        await self.conn.execute(
+            "INSERT OR IGNORE INTO task_write_dir_allowlist "
+            "(task_id, dir, added_at) VALUES (?, ?, ?)",
+            (task_id, dir_path, iso(utcnow())),
+        )
+        await self.conn.commit()
+
+    async def list_write_dirs(self, task_id: str) -> list[str]:
+        rows = await (await self.conn.execute(
+            "SELECT dir FROM task_write_dir_allowlist WHERE task_id = ?",
+            (task_id,),
+        )).fetchall()
+        return [r["dir"] for r in rows]
 
     # ---- ask_user (executor → human via operator) ----
 

@@ -184,6 +184,35 @@ class Broker:
             ))
             return PermissionResult(behavior="allow", updatedInput=tool_input)
 
+        # Pre-approved Write directory: if the user previously tapped
+        # "Yes (and folder)" on a Write approval, any subsequent Write to
+        # a file under that dir auto-allows for this task only.
+        if (
+            verdict.kind == ClassifierVerdict.MUTATING
+            and tool_name == "Write"
+        ):
+            fp = str(tool_input.get("file_path") or "")
+            if fp:
+                import os.path as _osp
+                parent = _osp.dirname(_osp.abspath(fp))
+                allowed_dirs = await self._db.list_write_dirs(str(task.id))
+                for d in allowed_dirs:
+                    da = _osp.abspath(d)
+                    if parent == da or parent.startswith(da + _osp.sep):
+                        await self._db.record_auto_approval(req, "allow", "auto:pre_approved_write_dir")
+                        await self._publish(task.id, "approval.resolved", {
+                            "approval_id": str(req_id),
+                            "auto": True,
+                            "decision": "allow",
+                            "tool_name": tool_name,
+                            "canonical": verdict.canonical,
+                        })
+                        broker_log.info("decide " + fmt(
+                            event="auto_allow_write_dir", task=str(task.id),
+                            tool=tool_name, file=fp, allowed_dir=d,
+                        ))
+                        return PermissionResult(behavior="allow", updatedInput=tool_input)
+
         if verdict.kind == ClassifierVerdict.CATASTROPHIC:
             await self._db.record_auto_approval(req, "deny", verdict.reason or "catastrophic")
             await self._publish(task.id, "approval.resolved", {

@@ -982,18 +982,25 @@ class TelegramBotService:
                 continue
             canonical = (payload.get("canonical_command") or "").strip()
             blast = (payload.get("blast_radius") or "").strip()
+            tool_name = (payload.get("tool_name") or "").strip()
             body = self._build_approval_body(canonical, blast)
+            keyboard = [[
+                {"text": "✅ Yes", "callback_data": f"appr:{approval_id}:allow"},
+                {"text": "❌ No",  "callback_data": f"appr:{approval_id}:deny"},
+            ]]
+            # Write-tool extras: a second row with "Yes + folder" lets the
+            # user pre-approve every future Write under the same parent dir
+            # for this task. Saves repeated taps on multi-file rewrites.
+            if tool_name == "Write":
+                keyboard.append([
+                    {"text": "✅ Yes + folder", "callback_data": f"appr:{approval_id}:allow_parent"},
+                ])
             try:
                 await self._api.call("sendMessage", {
                     "chat_id": self._owner_user_id,
                     "text": escape_v2(body),
                     "parse_mode": "MarkdownV2",
-                    "reply_markup": {
-                        "inline_keyboard": [[
-                            {"text": "✅ Yes", "callback_data": f"appr:{approval_id}:allow"},
-                            {"text": "❌ No",  "callback_data": f"appr:{approval_id}:deny"},
-                        ]],
-                    },
+                    "reply_markup": {"inline_keyboard": keyboard},
                 })
                 telegram_log.info("bot approval prompt " + fmt(
                     session=self._session_id, approval=approval_id,
@@ -1113,7 +1120,7 @@ class TelegramBotService:
                 await self._safe_answer_callback(cq_id, "Unknown action.")
             return
         decision = parts[2]
-        if decision not in {"allow", "deny"}:
+        if decision not in {"allow", "deny", "allow_parent"}:
             if cq_id:
                 await self._safe_answer_callback(cq_id, "Bad decision.")
             return
@@ -1150,10 +1157,31 @@ class TelegramBotService:
             )
             return
 
+        # allow_parent is just an allow that ALSO records the parent
+        # directory of the Write target into the per-task allowlist.
+        if decision == "allow_parent":
+            import json as _json
+            try:
+                tool_input = _json.loads(row.get("tool_input_json") or "{}")
+            except Exception:
+                tool_input = {}
+            fp = str((tool_input or {}).get("file_path") or "")
+            if row.get("tool_name") == "Write" and fp:
+                import os.path as _osp
+                parent = _osp.dirname(_osp.abspath(fp))
+                if parent:
+                    await self._db.allow_write_dir(str(row["task_id"]), parent)
+                    telegram_log.info("bot approval allow_parent " + fmt(
+                        approval=approval_id_str, task=row["task_id"],
+                        dir=parent,
+                    ))
+            broker_decision = "allow"
+        else:
+            broker_decision = decision
         phrase = row["challenge_phrase"] or ""
         approved, matched = await self._broker.submit_response(
             approval_id=approval_uuid,
-            decision=decision,
+            decision=broker_decision,
             challenge_phrase_supplied=phrase,
         )
         outcome = "allow" if approved else "deny"
