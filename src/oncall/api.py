@@ -865,10 +865,10 @@ async def _build_startup_status(
     stale_memories: int = 0,
 ) -> str:
     """Compose the startup ping. On a fully clean boot it's just one line —
-    `✅ oncall up`. Anything degraded gets its own ⚠️ line; informational
+    `🔧 oncall up`. Anything degraded gets its own ⚠️ line; informational
     follow-ups (recovered tasks, pending rebuild) get a ↻ line. The signal
     a user scans for is *whether there's anything below the headline*."""
-    lines: list[str] = ["✅ oncall up"]
+    lines: list[str] = ["🔧 oncall up"]
     if operator is None:
         lines.append("⚠️ operator: NOT configured (no LLM key)")
     if is_ollama_model(settings.oncall_memory_embed_model):
@@ -915,7 +915,7 @@ async def _rebuild_memory_then_notify(
         )
     else:
         await telegram_bot.notify_owner(
-            f"✅ memory rebuilt: {rebuilt} row(s) re-embedded with {model}"
+            f"🔧 memory rebuilt: {rebuilt} row(s) re-embedded with {model}"
         )
 
 
