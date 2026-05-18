@@ -75,6 +75,12 @@ class Supervisor:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            # claude emits MCP tool_results as one JSON line per result.
+            # `read_image` carries the photo as inline base64; a multi-MB
+            # image blows past asyncio's 64KB default StreamReader limit
+            # and crashes the supervisor with LimitOverrunError. Cap is
+            # 10MB on the MCP side; base64 + JSON overhead → use 32MB.
+            limit=32 * 1024 * 1024,
             # Inherit the orchestrator's cwd. When `oncall api` is launched
             # from a project dir, claude operates there. As a global tool the
             # user picks the working directory by `cd`ing before starting.

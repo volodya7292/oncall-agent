@@ -200,7 +200,7 @@ async def test_dispatch_task_via_operator_tool(stack):
     """Operator calls dispatch_task → lifecycle.submit_task is invoked."""
     llm = ScriptedLLM(script=[
         # turn 1: call dispatch_task with the right args
-        [("dispatch_task", {"prompt": "check staging health", "model": "haiku"})],
+        [("dispatch_task", {"prompt": "check staging health", "model": "sonnet"})],
         # turn 2 (after tool result): final text answer
         "Started task. I'll let you know when it's done.",
     ])
@@ -223,7 +223,7 @@ async def test_dispatch_task_via_operator_tool(stack):
 
     assert submitted, "dispatch_task did not reach lifecycle"
     assert submitted[0]["prompt"] == "check staging health"
-    assert submitted[0]["model"] == "haiku"
+    assert submitted[0]["model"] == "sonnet"
     assert "Started task" in result.text
 
     # Cancel the spawned task to keep the test loop clean.
@@ -1595,7 +1595,7 @@ async def test_restricted_dispatch_task_defers_and_publishes_event(stack):
     await asyncio.sleep(0)  # let the subscriber attach
 
     llm = ScriptedLLM(script=[
-        [("dispatch_task", {"prompt": "grep alex's project for X", "model": "haiku"})],
+        [("dispatch_task", {"prompt": "grep alex's project for X", "model": "sonnet"})],
         "",  # operator emits empty content after the deferred dispatch
     ])
     operator = Operator(
@@ -1652,7 +1652,7 @@ async def test_resolve_dispatch_approval_allow_spawns_with_restriction(stack):
     )
     await stack["db"].create_pending_dispatch(
         dispatch_id="d1", chat_session_id="s_lock",
-        prompt="check staging", model="haiku",
+        prompt="check staging", model="sonnet",
         restricted_to_chat="111",
     )
     out = await operator.resolve_dispatch_approval("d1", "allow")
@@ -1688,7 +1688,7 @@ async def test_resolve_dispatch_approval_deny_does_not_spawn(stack):
     )
     await stack["db"].create_pending_dispatch(
         dispatch_id="d2", chat_session_id="s_lock",
-        prompt="check staging", model="haiku",
+        prompt="check staging", model="sonnet",
         restricted_to_chat="111",
     )
     out = await operator.resolve_dispatch_approval("d2", "deny")

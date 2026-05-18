@@ -316,7 +316,6 @@ class TelegramService:
         the counterparty's messages would teach the model the wrong voice."""
         entity = _entity_arg(chat_id)
         samples: list[dict[str, Any]] = []
-        # telethon's iter_messages is async-iterable
         async for msg in self._client.iter_messages(
             entity, limit=limit, from_user="me",
         ):
@@ -603,6 +602,45 @@ class TelegramService:
         name = (getattr(f, "name", None) if f else None) or ""
         return data, mime, name
 
+    async def transcribe_voice(
+        self, chat_id: str, message_id: str, *, max_wait_s: int = 20,
+    ) -> dict[str, Any]:
+        """Transcribe a voice / audio message via Telegram's premium
+        transcription API (`messages.transcribeAudio`). Requires the
+        userbot account to have Telegram Premium.
+
+        Returns `{text, pending}`. `pending=True` means the server is
+        still working — we already polled up to `max_wait_s` seconds in
+        ~2s intervals; the caller can choose to retry later or work
+        with the partial text we have (Telegram streams partial
+        transcripts as they finalize). Raises ValueError on a bad
+        message id or RPC error (e.g. message has no voice/audio,
+        Premium not active, peer not found)."""
+        from telethon.tl.functions.messages import TranscribeAudioRequest  # type: ignore
+        try:
+            msg_id_int = int(str(message_id).strip())
+        except (TypeError, ValueError):
+            raise ValueError(f"invalid message_id: {message_id!r}")
+        entity = _entity_arg(chat_id)
+        deadline = time.monotonic() + max_wait_s
+        text = ""
+        pending = True
+        while True:
+            try:
+                resp = await self._client(
+                    TranscribeAudioRequest(peer=entity, msg_id=msg_id_int),
+                )
+            except Exception as e:
+                raise ValueError(f"{type(e).__name__}: {e}") from e
+            text = getattr(resp, "text", "") or ""
+            pending = bool(getattr(resp, "pending", False))
+            if not pending:
+                break
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(2.0)
+        return {"text": text, "pending": pending}
+
     async def reply_to_chat(
         self, chat_id: str, text: str,
     ) -> dict[str, Any]:
@@ -651,12 +689,23 @@ class TelegramService:
 
 def _media_placeholder(msg: Any) -> str:
     """Synthetic body for a media-only Telegram message (no caption). The
-    operator sees this in `read_chat` / `search_messages` results alongside
-    the real `message_id`, then calls `read_image(chat_id, message_id)` to
-    actually load the bytes. Without this the message was invisible —
-    `get_chat_history` filtered it out as `if not text: continue`, leaving
-    the model to guess at nearby ids (which usually pointed at a sibling
-    text message with no media)."""
+    operator sees this in `op=history` results alongside the real
+    `message_id` and routes accordingly: `read_image` for photos,
+    `transcribe` for voice/voice-notes. Voice notes get a duration in
+    the placeholder so the model can decide whether to bother
+    transcribing (a 1-second blip is usually noise; a 30-second message
+    almost always carries content)."""
+    # Voice notes first — telethon exposes `.voice` only for proper voice
+    # messages (DocumentAttributeAudio.voice=True), not for music files.
+    voice = getattr(msg, "voice", None)
+    if voice is not None:
+        duration = _audio_duration(voice)
+        return f"[voice: {duration}s]" if duration is not None else "[voice]"
+    # Non-voice audio (music / forwarded files).
+    audio = getattr(msg, "audio", None)
+    if audio is not None:
+        duration = _audio_duration(audio)
+        return f"[audio: {duration}s]" if duration is not None else "[audio]"
     f = getattr(msg, "file", None)
     mime = getattr(f, "mime_type", None) if f else None
     name = getattr(f, "name", None) if f else None
@@ -672,6 +721,21 @@ def _media_placeholder(msg: Any) -> str:
     if mime:
         return f"[file: {mime}]"
     return "[attachment]"
+
+
+def _audio_duration(doc: Any) -> int | None:
+    """Pull the duration (seconds) from a Telegram Document's audio
+    attribute. Returns None if the document has no audio attribute or
+    no duration field."""
+    try:
+        from telethon.tl.types import DocumentAttributeAudio  # type: ignore
+    except Exception:
+        return None
+    for attr in getattr(doc, "attributes", None) or []:
+        if isinstance(attr, DocumentAttributeAudio):
+            d = getattr(attr, "duration", None)
+            return int(d) if d is not None else None
+    return None
 
 
 def _display_name(sender: Any) -> str | None:

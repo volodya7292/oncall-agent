@@ -55,7 +55,7 @@ DISPATCH_TOOL = types.Tool(function_declarations=[
             type="OBJECT",
             properties={
                 "prompt": types.Schema(type="STRING"),
-                "model": types.Schema(type="STRING", enum=["haiku", "sonnet", "opus"]),
+                "model": types.Schema(type="STRING", enum=["sonnet", "opus"]),
             },
             required=["prompt"],
         ),

@@ -17,7 +17,7 @@ The classifier is the universal gate — it doesn't care whether a command is lo
 **Voice is deferred.** It will live as a thin client on top of the agent (e.g., an Android app calling the agent over HTTPS). The current focus is **the agent API and its safety core**. Telephony/STT/TTS is out of scope for this iteration — design with a clean "voice gateway" interface so it can be bolted on later without architectural changes.
 
 ### Core architectural commitments (decided)
-- **Two-tier agent split: operator + executor.** The user talks to a **operator** (Gemma via Ollama, local) — fast, cheap, conversational. The operator never executes infrastructure work; its only side-effecting capability is *dispatching a task to the executor*. The **executor** is the `claude` CLI, spawned per task, doing actual work under the broker's gate. The user never talks to Claude directly. Rationale: cost (most utterances don't need a frontier model), latency (local Gemma is ~tens of ms; CLI spin-up is seconds), and blast-radius isolation (a prompt-injected operator still can't bypass the broker, because the broker is downstream of Claude, not of the operator). Challenge-phrase generation, matching, and kill-phrase detection live in the orchestrator — never in the operator.
+- **Two-tier agent split: operator + executor.** The user talks to an **operator** — a small fast model (cloud Gemini in production, configurable). The operator is a *low-latency conversation agent only*: it acks, asks clarifying questions, presents results, and saves/recalls memory. It has NO direct external connections — no Telegram reads, no shell, no file IO, no DB queries beyond its own memory store. The only side-effecting capability is *dispatching a task to the executor* (and the small number of typed dispatch variants like `dispatch_dm_send` for memory- or user-authorized Telegram replies). The **executor** is the `claude` CLI, spawned per task — the intelligent tool-calling layer that does the actual work (reading chat history, running shell, writing code) under the broker's gate. Anything that requires touching the outside world goes through the executor. The user never talks to Claude directly. Rationale: cost (most utterances don't need a frontier model), latency (a small model replying to "ok thanks" is ~hundreds of ms; CLI spin-up is seconds, acceptable for actual work), and blast-radius isolation (a prompt-injected operator still can't bypass the broker, because the broker is downstream of Claude, not of the operator; the operator can't even *do* anything without dispatching). Challenge-phrase generation, matching, and kill-phrase detection live in the orchestrator — never in the operator.
 - **One chokepoint, deterministic.** Every tool call the *executor* wants to make goes through a permission broker. Built on the `claude` CLI's `--permission-prompt-tool` hook. Pipeline: deny rules → mode → allow rules → broker callback.
 - **Classification is deterministic, not model-driven.** The broker parses commands against an allowlist. Bare `cat / ls / grep / git status / SELECT / kubectl get` and similar are read-only and auto-run. Anything not provably read-only is mutating and escalates. Unknown = mutating. The model proposes; a dumb gate disposes.
 - **Approval contract.** When escalation is needed, the agent emits a *canonical, minimal* description of the exact command and its blast radius, then demands a **challenge phrase**, not a bare "yes." Default-deny on timeout, ambiguity, or low-confidence input. High-priority kill phrase ("stop everything") hard-aborts running tool calls. N consecutive denials → agent stops and notifies, doesn't loop.
@@ -28,7 +28,7 @@ The classifier is the universal gate — it doesn't care whether a command is lo
 
 ### Stack decisions (decided)
 - **Language:** Python (uv-managed) for the orchestrator/API/MCP/operator layer.
-- **Operator runtime: Ollama-hosted Gemma**, local. Default model `gemma3:latest` (user said "gemma4" — Gemma 4 isn't a widely-released ID yet; the model is a config knob via `ONCALL_OPERATOR_MODEL`, swap freely). HTTP `/api/chat` with tool-calling. Operator handles dialogue, status questions, reading inbox, dispatching tasks, presenting approvals.
+- **Operator runtime:** small fast model with tool-calling. Production uses Gemini via the Vercel AI Gateway; the backend is a config knob (`ONCALL_OPERATOR_*`). The operator's job is the conversational surface only: ack, clarify, present approvals, save/recall memory, and dispatch tasks. It does NOT touch Telegram, shell, files, or any external resource directly — that all goes through the executor.
 - **Executor runtime: the `claude` CLI, NOT the Agent SDK.** The orchestrator spawns `claude` as a subprocess per task with `--print --output-format stream-json --input-format stream-json`, parses streaming JSON events, and supervises session lifecycle via `--session-id` / `--resume`. Rationale per user directive (2026-05-16): fewer dependencies, no SDK version drift, the CLI already implements the full permission pipeline.
 - **Permission chokepoint = CLI flags.** Deterministic gate is `.claude/settings.json` `permissions.deny` + `permissions.allow` + `--permission-mode`. The escalation hook is `--permission-prompt-tool mcp__oncall__approve`, pointing at an MCP tool we own (the broker). That MCP tool implements the read-back / challenge-phrase contract.
 - **MCP servers we provide** (registered inline via `--mcp-config <json>` at spawn time by the supervisor): `oncall` (the approval broker + `messenger_inbox`). Built-in CLI tools (Bash, Read, Edit, Write, Grep, Glob, WebFetch) are used directly with the allow/deny rules; mutations route through the broker via `--permission-prompt-tool`. SSH and DB access happen via Bash (`ssh …`, `psql -c …`) under the same classifier rules as everything else.
@@ -62,16 +62,19 @@ The classifier is the universal gate — it doesn't care whether a command is lo
 [ user (Telegram bot — primary; HTTP for future clients) ]
         │
         ▼
-[ Operator — Gemma via Ollama ]   ← local, conversational, cannot touch infra
-        │ operator-tools (HTTP into orchestrator)
+[ Operator — small fast model ]   ← conversational shell only; no external IO
+        │ trivial tools: dispatch_task / dispatch_dm_send / memory / approval-relay
         ▼
 [ Orchestrator (FastAPI + SQLite + broker + event bus) ]
-        │ spawns claude per task
+        │ spawns claude per dispatched task
         ▼
-[ claude CLI subprocess ]   ← per-task; gated by broker
+[ Executor: claude CLI subprocess ]   ← intelligent tool-calling; gated by broker
         │ stdio MCP
         ▼
 [ oncall MCP server ]   ← child of claude; proxies to orchestrator over loopback
+        │
+        ▼
+[ Telegram / shell / files / web / DB ]   ← all external resources reached here
 ```
 
 The Telegram bot (`telegram_bot.py`) is the primary user-facing client; it's just one of several possible HTTP clients of the orchestrator. A future Android phone app or third-party voice gateway plugs in at the same `POST /chat` + SSE seam. The orchestrator knows nothing about who's driving it.
@@ -322,13 +325,11 @@ Operator can't bypass this even if fully prompt-injected.
 
 | Task class | Model | Rationale |
 |---|---|---|
-| Reply to a DM / draft a short message | `haiku` | Short text generation, low context. Cheap & fast. |
-| Quick infra check ("is the staging API healthy?") | `haiku` | A few read-only commands, short reasoning. |
-| Investigate a bug / read logs / RCA | `sonnet` | Moderate context, multi-step reasoning. Default tier. |
+| Reply to a DM / quick infra check / investigation / RCA | `sonnet` | Default tier. The operator (Gemini) already handles cheap chat directly — anything spawning a task is something the operator couldn't do itself, so instruction-following and judgement matter, and sonnet is the floor. |
 | Coding (write a fix, create an MR) | `opus` (high effort) | Hard task: lots to keep in mind. Worth the cost. |
 | Multi-host migration / risky ops | `opus` | High blast radius — pay for the best reasoning. |
 
-The operator system prompt encodes this table. Gemma is told: *if you're unsure of the tier, default to `sonnet`. If the user says "carefully" or "this is risky" or "write code," upgrade to `opus`. If the task is a one-shot lookup or a short reply, use `haiku`.* `dispatch_task` takes `(prompt, model, budget_usd?, task_class?)` — the `task_class` is just a label for the audit log.
+The operator system prompt encodes this: *default to `sonnet`; upgrade to `opus` when the user says "carefully" / "this is risky" / "write code".* `dispatch_task` takes `(prompt, model, budget_usd?, task_class?)` — the `task_class` is just a label for the audit log.
 
 **Ollama interaction.** HTTP `POST {ONCALL_OLLAMA_URL}/api/chat` with `model`, `messages`, `tools`, `stream=false` (MVP — switch to streaming for voice later). Tool-calling via Ollama's native `tools` parameter (supported by Gemma 3 in recent Ollama).
 
@@ -358,7 +359,7 @@ The operator system prompt encodes this table. Gemma is told: *if you're unsure 
 **Inbound messenger flow — reply-by-proposal.** When a DM arrives:
 1. `messenger.received` event hits the operator.
 2. Operator triages: is the message important enough to interrupt the user? (Heuristic in operator prompt: people in a configured `important_senders` list, or keywords like "urgent" / "down" / "production" / explicit @mentions. Otherwise queue silently — the user picks it up later via `read_inbox`.)
-3. If important: operator drafts a proposed reply. For short replies, Gemma drafts it itself. For replies that need context the operator doesn't have (e.g., "the migration status" from yesterday's tasks), operator calls `dispatch_task(model="haiku", prompt="<original DM> + <relevant task summaries>; draft a reply.")` and waits for the result.
+3. If important: operator drafts a proposed reply. For short replies, Gemma drafts it itself. For replies that need context the operator doesn't have (e.g., "the migration status" from yesterday's tasks), operator calls `dispatch_task(model="sonnet", prompt="<original DM> + <relevant task summaries>; draft a reply.")` and waits for the result.
 4. Operator pushes a notification to the user: "DM from Alex says `<verbatim message>`. Proposed reply: `<draft>`. Say *approve* to send, *edit* to amend, or *ignore*."
 5. On user approval → `messenger_inbox` MCP tool with `op="send"` (mutating; goes through the broker like everything else, gets a challenge phrase for the actual send).
 6. On "edit" → user dictates changes; operator regenerates the draft; loops back to step 4.
@@ -689,7 +690,7 @@ Acceptance:
 - `test_operator.py` — with a fake `OllamaClient` returning canned tool calls: verify operator invokes the right orchestrator endpoints with the right args; verify it never tries to decide a challenge match itself; verify proactive notification on `approval.requested`.
 
 **Integration:**
-- `test_integration_e2e.py` — spawn orchestrator + real `claude` on ephemeral port. `--model haiku-4-5`, `--max-turns 3`, tight prompt that triggers exactly one mutating Bash. Side coroutine polls `/approvals/pending`, posts correct challenge phrase. Assert `state=completed`. Skip if `ANTHROPIC_API_KEY` unset.
+- `test_integration_e2e.py` — spawn orchestrator + real `claude` on ephemeral port. `--model sonnet`, `--max-turns 3`, tight prompt that triggers exactly one mutating Bash. Side coroutine polls `/approvals/pending`, posts correct challenge phrase. Assert `state=completed`. Skip if `ANTHROPIC_API_KEY` unset.
 - Operator integration test — same shape but `POST /chat` initially. Requires both `ANTHROPIC_API_KEY` and a running Ollama with the configured model.
 
 **E2E:** the milestone-1 and milestone-2 acceptance tests via `pytest -k acceptance`, plus a manual crash-recovery test documented in README.

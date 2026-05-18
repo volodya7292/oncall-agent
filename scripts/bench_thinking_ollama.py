@@ -44,7 +44,7 @@ TOOLS = [{
             "type": "object",
             "properties": {
                 "prompt": {"type": "string"},
-                "model": {"type": "string", "enum": ["haiku", "sonnet", "opus"]},
+                "model": {"type": "string", "enum": ["sonnet", "opus"]},
             },
             "required": ["prompt"],
         },

@@ -47,6 +47,13 @@ class Task(BaseModel):
     # executor calls via /internal/messenger are gated against this id —
     # cross-chat access is refused. None ⇒ no restriction.
     restricted_to_chat: str | None = None
+    # When set, the broker auto-allows `op=send` on
+    # `mcp__oncall__messenger_inbox` when the tool input's `chat_id`
+    # matches this value. Set by the operator's `dispatch_dm_send` after
+    # synchronous authority + DM-allowlist verification, so the send
+    # itself doesn't require a separate broker round-trip. None ⇒ normal
+    # mutating-tool challenge flow applies.
+    pre_approved_send_chat: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
     terminal_reason: TerminalReason | None = None

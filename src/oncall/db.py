@@ -35,6 +35,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Telegram chat the task is locked to (autonomous-reply lockdown).
     -- Migration adds this column on existing installs.
     restricted_to_chat TEXT,
+    -- Telegram chat the task is pre-authorized to op=send to. Broker
+    -- auto-allows op=send when chat_id matches. NULL = no pre-approval.
+    pre_approved_send_chat TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     terminal_reason TEXT
@@ -142,6 +145,20 @@ CREATE TABLE IF NOT EXISTS memory_dedup_skip_pairs (
     PRIMARY KEY (id_a, id_b)
 );
 
+-- Tracks which operator memories have already been surfaced as a
+-- `[memory note: ...]` user-role message in a chat session. Used to
+-- dedup memory injection across turns so the system prompt + chat
+-- history prefix stays stable (KV cache hits) and the model doesn't
+-- re-read the same memory text every turn. Reset on /clear; survives
+-- /compress (compressed history may have lost the verbatim memory text,
+-- but the model has been shown the fact at least once).
+CREATE TABLE IF NOT EXISTS session_memory_shown (
+    session_id TEXT NOT NULL,
+    memory_id INTEGER NOT NULL,
+    shown_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, memory_id)
+);
+
 -- Inbox rows the auto-drain has shown to the operator. Decoupled from
 -- `messenger_inbox.read_at` because a silent triage outcome (operator
 -- chose STAY SILENT) does NOT mark the row read — the user still needs to
@@ -220,6 +237,11 @@ class Database:
         # so we swallow that specific case.
         await self._migrate_add_column("tasks", "result_summary", "TEXT")
         await self._migrate_add_column("tasks", "restricted_to_chat", "TEXT")
+        # Set when the operator dispatches a task that's pre-authorized to
+        # send to a specific Telegram chat (memory-authorized auto-reply or
+        # user-approved draft). Broker auto-allows op=send when the input
+        # chat_id matches this column. NULL means no pre-approval.
+        await self._migrate_add_column("tasks", "pre_approved_send_chat", "TEXT")
         await self._migrate_add_column(
             "operator_memories", "model", "TEXT NOT NULL DEFAULT ''",
         )
@@ -251,9 +273,9 @@ class Database:
             """
             INSERT INTO tasks (id, session_id, state, prompt, model, max_turns,
                                consecutive_denials, dispatched_by_chat_session,
-                               restricted_to_chat,
+                               restricted_to_chat, pre_approved_send_chat,
                                created_at, updated_at, terminal_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(task.id),
@@ -265,6 +287,7 @@ class Database:
                 task.consecutive_denials,
                 task.dispatched_by_chat_session,
                 task.restricted_to_chat,
+                task.pre_approved_send_chat,
                 iso(task.created_at),
                 iso(task.updated_at),
                 task.terminal_reason.value if task.terminal_reason else None,
@@ -521,6 +544,48 @@ class Database:
         """Wipe every compression checkpoint for this session."""
         cur = await self.conn.execute(
             "DELETE FROM chat_summaries WHERE session_id = ?", (session_id,),
+        )
+        await self.conn.commit()
+        return cur.rowcount
+
+    # ---- per-session memory injection tracking ----
+
+    async def get_shown_memory_ids(self, session_id: str) -> set[int]:
+        """Return the set of operator-memory ids that have already been
+        injected as a `[memory note]` user-message in this session. Used
+        by the operator to dedup memory injection across turns (so we
+        only inject a memory the FIRST time it's relevant, not every
+        turn it surfaces in retrieval)."""
+        cur = await self.conn.execute(
+            "SELECT memory_id FROM session_memory_shown WHERE session_id = ?",
+            (session_id,),
+        )
+        rows = await cur.fetchall()
+        return {int(r["memory_id"]) for r in rows}
+
+    async def record_memory_shown(
+        self, session_id: str, memory_ids: list[int],
+    ) -> None:
+        """Persist that `memory_ids` were just injected into this session's
+        chat history. Idempotent via PRIMARY KEY (session_id, memory_id);
+        re-runs on the same ids are a no-op."""
+        if not memory_ids:
+            return
+        now = iso(utcnow())
+        await self.conn.executemany(
+            "INSERT OR IGNORE INTO session_memory_shown "
+            "(session_id, memory_id, shown_at) VALUES (?, ?, ?)",
+            [(session_id, mid, now) for mid in memory_ids],
+        )
+        await self.conn.commit()
+
+    async def clear_session_memory_shown(self, session_id: str) -> int:
+        """Wipe this session's memory-shown tracking. Called from /clear
+        so a freshly-cleared session re-injects relevant memories from
+        scratch. Returns rows removed."""
+        cur = await self.conn.execute(
+            "DELETE FROM session_memory_shown WHERE session_id = ?",
+            (session_id,),
         )
         await self.conn.commit()
         return cur.rowcount
@@ -911,6 +976,7 @@ def _row_to_task(row: aiosqlite.Row) -> Task:
         consecutive_denials=row["consecutive_denials"],
         dispatched_by_chat_session=row["dispatched_by_chat_session"],
         restricted_to_chat=row["restricted_to_chat"],
+        pre_approved_send_chat=row["pre_approved_send_chat"],
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
         terminal_reason=TerminalReason(row["terminal_reason"]) if row["terminal_reason"] else None,

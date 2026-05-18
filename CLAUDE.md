@@ -11,12 +11,13 @@ uv build
 uv tool install --force ./dist/oncall_agent-0.1.0-py3-none-any.whl
 ```
 
-Additionally, the running `oncall api` daemon loads the operator system prompt **once at startup** (see `Operator.__init__` in [src/oncall/operator.py](src/oncall/operator.py)). Prompt edits — even on the editable install path — require a daemon restart to take effect:
+Additionally, the running `oncall api` daemon loads the operator system prompt **once at startup** (see `Operator.__init__` in [src/oncall/operator.py](src/oncall/operator.py)). Prompt edits — even on the editable install path — require a daemon restart to take effect. The daemon is launchd-managed; restart with:
 
 ```sh
-pgrep -af "oncall api"          # find the PID
-kill <pid> && oncall api        # restart
+oncall service start            # restarts the launchd-managed daemon
 ```
+
+Do NOT `kill` the PID directly — launchd will respawn it from the same wheel anyway. `oncall service start` is the right knob.
 
 ## Testing discipline
 

@@ -131,7 +131,7 @@ TOOLS = types.Tool(function_declarations=[
             properties={
                 "prompt": types.Schema(type="STRING"),
                 "model": types.Schema(
-                    type="STRING", enum=["haiku", "sonnet", "opus"],
+                    type="STRING", enum=["sonnet", "opus"],
                 ),
             },
             required=["prompt"],

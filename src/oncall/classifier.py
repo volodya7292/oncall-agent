@@ -137,6 +137,8 @@ def classify(tool_name: str, tool_input: dict[str, Any]) -> Verdict:
         )
     if tool_name == "mcp__oncall__messenger_inbox":
         return _classify_messenger(tool_input)
+    if tool_name == "mcp__oncall__memory":
+        return _classify_memory(tool_input)
     # Unknown tool → mutating (default-deny posture).
     return Verdict(
         kind=ClassifierVerdict.MUTATING,
@@ -802,7 +804,7 @@ def _stmt_is_read_only(stmt: exp.Expression) -> bool:
 def _classify_messenger(tool_input: dict[str, Any]) -> Verdict:
     op = str(tool_input.get("op", ""))
     if op in (
-        "list", "read", "mark_read", "style",
+        "list", "read", "mark_read", "style", "read_image", "transcribe",
         "history", "search", "search_messages", "list_chats",
     ):
         return Verdict(
@@ -825,6 +827,34 @@ def _classify_messenger(tool_input: dict[str, Any]) -> Verdict:
         kind=ClassifierVerdict.MUTATING,
         canonical=f"messenger_inbox.{op}",
         blast_radius=f"Unknown messenger op '{op}'.",
+        reason="unknown_op",
+    )
+
+
+def _classify_memory(tool_input: dict[str, Any]) -> Verdict:
+    """Operator memory store ops. `save` writes a row to local SQLite with
+    no external blast radius and the operator already does it without
+    approval — the executor inherits the same trust. Both ops are
+    classified READONLY so the broker auto-allows."""
+    op = str(tool_input.get("op", ""))
+    if op == "query":
+        q = str(tool_input.get("query", ""))[:60]
+        return Verdict(
+            kind=ClassifierVerdict.READONLY,
+            canonical=f"memory.query({q!r})",
+            blast_radius="Read-only memory lookup (local SQLite).",
+        )
+    if op == "save":
+        text = str(tool_input.get("text", ""))[:80]
+        return Verdict(
+            kind=ClassifierVerdict.READONLY,
+            canonical=f"memory.save({text!r})",
+            blast_radius="Writes one local-DB row; no external effect.",
+        )
+    return Verdict(
+        kind=ClassifierVerdict.MUTATING,
+        canonical=f"memory.{op}",
+        blast_radius=f"Unknown memory op '{op}'.",
         reason="unknown_op",
     )
 
