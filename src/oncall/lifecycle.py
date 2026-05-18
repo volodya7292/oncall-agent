@@ -1,7 +1,9 @@
 """Task lifecycle controller.
 
-Owns the set of in-flight task subprocesses, accepts new submissions, performs
-crash recovery on startup, and routes kill requests.
+Owns the single in-flight executor subprocess, accepts new hand_off
+submissions onto a FIFO queue, performs crash recovery on startup, and
+routes kill requests. All executor runs are serialized through one worker
+so they share the same global claude --session-id without racing.
 """
 
 from __future__ import annotations
@@ -39,70 +41,81 @@ class Lifecycle:
     settings: Settings
     paths: Paths
     running: dict[UUID, RunningTask] = field(default_factory=dict)
-    # Cap on concurrent claude executors. Tasks beyond the cap stay in
-    # `pending` state until a slot opens. Initialized in __post_init__.
-    _slot_sem: "asyncio.Semaphore | None" = field(default=None, init=False, repr=False)
+    _queue: "asyncio.Queue[Task] | None" = field(default=None, init=False, repr=False)
+    _worker_task: "asyncio.Task[None] | None" = field(default=None, init=False, repr=False)
+    _current_task_id: UUID | None = field(default=None, init=False, repr=False)
+    _shutdown_flag: "asyncio.Event | None" = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self._slot_sem = asyncio.Semaphore(self.settings.oncall_max_concurrent_tasks)
+        self._queue = asyncio.Queue()
+        self._shutdown_flag = asyncio.Event()
+        self._worker_task = asyncio.create_task(self._worker_loop(), name="executor-worker")
 
-    async def submit_task(
-        self,
-        *,
-        prompt: str,
-        model: str | None = None,
-        max_turns: int | None = None,
-        chat_session_id: str | None = None,
-        restricted_to_chat: str | None = None,
-        pre_approved_send_chat: str | None = None,
-    ) -> Task:
+    async def enqueue_executor(
+        self, *, prompt: str, chat_session_id: str | None = None,
+    ) -> dict[str, object]:
+        """Programmatic entry point for the operator's `hand_off()` tool.
+        Creates a Task row, pushes it onto the FIFO queue, and returns
+        immediately. The single executor worker drains the queue.
+        """
         task = Task(
-            session_id=str(uuid4()),  # claude --session-id requires UUID format
+            session_id=str(uuid4()),  # per-row id for DB tracking only
             prompt=prompt,
-            model=model,
-            max_turns=max_turns,
             dispatched_by_chat_session=chat_session_id,
-            restricted_to_chat=restricted_to_chat,
-            pre_approved_send_chat=pre_approved_send_chat,
         )
         await self.db.insert_task(task)
         await self.events.publish(task.id, "state.changed", {"state": task.state.value})
-        self._spawn(task, resuming=False)
-        return task
+        assert self._queue is not None
+        await self._queue.put(task)
+        depth = self._queue.qsize()
+        busy = self._current_task_id is not None
+        return {
+            "task_id": str(task.id),
+            "queue_depth": depth,
+            "busy": busy,
+        }
+
+    def acting_status(self) -> dict[str, object]:
+        """Snapshot used by the operator's turn-time `<acting-status>`
+        injection. Reports whether the worker is mid-task and how many
+        items are waiting. Cheap; no I/O."""
+        return {
+            "busy": self._current_task_id is not None,
+            "queue_depth": self._queue.qsize() if self._queue is not None else 0,
+            "current_task_id": str(self._current_task_id) if self._current_task_id else None,
+        }
 
     async def recover(self) -> None:
-        """On boot, re-spawn any tasks left in {running, awaiting_approval},
-        re-surface any pending approvals so the operator's bot UI shows
-        them again (the in-memory event bus + button keyboards were lost
-        on shutdown), and sweep orphans whose parent already terminated."""
-        alive = await self.db.list_tasks_in_states(TaskState.RUNNING, TaskState.AWAITING_APPROVAL)
-        for task in alive:
-            log.info("recovering task %s (state=%s)", task.id, task.state)
-            self._spawn(task, resuming=True)
-        # Re-publish approval.requested for any pending approval whose
-        # parent task we just recovered. The broker also re-publishes on
-        # the reattach path when claude --resume re-calls the approve
-        # tool, but that depends on the CLI's resume behavior; this
-        # ensures the bot UI re-surfaces the keyboard regardless.
-        alive_ids = {t.id for t in alive}
-        try:
-            for approval in await self.db.list_pending_approvals():
-                if approval.task_id not in alive_ids:
-                    continue
-                await self.events.publish(approval.task_id, "approval.requested", {
-                    "approval_id": str(approval.id),
-                    "tool_name": approval.tool_name,
-                    "canonical_command": approval.canonical_command,
-                    "blast_radius": approval.blast_radius,
-                    "challenge_phrase": approval.challenge_phrase,
-                    "reattach": True,
-                })
-                log.info(
-                    "recover: re-published approval.requested approval=%s task=%s",
-                    approval.id, approval.task_id,
-                )
-        except Exception:
-            log.exception("recover: re-publish of pending approvals failed")
+        """On boot, re-enqueue any tasks left in {pending}, mark stale
+        RUNNING/AWAITING_APPROVAL as failed (the prior daemon's worker
+        died mid-turn; with a single shared session we can't safely
+        resume two), and sweep orphan approvals."""
+        # Stale in-flight: a prior daemon was running this; we can't
+        # cleanly resume because the new shared-session model doesn't
+        # allow concurrent re-attach against an unknown number of
+        # interrupted turns. Mark them failed so the queue starts clean.
+        stale = await self.db.list_tasks_in_states(
+            TaskState.RUNNING, TaskState.AWAITING_APPROVAL,
+        )
+        for task in stale:
+            log.warning(
+                "recover: marking stale task %s (state=%s) as FAILED — "
+                "single-session model can't safely resume mid-turn",
+                task.id, task.state.value,
+            )
+            await self.db.update_task_state(
+                task.id, TaskState.FAILED, TerminalReason.KILLED,
+            )
+            await self.events.publish(task.id, "state.changed", {
+                "state": TaskState.FAILED.value, "terminal_reason": "killed",
+            })
+        # Queued before the crash: still valid to run, just push them
+        # back onto the queue in submission order.
+        pending = await self.db.list_tasks_in_states(TaskState.PENDING)
+        assert self._queue is not None
+        for task in pending:
+            log.info("recover: re-queueing pending task %s", task.id)
+            await self._queue.put(task)
         await self._sweep_orphan_approvals()
 
     async def _sweep_orphan_approvals(self) -> None:
@@ -156,8 +169,7 @@ class Lifecycle:
         # the broker's await returns immediately. Also write the resolved
         # row to the DB ourselves rather than relying on the broker's
         # post-await commit — during shutdown the broker may not survive
-        # long enough to do it. The DB row matters because the next daemon
-        # boot's recover() would otherwise see an orphan pending row.
+        # long enough to do it.
         for approval in await self.db.list_pending_approvals():
             if approval.task_id != task_id:
                 continue
@@ -183,39 +195,100 @@ class Lifecycle:
         return True
 
     async def shutdown(self) -> None:
-        """Graceful daemon shutdown: cancel the in-process runners but
-        LEAVE task state alone in the DB. On the next boot, recover()
-        sees these as RUNNING/AWAITING_APPROVAL and re-spawns them via
-        claude --resume. The broker's (session_id, tool_use_id) dedup
-        re-attaches any in-flight approvals."""
+        """Graceful daemon shutdown. Set the flag so the worker exits
+        at its next queue.get() / iteration boundary, cancel any
+        in-flight runner so the current await unblocks. Tasks
+        mid-flight stay in their current DB state — on next boot
+        recover() marks them FAILED."""
+        if self._shutdown_flag is not None:
+            self._shutdown_flag.set()
+        # Cancel runners (current + any future ones the worker might
+        # spawn before noticing the flag) so awaits unblock.
+        for rt in list(self.running.values()):
+            if not rt.runner.done():
+                rt.runner.cancel()
+        # Cancel worker too — between draining the queue and re-checking
+        # the flag, it could be parked at queue.get() with no runner to
+        # ricochet through.
+        if self._worker_task is not None:
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._worker_task = None
         for task_id, rt in list(self.running.items()):
-            rt.runner.cancel()
             try:
                 await rt.runner
             except (asyncio.CancelledError, Exception):
                 pass
             self.running.pop(task_id, None)
-            log.info("shutdown: cancelled runner for task %s (state preserved for resume)", task_id)
+            log.info("shutdown: cancelled runner for task %s", task_id)
 
     # ---- internals ----
 
-    def _spawn(self, task: Task, *, resuming: bool) -> None:
-        sup = Supervisor(db=self.db, events=self.events, settings=self.settings, paths=self.paths)
-        runner = asyncio.create_task(self._run(task, sup, resuming=resuming))
-        self.running[task.id] = RunningTask(task=task, supervisor=sup, runner=runner)
-
-    async def _run(self, task: Task, sup: Supervisor, *, resuming: bool) -> TerminalReason:
-        assert self._slot_sem is not None  # set in __post_init__
-        # Log when waiting so the audit stream shows backpressure.
-        if self._slot_sem.locked():
-            log.info("task %s waiting for executor slot (cap=%d)",
-                     task.id, self.settings.oncall_max_concurrent_tasks)
-            await self.events.publish(task.id, "queued", {
-                "cap": self.settings.oncall_max_concurrent_tasks,
-            })
+    async def _worker_loop(self) -> None:
+        """Single FIFO worker: drains the queue one task at a time so all
+        executor runs share the global session id without racing.
+        Exits when the shutdown flag is set or the task is cancelled."""
+        assert self._queue is not None
+        assert self._shutdown_flag is not None
+        get_q = asyncio.ensure_future(self._queue.get())
+        flag_wait = asyncio.ensure_future(self._shutdown_flag.wait())
         try:
-            async with self._slot_sem:
-                return await sup.run(task, resuming=resuming)
+            while True:
+                if self._shutdown_flag.is_set():
+                    return
+                done, _ = await asyncio.wait(
+                    {get_q, flag_wait}, return_when=asyncio.FIRST_COMPLETED,
+                )
+                if flag_wait in done:
+                    return
+                task = get_q.result()
+                get_q = asyncio.ensure_future(self._queue.get())
+                try:
+                    self._current_task_id = task.id
+                    await self._run_one(task)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("worker loop: unexpected error running task %s", task.id)
+                finally:
+                    self._current_task_id = None
+        finally:
+            for fut in (get_q, flag_wait):
+                if not fut.done():
+                    fut.cancel()
+
+    async def _run_one(self, task: Task) -> None:
+        sup = Supervisor(db=self.db, events=self.events, settings=self.settings, paths=self.paths)
+        runner = asyncio.create_task(self._supervise(task, sup))
+        self.running[task.id] = RunningTask(task=task, supervisor=sup, runner=runner)
+        try:
+            try:
+                await runner
+            except asyncio.CancelledError:
+                # Worker cancelled mid-task. Drag the child runner down
+                # with us so it doesn't pin the loop as an orphan.
+                if not runner.done():
+                    runner.cancel()
+                    try:
+                        await runner
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                raise
+        finally:
+            self.running.pop(task.id, None)
+            # Best-effort, swallow cancellation so the cleanup doesn't
+            # propagate a second cancel into surrounding code.
+            try:
+                await self._sweep_orphan_approvals()
+            except asyncio.CancelledError:
+                pass
+
+    async def _supervise(self, task: Task, sup: Supervisor) -> TerminalReason:
+        try:
+            return await sup.run(task, resuming=False)
         except asyncio.CancelledError:
             return TerminalReason.KILLED
         except Exception:
@@ -225,10 +298,3 @@ class Lifecycle:
                 "state": TaskState.FAILED.value, "terminal_reason": "cli_error",
             })
             return TerminalReason.CLI_ERROR
-        finally:
-            self.running.pop(task.id, None)
-            # If the task ended without going through `kill()` (e.g. normal
-            # supervisor completion, or the crash path above), any pending
-            # approval rows it left behind are now orphans. Sweep them so
-            # /status' pending-approval count reflects reality.
-            await self._sweep_orphan_approvals()

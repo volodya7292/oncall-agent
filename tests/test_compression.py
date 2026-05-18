@@ -265,7 +265,8 @@ async def test_clear_session_on_empty_session_is_noop(stack):
     runner = FakeRunner()
     operator = _make_operator(stack, runner)
     out = await operator.clear_session("never-existed")
-    assert out == {"messages_deleted": 0, "summaries_deleted": 0}
+    assert out["messages_deleted"] == 0
+    assert out["summaries_deleted"] == 0
 
 
 # ---------------------------------------------------------------------------

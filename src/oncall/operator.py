@@ -316,198 +316,42 @@ OPERATOR_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "dispatch_task",
+            "name": "hand_off",
             "description": (
-                "Hand work to the Claude executor. Use this for any request that "
-                "requires touching infrastructure (running shell commands, "
-                "investigating bugs, writing code, etc). Pick the model tier: "
-                "'sonnet' (default) for investigations & multi-step reasoning; "
-                "'opus' for coding or anything risky."
+                "Hand the user's request over to ACTING — a deeper, slower "
+                "process that can take whatever time it needs and answer "
+                "fully. Call this whenever the request needs work: tools, "
+                "files, code, lookups, the user's data, an image to "
+                "interpret, a decision to make, OR when you don't have "
+                "enough context to answer confidently.\n"
+                "\n"
+                "The user's verbatim message is forwarded automatically. "
+                "Optionally pass `hint` to add context the user's literal "
+                "words don't carry — most commonly when the user replies "
+                "with a deictic / one-word answer (\"yes\", \"do it\", "
+                "\"the second one\") to a question YOU asked. Keep hints "
+                "short (one sentence) and factual; do NOT restate the "
+                "user's message.\n"
+                "\n"
+                "In the SAME response, emit one short ack to the user "
+                "(e.g. \"Looking.\", \"Let me check.\", \"On it.\") and "
+                "then say nothing else. The user's answer will be "
+                "delivered to them by the system when acting completes."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "Refined task description handed to the executor.",
-                    },
-                    "model": {
-                        "type": "string",
-                        "enum": ["sonnet", "opus"],
-                        "default": "sonnet",
-                    },
-                    "task_class": {
-                        "type": "string",
-                        "description": "Optional label for the audit log: 'reply', 'check', 'investigate', 'code', 'migration'.",
-                    },
-                },
-                "required": ["prompt"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "dispatch_handle_dm",
-            "description": (
-                "Hand a Telegram chat off to the executor to handle. "
-                "The executor is YOU but more intelligent — it reads chat "
-                "history (`op=history`), the user's outgoing style samples "
-                "(`op=style`), and any relevant attachments (`op=read_image`), "
-                "then DECIDES on its own whether to send a reply or to do "
-                "nothing for this turn. You do not pre-decide the wording; "
-                "you provide a `hint` describing the situation + intent, and "
-                "the executor uses its judgement.\n"
-                "\n"
-                "If the executor decides to reply, `op=send` is auto-allowed "
-                "(authority + DM allowlist are verified at dispatch time, no "
-                "broker round-trip). If it decides NOT to reply (situation "
-                "doesn't match, ambiguous, off-topic for the authority, etc.), "
-                "it logs the reason and exits silently — no message is sent.\n"
-                "\n"
-                "Two authority modes:\n"
-                "  - Memory-authorized: pass `authority_memory_id` as the "
-                "    integer id of a memory that authorizes a reply for THIS "
-                "    sender on THIS topic.\n"
-                "  - User-approved: pass the literal string \"user_approved\" "
-                "    when the user just asked you to send something specific "
-                "    (e.g. \"tell X I'll be late\"). In this mode the "
-                "    executor should almost always send — the user's intent "
-                "    is the authority.\n"
-                "\n"
-                "The chat_id must be on the user's DM allowlist (`/allowdm "
-                "<chat_id>`); otherwise the dispatch is refused and you STAY "
-                "SILENT for the rest of the turn."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "chat_id": {
-                        "type": "string",
-                        "description": "Telegram chat_id to handle.",
-                    },
                     "hint": {
                         "type": "string",
                         "description": (
-                            "Short description of the situation + your "
-                            "intent — what came in, what authorization "
-                            "applies, what (if anything) you think should be "
-                            "communicated. NOT verbatim text. The executor "
-                            "decides whether and what to send. Examples: "
-                            "\"sender pinged with 'ну что'; memory #10 "
-                            "authorizes answering questions from them; "
-                            "engage casually if it's actually a question, "
-                            "otherwise let it be\", \"user wants to tell "
-                            "them they'll be 30 min late\", \"user asked to "
-                            "say literally: 'ok thanks'\"."
-                        ),
-                    },
-                    "authority_memory_id": {
-                        "description": (
-                            "Integer memory id authorizing the autonomous "
-                            "reply, OR the literal string \"user_approved\" "
-                            "when the user just asked you to send something."
+                            "Optional one-sentence context to attach to "
+                            "the hand-off. Use when the user's literal "
+                            "message lacks standalone meaning (e.g. a "
+                            "'yes' to an offer you made). Empty / omitted "
+                            "when not needed."
                         ),
                     },
                 },
-                "required": ["chat_id", "hint", "authority_memory_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_task_status",
-            "description": "Fetch a task's current state, latest assistant text, and any pending approval.",
-            "parameters": {
-                "type": "object",
-                "properties": {"task_id": {"type": "string"}},
-                "required": ["task_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_tasks",
-            "description": (
-                "List recent tasks, optionally filtered by state. State meanings:\n"
-                "  pending           — submitted but QUEUED behind the executor "
-                "concurrency cap. Use this filter when the user asks "
-                "'what's queued?', 'what's waiting?', 'how many in line?'.\n"
-                "  running           — claude executor actively working.\n"
-                "  awaiting_approval — paused on a mutating tool call; user must approve.\n"
-                "  completed/failed/killed — terminal."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "state": {
-                        "type": "string",
-                        "enum": ["pending", "running", "awaiting_approval", "completed", "failed", "killed"],
-                    },
-                    "limit": {"type": "integer", "default": 10},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "present_pending_approval",
-            "description": (
-                "Fetch the canonical command, blast radius, and challenge phrase "
-                "for a pending approval. The user must hear the canonical command "
-                "and challenge phrase VERBATIM."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {"approval_id": {"type": "string"}},
-                "required": ["approval_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "submit_approval_response",
-            "description": (
-                "Forward the user's response to a pending approval. The server "
-                "validates the challenge phrase — you do NOT decide whether it "
-                "matches. Pass the user's spoken/typed phrase verbatim."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "approval_id": {"type": "string"},
-                    "decision": {"type": "string", "enum": ["allow", "deny"]},
-                    "challenge_phrase_supplied": {"type": "string"},
-                },
-                "required": ["approval_id", "decision", "challenge_phrase_supplied"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "kill_task",
-            "description": (
-                "Hard-stop a task. Works on tasks in any non-terminal state — "
-                "pending (queued behind the cap), running, or awaiting_approval. "
-                "The server requires the user to have said a variant of 'stop "
-                "everything' (case-insensitive). For routine 'drop task X from "
-                "the queue' requests, ask the user to confirm with 'stop "
-                "everything' (or similar) and pass their literal phrase here. "
-                "Killing a queued task is cheap — the executor was never spawned. "
-                "Killing a running task interrupts mid-action."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task_id": {"type": "string"},
-                    "kill_phrase": {"type": "string", "description": "Pass the user's actual phrase; server checks for 'stop everything'."},
-                },
-                "required": ["task_id", "kill_phrase"],
             },
         },
     },
@@ -567,44 +411,6 @@ OPERATOR_TOOLS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["memory_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_image",
-            "description": (
-                "Load an image or document so YOU can see its contents. The "
-                "attachment is fed back to you on the next round as an inline "
-                "image part — after calling this you can describe what's in "
-                "the picture, transcribe text from a screenshot, read a PDF, "
-                "etc. Two sources:\n"
-                "  - `path`: an absolute path to a file on this host. The "
-                "    file must already exist (you cannot create one).\n"
-                "  - `chat_id` + `message_id`: a Telegram message attachment. "
-                "    Get the ids from a dispatched task's result (drafting "
-                "    tasks return chat_id + message_id for attachments).\n"
-                "Pass EITHER `path` OR the (chat_id, message_id) pair, never "
-                "both. Cap is 10 MB. The attachment lives only for this turn "
-                "— if you need it again in a later turn, call this tool again."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute path to a local file.",
-                    },
-                    "chat_id": {
-                        "type": "string",
-                        "description": "Telegram chat id (with message_id).",
-                    },
-                    "message_id": {
-                        "type": "string",
-                        "description": "Telegram message id (with chat_id).",
-                    },
-                },
             },
         },
     },
@@ -906,8 +712,10 @@ class Operator:
     ) -> OperatorTurnResult:
         """Inject a synthetic '[system note: ...]' turn into a chat session.
         Used by background tasks that re-engage the operator (task terminated,
-        approval requested, inbound DM landed). No-op if the session has no
-        history (we don't manufacture context for nobody).
+        approval requested, inbound DM landed). Always runs — even when the
+        session has no prior history. Callers like the inbox-drain depend on
+        this firing after /clear so a freshly-wiped session can still triage
+        an incoming DM instead of silently dropping it.
 
         `retrieval_query`: when set, this string is used as the semantic
         retrieval key for the memory section instead of skipping retrieval.
@@ -915,9 +723,6 @@ class Operator:
         body) so memory entries about the sender / topic / preferences are
         loaded; leave None for purely procedural pings (a task terminating)
         where no user-meaningful content needs surfacing."""
-        history = await self._db.load_chat_history(session_id, limit=1)
-        if not history:
-            return OperatorTurnResult(text="", tool_calls_made=[], ran=False)
         async with self._lock_for(session_id):
             return await self._run_turn(
                 session_id, f"{AUTO_PING_PREFIX}{note}]",
@@ -1072,6 +877,19 @@ class Operator:
                 ],
             })
 
+        # Acting-status: transient user-turn note so the operator knows
+        # whether the previous hand_off is still in flight. Not persisted —
+        # status changes per turn. The text framing ("acting") matches the
+        # operator prompt's mental model; never mentions "executor"/"task".
+        status = self._lifecycle.acting_status()
+        if status.get("busy"):
+            depth = int(status.get("queue_depth") or 0)
+            extra = f" — {depth} also queued" if depth else ""
+            status_block = f"<acting-status>still acting{extra}</acting-status>"
+        else:
+            status_block = "<acting-status>idle</acting-status>"
+        messages.append({"role": "user", "content": status_block})
+
         tool_calls_made: list[dict[str, Any]] = []
         for _round in range(self._max_tool_rounds):
             resp = await self._llm.chat(
@@ -1132,6 +950,7 @@ class Operator:
                         session_id, tc["name"], args,
                         restricted_to_chat=restricted_to_chat,
                         tool_calls_made=tool_calls_made,
+                        user_text=user_text,
                     )
                 except Exception as e:
                     log.exception("operator tool %s failed", tc["name"])
@@ -1194,6 +1013,28 @@ class Operator:
                     await self._db.append_chat_message(
                         session_id, "user", placeholder,
                     )
+
+            # Short-circuit after a successful hand_off: the operator
+            # already emitted its ack in this same turn (assistant_dict's
+            # `content`), and our contract is that nothing else should be
+            # said before acting completes. Skipping the next LLM round
+            # also matters for ordering — the executor can fail fast and
+            # publish its result-delivery message; if we waited for
+            # another LLM round here, the ack would land AFTER the result.
+            handed_off = any(
+                tc["name"] == "hand_off"
+                and not (
+                    isinstance(c.get("result"), dict) and c["result"].get("error")
+                )
+                for tc, c in zip(tc_list, tool_calls_made[-len(tc_list):])
+            )
+            if handed_off:
+                final_text = _strip_breadcrumb_impersonation(
+                    resp.get("content") or ""
+                )
+                return OperatorTurnResult(
+                    text=final_text, tool_calls_made=tool_calls_made,
+                )
 
         # Hit the tool-round cap.
         msg = "I'm stuck — too many tool rounds without a final answer. Try rephrasing."
@@ -1652,349 +1493,137 @@ class Operator:
 
     # ---- tool execution ----
 
-    # Max attachment size loaded into a turn. 10 MB keeps a single
-    # base64-encoded image well under typical model input caps while
-    # still admitting screenshots, PDFs, etc.
-    _ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024
+    # Max chars of recent operator-user dialogue prepended to a hand_off
+    # prompt as context for the executor. Cap is per hand_off, not
+    # cumulative — the cursor dedups so each chunk is forwarded once.
+    _HANDOFF_CONTEXT_MAX_CHARS = 1024
 
-    async def _read_image(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Load a local file or a Telegram message attachment into the
-        current turn. The bytes are returned to the tool loop under a
-        private `_attachment` key, which the loop strips before
-        serializing the tool response and replays as a follow-up
-        list-content user message (so the model sees the image inline).
+    async def _compose_handoff_prompt(
+        self, *, chat_session_id: str, user_text: str, hint: str,
+    ) -> tuple[str, int]:
+        """Build the prompt forwarded to the executor for one hand_off.
+
+        Includes a tail of recent operator-user dialogue (up to
+        `_HANDOFF_CONTEXT_MAX_CHARS` chars) that the executor hasn't
+        seen yet, plus the user's verbatim message, plus an optional
+        operator hint. Returns (prompt, new_cursor) — the cursor is the
+        latest chat_messages.id covered by this hand_off; caller
+        persists it after a successful enqueue.
+
+        On any failure loading history we degrade to the user_text-only
+        path (still safe — the executor session itself accumulates context
+        across resumes, so missing a chunk just means slightly less ground
+        truth for one turn).
         """
-        import base64
-        import mimetypes
-        from pathlib import Path as _Path
+        try:
+            cursor = await self._db.get_handoff_cursor(chat_session_id)
+            history = await self._db.load_chat_history(
+                chat_session_id, since_id=cursor, limit=200,
+            )
+        except Exception:
+            log.exception("hand_off: history fetch failed; sending user_text only")
+            return self._format_handoff_body(
+                tail=[], user_text=user_text, hint=hint,
+            ), 0
 
-        path = args.get("path")
-        chat_id = args.get("chat_id")
-        message_id = args.get("message_id")
+        tail: list[tuple[str, str]] = []  # (label, content)
+        new_cursor = cursor
+        for row in history:
+            mid = int(row["id"])
+            if mid > new_cursor:
+                new_cursor = mid
+            role = row.get("role")
+            content = (row.get("content") or "").strip()
+            if not content:
+                continue
+            if role not in ("user", "assistant"):
+                continue
+            if content.startswith("[memory note:") or content.startswith(AUTO_PING_PREFIX):
+                continue
+            if content.startswith("<acting-status>"):
+                continue
+            if content == user_text:
+                # The latest user turn — printed as "user (now)" below.
+                continue
+            label = "user" if role == "user" else "operator"
+            tail.append((label, content))
 
-        if path and (chat_id or message_id):
-            return {"error": "pass EITHER path OR (chat_id, message_id), not both"}
-        if not path and not (chat_id and message_id):
-            return {"error": "path, or both chat_id and message_id, required"}
+        # Trim from the FRONT until under the char cap (keep most recent).
+        def total(items: list[tuple[str, str]]) -> int:
+            return sum(len(lbl) + len(c) + 3 for lbl, c in items)  # ": " + "\n"
+        while tail and total(tail) > self._HANDOFF_CONTEXT_MAX_CHARS:
+            tail.pop(0)
 
-        if path:
-            p = _Path(str(path)).expanduser()
-            if not p.is_file():
-                return {"error": f"not a file: {p}"}
-            size = p.stat().st_size
-            if size > self._ATTACHMENT_MAX_BYTES:
-                return {"error": f"file too large: {size} bytes (cap {self._ATTACHMENT_MAX_BYTES})"}
-            try:
-                data = p.read_bytes()
-            except Exception as e:
-                return {"error": f"{type(e).__name__}: {e}"}
-            mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
-            source = f"file {p}"
-        else:
-            if self._telegram is None:
-                return {"error": "telegram not configured"}
-            try:
-                data, mime, fname = await self._telegram.download_attachment(
-                    str(chat_id), str(message_id),
-                    max_bytes=self._ATTACHMENT_MAX_BYTES,
-                )
-            except Exception as e:
-                return {"error": f"{type(e).__name__}: {e}"}
-            source = f"telegram {chat_id}/{message_id}"
-            if fname:
-                source += f" ({fname})"
+        return self._format_handoff_body(
+            tail=tail, user_text=user_text, hint=hint,
+        ), new_cursor
 
-        return {
-            "loaded": True,
-            "mime_type": mime,
-            "size_bytes": len(data),
-            "source": source,
-            # Private key consumed by the tool loop. Stripped before the
-            # tool response is serialized to the LLM / persisted to DB.
-            "_attachment": {
-                "data_b64": base64.b64encode(data).decode("ascii"),
-                "mime_type": mime,
-                "source": source,
-                "size_bytes": len(data),
-            },
-        }
+    @staticmethod
+    def _format_handoff_body(
+        *, tail: list[tuple[str, str]], user_text: str, hint: str,
+    ) -> str:
+        parts: list[str] = []
+        if tail:
+            parts.append(
+                "[recent operator↔user dialogue, for context — newest last]"
+            )
+            for label, content in tail:
+                parts.append(f"{label}: {content}")
+            parts.append("")
+        if hint:
+            parts.append(f"[operator hint: {hint}]")
+            parts.append("")
+        parts.append(user_text)
+        return "\n".join(parts)
 
     async def _execute_tool(
         self, chat_session_id: str, name: str, args: dict[str, Any],
         *, restricted_to_chat: str | None = None,
         tool_calls_made: list[dict[str, Any]] | None = None,
+        user_text: str = "",
     ) -> dict[str, Any]:
-        # Hard guardrail: when the turn was triggered by the inbox-drain
-        # autonomous-reply path, `restricted_to_chat` is the only chat this
-        # turn may read from or send to. Cross-chat enumeration tools are
-        # refused outright; per-chat tools must target the locked chat;
-        # local-file `read_image` is refused. `dispatch_task` is allowed but
-        # requires user approval (see the dispatch_task branch below). All
-        # other operator tools (memory, status, etc.) are unaffected.
-        if restricted_to_chat is not None:
-            err = _check_restricted_access(name, args, restricted_to_chat)
-            if err is not None:
-                operator_log.warning("restricted_tool_blocked " + fmt(
-                    chat=chat_session_id, tool=name,
-                    locked_to=restricted_to_chat,
-                    args=json.dumps(args, ensure_ascii=False),
-                ))
-                return err
-        if name == "dispatch_task":
-            model_alias = args.get("model", "sonnet")
-            model = MODEL_ALIAS_MAP.get(model_alias, model_alias)
-            prompt = args["prompt"]
-            # Restricted turn: don't spawn directly. Park the dispatch in
-            # `pending_dispatches`, publish an event the bot turns into a
-            # Yes/No keyboard, and return a pending sentinel. The actual
-            # task spawns from the bot's callback handler IF the user taps
-            # Yes — inheriting `restricted_to_chat` so the executor also
-            # runs locked.
-            if restricted_to_chat is not None:
-                dispatch_id = str(uuid4())
-                await self._db.create_pending_dispatch(
-                    dispatch_id=dispatch_id,
-                    chat_session_id=chat_session_id,
-                    prompt=prompt,
-                    model=model,
-                    restricted_to_chat=restricted_to_chat,
-                )
-                if self._events is not None:
-                    await self._events.publish_global(
-                        "dispatch.approval_requested", {
-                            "dispatch_id": dispatch_id,
-                            "chat_session_id": chat_session_id,
-                            "prompt": prompt,
-                            "model": model,
-                            "restricted_to_chat": restricted_to_chat,
-                        },
-                    )
-                operator_log.info("dispatch_task.deferred " + fmt(
-                    chat=chat_session_id, dispatch_id=dispatch_id,
-                    locked_to=restricted_to_chat, model=model,
-                    prompt_preview=prompt[:120],
-                ))
-                return {
-                    "status": "pending_approval",
-                    "dispatch_id": dispatch_id,
-                    "message": (
-                        "User approval requested via the bot. If they tap "
-                        "Yes, the task will spawn (locked to the same chat) "
-                        "and its terminal state will auto-ping you. Emit "
-                        "empty assistant content now."
-                    ),
-                }
-            # Inject relevant operator memories as context — the executor
-            # is the operator's smarter self, so it should see what the
-            # operator knows. Retrieval failures are logged and swallowed:
-            # the task still runs, just without auto-context.
-            try:
-                hits = await self._memory.retrieve(prompt, limit=10)
-            except Exception:
-                log.exception("memory retrieve failed for dispatch_task")
-                hits = []
-            recent = _format_recent_context(
-                await self._db.load_chat_history(chat_session_id, limit=40)
-            )
-            augmented_prompt = _inject_memory_context(prompt, hits)
-            if recent:
-                augmented_prompt = recent + "\n\n" + augmented_prompt
-            task = await self._lifecycle.submit_task(
-                prompt=augmented_prompt,
-                model=model,
-                chat_session_id=chat_session_id,
-            )
-            return {
-                "task_id": str(task.id),
-                "session_id": task.session_id,
-                "state": task.state.value,
-                "model": model,
-            }
-
-        if name == "dispatch_handle_dm":
-            if self._telegram is None:
-                return {"error": "telegram not configured"}
-            chat_id = str(args.get("chat_id") or "").strip()
-            hint = str(args.get("hint") or "").strip()
-            authority_raw = args.get("authority_memory_id")
-            if not chat_id or not hint:
-                return {"error": "chat_id and hint required"}
-            authority_id: int | None = None
-            user_approved = False
-            if isinstance(authority_raw, str) and authority_raw.strip() == "user_approved":
-                user_approved = True
-            else:
-                try:
-                    authority_id = int(authority_raw)
-                except (TypeError, ValueError):
-                    return {"error": (
-                        "authority_memory_id must be an integer memory id or "
-                        "the literal string \"user_approved\""
-                    )}
-            authority_text: str | None = None
-            if not user_approved:
-                authority = await self._memory.get_by_id(authority_id)  # type: ignore[arg-type]
-                if authority is None:
-                    return {"error": f"authority_memory_id={authority_id} not found"}
-                authority_text = authority.text
-            send_allowed = await self._db.is_dm_allowed(chat_id)
-            operator_log.info("dispatch_handle_dm.authority " + fmt(
-                chat=chat_id,
-                authority="user_approved" if user_approved else authority_id,
-                memory_text=authority_text,
-                send_allowed=send_allowed,
-            ))
-            if not send_allowed:
-                operator_log.warning("dispatch_handle_dm.send_not_preapproved " + fmt(
-                    chat=chat_id,
-                ))
-            prompt = _build_handle_dm_prompt(
-                chat_id, hint,
-                user_approved=user_approved,
-                send_allowed=send_allowed,
-            )
-            # Inject relevant memories (sender authorizations, name
-            # preferences, etc.) so the executor sees the operator's full
-            # context, not just the hint. Retrieval failure is logged and
-            # swallowed — the task still runs.
-            try:
-                hits = await self._memory.retrieve(hint, limit=10)
-            except Exception:
-                log.exception("memory retrieve failed for dispatch_handle_dm")
-                hits = []
-            augmented_prompt = _inject_memory_context(prompt, hits)
-            task = await self._lifecycle.submit_task(
-                prompt=augmented_prompt,
-                model="sonnet",
-                chat_session_id=chat_session_id,
-                # Lock the executor to this one chat. Pre-approve op=send
-                # ONLY when the user allowlisted this chat for autonomous
-                # writes via `/allowdm`; without that, the executor can
-                # still read (history/style/transcribe/etc.) but op=send
-                # falls through to the normal broker approval flow, which
-                # for an autonomous turn means the send won't go.
-                restricted_to_chat=chat_id,
-                pre_approved_send_chat=chat_id if send_allowed else None,
-            )
-            operator_log.info("dispatch_handle_dm " + fmt(
-                chat=chat_session_id, task=str(task.id), target_chat=chat_id,
-                authority="user_approved" if user_approved else authority_id,
-            ))
-            return {
-                "task_id": str(task.id),
-                "session_id": task.session_id,
-                "state": task.state.value,
-                "model": "sonnet",
-                "task_class": "handle_dm",
-                "authority_memory_id": (
-                    "user_approved" if user_approved else authority_id
-                ),
-            }
-
-        if name == "get_task_status":
-            tid = _uuid(args["task_id"])
-            if tid is None:
-                return {"error": "invalid task_id"}
-            task = await self._db.get_task(tid)
-            if task is None:
-                return {"error": "no such task"}
-            # Anti-spiral guard: refuse repeated polls in the same turn.
-            # The operator has been observed calling get_task_status 16x
-            # in a single turn waiting for a still-running task to finish.
-            # The orchestrator auto-pings on terminal state — there is
-            # zero value in polling. One call per turn is plenty.
-            already = sum(
-                1 for c in (tool_calls_made or [])
-                if c.get("name") == "get_task_status"
-            )
-            if already >= 1:
+        del restricted_to_chat, tool_calls_made  # vestigial; kept for compat
+        if name == "hand_off":
+            text = (user_text or "").strip()
+            if not text:
                 return {
                     "error": (
-                        "do_not_poll: get_task_status was already called this "
-                        "turn. The orchestrator auto-pings you the moment the "
-                        "task terminates — there is no value in polling. End "
-                        "your turn with a short message to the user instead."
+                        "no fresh user message to hand off — reply to the user "
+                        "directly instead."
                     ),
                 }
-            events = await self._db.list_events(tid)
-            latest_text = next(
-                (e["payload"].get("text", "") for e in reversed(events)
-                 if e["type"] == "assistant.text"),
-                "",
+            hint = str(args.get("hint") or "").strip()
+            forwarded, new_cursor = await self._compose_handoff_prompt(
+                chat_session_id=chat_session_id, user_text=text, hint=hint,
             )
-            pending_id = next(
-                (e["payload"].get("approval_id") for e in reversed(events)
-                 if e["type"] == "approval.requested"
-                 and not _was_resolved(events, e["payload"]["approval_id"])),
-                None,
-            )
-            # result_summary is filled in by task_summary.summarize_task() once
-            # a task terminates. Authoritative digest of what the executor did;
-            # prefer it over latest_assistant_text when both are available.
-            result_summary = await self._db.get_task_result_summary(tid)
-            return {
-                "task_id": str(task.id),
-                "state": task.state.value,
-                "terminal_reason": task.terminal_reason.value if task.terminal_reason else None,
-                "latest_assistant_text": latest_text[:600],
-                "result_summary": result_summary,
-                "pending_approval_id": pending_id,
-            }
-
-        if name == "list_tasks":
-            state = args.get("state")
-            limit = int(args.get("limit") or 10)
-            tasks = await self._db.list_tasks(limit=limit)
-            if state:
-                tasks = [t for t in tasks if t.state.value == state]
-            return {
-                "tasks": [
-                    {
-                        "task_id": str(t.id),
-                        "state": t.state.value,
-                        "prompt": t.prompt[:100],
-                        "created_at": t.created_at.isoformat(),
-                    }
-                    for t in tasks
-                ],
-            }
-
-        if name == "present_pending_approval":
-            aid = _uuid(args["approval_id"])
-            if aid is None:
-                return {"error": "invalid approval_id"}
-            row = await self._db.get_approval(aid)
-            if row is None:
-                return {"error": "no such approval"}
-            return {
-                "approval_id": row["id"],
-                "tool_name": row["tool_name"],
-                "canonical_command": row["canonical_command"],
-                "blast_radius": row["blast_radius"],
-                "challenge_phrase": row["challenge_phrase"],
-                "state": row["state"],
-            }
-
-        if name == "submit_approval_response":
-            aid = _uuid(args["approval_id"])
-            if aid is None:
-                return {"error": "invalid approval_id"}
-            approved, matched = await self._broker.submit_response(
-                approval_id=aid,
-                decision=args["decision"],
-                challenge_phrase_supplied=args["challenge_phrase_supplied"],
-            )
-            return {"approved": approved, "challenge_matched": matched}
-
-        if name == "kill_task":
-            tid = _uuid(args["task_id"])
-            if tid is None:
-                return {"error": "invalid task_id"}
-            from .approval_client import is_kill_phrase
-            if not is_kill_phrase(args.get("kill_phrase", "")):
-                return {"error": "kill phrase did not match 'stop everything'"}
-            ok = await self._lifecycle.kill(tid, reason="kill_phrase")
-            return {"killed": ok}
+            try:
+                outcome = await self._lifecycle.enqueue_executor(
+                    prompt=forwarded, chat_session_id=chat_session_id,
+                )
+            except Exception as e:
+                log.exception("hand_off: enqueue_executor failed")
+                return {"error": f"{type(e).__name__}: {e}"}
+            # Advance the cursor only after the enqueue succeeds — if
+            # enqueue fails we want the next attempt to re-forward this
+            # chunk, not lose it.
+            if new_cursor:
+                try:
+                    await self._db.set_handoff_cursor(
+                        chat_session_id, new_cursor,
+                    )
+                except Exception:
+                    log.exception("hand_off: set_handoff_cursor failed")
+            operator_log.info("hand_off " + fmt(
+                chat=chat_session_id,
+                task=outcome.get("task_id"),
+                queue_depth=outcome.get("queue_depth"),
+                busy=outcome.get("busy"),
+                text_preview=text[:120],
+                hint=hint or None,
+                forwarded_len=len(forwarded),
+                cursor=new_cursor,
+            ))
+            return {"enqueued": True, **outcome}
 
         if name == "save_memory":
             text = str(args.get("text") or "").strip()
@@ -2047,9 +1676,6 @@ class Operator:
                 deleted=ok, text=existing.text,
             ))
             return {"forgotten": ok, "memory_id": memory_id}
-
-        if name == "read_image":
-            return await self._read_image(args)
 
         if name == "query_memory":
             q = str(args.get("query") or "").strip()

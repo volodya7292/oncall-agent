@@ -303,6 +303,27 @@ class TelegramService:
         'skip / ignore / dismiss' a chat's pending DMs."""
         return await self._db.mark_chat_read(chat_id)
 
+    async def get_chat_unread_count(self, chat_id: str) -> int | None:
+        """Telegram-side unread count for one chat. Returns None when
+        the chat isn't resolvable or the API call errors — caller
+        should treat None as "don't know, proceed as if unread."
+
+        Used by the inbox-drain so we don't bother handing the chat off
+        to the executor when the user has already read the messages on
+        their phone (Telegram-side read state isn't pushed into our
+        `messenger_inbox.read_at` automatically)."""
+        try:
+            from telethon.tl.functions.messages import GetPeerDialogsRequest
+            entity = _entity_arg(chat_id)
+            result = await self._client(GetPeerDialogsRequest(peers=[entity]))
+            dialogs = getattr(result, "dialogs", None) or []
+            if not dialogs:
+                return None
+            return int(getattr(dialogs[0], "unread_count", 0) or 0)
+        except Exception as e:
+            log.warning("get_chat_unread_count failed for %s: %s", chat_id, e)
+            return None
+
     # ---- telethon-backed reads/writes ----
 
     async def get_chat_style(

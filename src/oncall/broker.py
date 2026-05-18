@@ -157,32 +157,32 @@ class Broker:
             ))
             return PermissionResult(behavior="allow", updatedInput=tool_input)
 
-        # Pre-approved Telegram send: the operator already verified authority
-        # (memory id or user_approved sentinel) and the DM allowlist at
-        # dispatch time, then stamped `pre_approved_send_chat` on the task.
-        # If the mutating tool call is `op=send` to that exact chat, the
-        # broker auto-allows without a challenge phrase round-trip.
+        # Pre-approved Telegram send: chat_id is on the user's per-chat
+        # allowlist (populated via `/allowdm <chat_id>`). Mutating `op=send`
+        # to that chat auto-allows without a challenge-phrase round-trip.
+        # The executor's system prompt carries the no-cross-chat-leak rule;
+        # this table is the final byte-level gate before a message leaves
+        # the box on the user's behalf.
         if (
             verdict.kind == ClassifierVerdict.MUTATING
-            and task.pre_approved_send_chat is not None
             and tool_name == "mcp__oncall__messenger_inbox"
             and tool_input.get("op") == "send"
-            and str(tool_input.get("chat_id") or "") == task.pre_approved_send_chat
         ):
-            await self._db.record_auto_approval(req, "allow", "auto:pre_approved_send")
-            await self._publish(task.id, "approval.resolved", {
-                "approval_id": str(req_id),
-                "auto": True,
-                "decision": "allow",
-                "tool_name": tool_name,
-                "canonical": verdict.canonical,
-            })
-            broker_log.info("decide " + fmt(
-                event="auto_allow_preapproved", task=str(task.id), tool=tool_name,
-                canonical=verdict.canonical,
-                chat=task.pre_approved_send_chat,
-            ))
-            return PermissionResult(behavior="allow", updatedInput=tool_input)
+            send_chat = str(tool_input.get("chat_id") or "")
+            if send_chat and await self._db.is_dm_allowed(send_chat):
+                await self._db.record_auto_approval(req, "allow", "auto:dm_allowlist")
+                await self._publish(task.id, "approval.resolved", {
+                    "approval_id": str(req_id),
+                    "auto": True,
+                    "decision": "allow",
+                    "tool_name": tool_name,
+                    "canonical": verdict.canonical,
+                })
+                broker_log.info("decide " + fmt(
+                    event="auto_allow_dm_allowlist", task=str(task.id), tool=tool_name,
+                    canonical=verdict.canonical, chat=send_chat,
+                ))
+                return PermissionResult(behavior="allow", updatedInput=tool_input)
 
         # Pre-approved Write directory: if the user previously tapped
         # "Yes (and folder)" on a Write approval, any subsequent Write to

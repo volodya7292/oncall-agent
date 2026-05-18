@@ -1,14 +1,13 @@
-"""Concurrency cap on executor tasks.
+"""Single-worker FIFO serialization.
 
-Lifecycle.submit_task() always returns immediately, but only N tasks may
-actually be running in supervisor.run() concurrently. Excess submissions
-wait at the semaphore inside _run.
+Every hand_off lands on one queue drained by one worker, so executor
+runs never overlap (they share a global claude --session-id). Order of
+arrival = order of execution.
 """
 
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -24,19 +23,21 @@ from oncall.models import TerminalReason
 
 
 class FakeSupervisor:
-    """Replaces the real Supervisor in tests. Each instance blocks on its
-    own `release` event so the test controls when it 'finishes'."""
+    """Replaces the real Supervisor. Each instance blocks on `release`
+    so the test controls when the run "finishes"."""
 
-    # Class-level: every instance registers itself here so tests can
-    # find and release them.
     instances: list["FakeSupervisor"] = []
+    enter_order: list[str] = []
 
     def __init__(self, **_ignored: Any) -> None:
-        self.entered = asyncio.Event()  # set when supervisor.run starts
-        self.release = asyncio.Event()  # test must set to let it return
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.task = None  # populated by run()
         FakeSupervisor.instances.append(self)
 
     async def run(self, task, *, resuming: bool = False) -> TerminalReason:
+        self.task = task
+        FakeSupervisor.enter_order.append(task.prompt)
         self.entered.set()
         await self.release.wait()
         return TerminalReason.SUCCESS
@@ -45,8 +46,10 @@ class FakeSupervisor:
 @pytest.fixture(autouse=True)
 def reset_supervisors():
     FakeSupervisor.instances.clear()
+    FakeSupervisor.enter_order.clear()
     yield
     FakeSupervisor.instances.clear()
+    FakeSupervisor.enter_order.clear()
 
 
 @pytest.fixture
@@ -54,7 +57,6 @@ def settings(tmp_path):
     return Settings(
         oncall_token="t",
         oncall_db_path=tmp_path / "db.sqlite",
-        oncall_max_concurrent_tasks=2,  # tight cap for tests
         ai_gateway_api_key="x",
     )
 
@@ -74,7 +76,6 @@ async def lc(settings, monkeypatch):
     try:
         yield lc
     finally:
-        # Release any blocked supervisors so cleanup doesn't hang.
         for s in FakeSupervisor.instances:
             s.release.set()
         await lc.shutdown()
@@ -82,7 +83,6 @@ async def lc(settings, monkeypatch):
 
 
 async def _wait_for(predicate, *, timeout: float = 1.0, interval: float = 0.005):
-    """Spin-wait helper — checks predicate up to timeout."""
     end = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < end:
         if predicate():
@@ -92,58 +92,42 @@ async def _wait_for(predicate, *, timeout: float = 1.0, interval: float = 0.005)
 
 
 @pytest.mark.asyncio
-async def test_cap_holds_excess_tasks_in_pending(lc):
-    """With cap=2, the third submitted task must NOT enter supervisor.run
-    until one of the first two finishes."""
-    cap = lc.settings.oncall_max_concurrent_tasks
-    assert cap == 2
-
-    # Submit 3 tasks. submit_task returns immediately.
-    tasks = []
+async def test_serialized_one_at_a_time(lc):
+    """Three rapid enqueues run strictly one at a time, in submission order."""
     for i in range(3):
-        t = await lc.submit_task(prompt=f"task {i}")
-        tasks.append(t)
+        await lc.enqueue_executor(prompt=f"task {i}")
 
-    # Three FakeSupervisors instantiated immediately (one per asyncio runner).
-    await _wait_for(lambda: len(FakeSupervisor.instances) == 3)
-
-    # But only the first two are inside supervisor.run; the third is parked
-    # at the semaphore inside _run.
-    await _wait_for(lambda: sum(s.entered.is_set() for s in FakeSupervisor.instances) == 2)
-    await asyncio.sleep(0.02)  # give the 3rd a chance if it were going to start
-    assert sum(s.entered.is_set() for s in FakeSupervisor.instances) == 2
-
-    # Release one of the running supervisors; the queued one must now enter.
-    FakeSupervisor.instances[0].release.set()
-    await _wait_for(lambda: sum(s.entered.is_set() for s in FakeSupervisor.instances) == 3)
-
-
-@pytest.mark.asyncio
-async def test_under_cap_runs_immediately(lc):
-    """With cap=2, two tasks both enter run() without queueing."""
-    await lc.submit_task(prompt="a")
-    await lc.submit_task(prompt="b")
-    await _wait_for(lambda: all(s.entered.is_set() for s in FakeSupervisor.instances)
-                            and len(FakeSupervisor.instances) == 2)
-
-
-@pytest.mark.asyncio
-async def test_killed_queued_task_releases_slot(lc):
-    """Killing a queued task must not consume a slot — the cap math has to
-    account for cancellation while waiting on the semaphore."""
-    a = await lc.submit_task(prompt="a")
-    b = await lc.submit_task(prompt="b")
-    c = await lc.submit_task(prompt="c")  # queued behind cap=2
-    await _wait_for(lambda: sum(s.entered.is_set() for s in FakeSupervisor.instances) == 2)
-
-    # Kill the queued one. Should resolve cleanly, no semaphore leak.
-    assert await lc.kill(c.id, reason="test") is True
-    # The other two should still be in their original entered state.
-    assert sum(s.entered.is_set() for s in FakeSupervisor.instances[:2]) == 2
-
-    # Now finish one running task; nothing new should try to claim the slot
-    # for `c` (it was killed).
-    FakeSupervisor.instances[0].release.set()
+    # First task enters supervisor.run; the other two wait.
+    await _wait_for(lambda: len(FakeSupervisor.instances) == 1)
+    await _wait_for(lambda: FakeSupervisor.instances[0].entered.is_set())
     await asyncio.sleep(0.02)
-    # Still only 2 supervisors that ever entered.
-    assert sum(s.entered.is_set() for s in FakeSupervisor.instances) == 2
+    assert len(FakeSupervisor.instances) == 1, "only one supervisor active at a time"
+
+    # Release first → second enters.
+    FakeSupervisor.instances[0].release.set()
+    await _wait_for(lambda: len(FakeSupervisor.instances) == 2)
+    await _wait_for(lambda: FakeSupervisor.instances[1].entered.is_set())
+    await asyncio.sleep(0.02)
+    assert len(FakeSupervisor.instances) == 2
+
+    # Release second → third enters.
+    FakeSupervisor.instances[1].release.set()
+    await _wait_for(lambda: len(FakeSupervisor.instances) == 3)
+    await _wait_for(lambda: FakeSupervisor.instances[2].entered.is_set())
+
+    # FIFO order preserved.
+    assert FakeSupervisor.enter_order == ["task 0", "task 1", "task 2"]
+
+
+@pytest.mark.asyncio
+async def test_busy_flag_reported_to_caller(lc):
+    """enqueue_executor returns busy=True when another task is already running."""
+    first = await lc.enqueue_executor(prompt="first")
+    assert first["busy"] is False  # nothing was running when we enqueued
+
+    # Wait for worker to pick it up.
+    await _wait_for(lambda: lc.acting_status()["busy"] is True)
+
+    second = await lc.enqueue_executor(prompt="second")
+    assert second["busy"] is True
+    assert second["queue_depth"] >= 1

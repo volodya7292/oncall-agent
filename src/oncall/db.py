@@ -159,6 +159,17 @@ CREATE TABLE IF NOT EXISTS session_memory_shown (
     PRIMARY KEY (session_id, memory_id)
 );
 
+-- Cursor into chat_messages.id, per operator chat session, marking the
+-- highest message id whose content has already been forwarded to the
+-- executor via hand_off. The next hand_off forwards only messages
+-- newer than this cursor (capped at ~1024 chars of recent operator-
+-- user dialogue), so the executor never re-sees the same chunk twice.
+CREATE TABLE IF NOT EXISTS executor_handoff_cursor (
+    chat_session_id TEXT PRIMARY KEY,
+    last_forwarded_message_id INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 -- Inbox rows the auto-drain has shown to the operator. Decoupled from
 -- `messenger_inbox.read_at` because a silent triage outcome (operator
 -- chose STAY SILENT) does NOT mark the row read — the user still needs to
@@ -391,17 +402,24 @@ class Database:
     # ---- task events ----
 
     async def append_event(self, task_id: UUID, type_: str, payload: dict[str, Any]) -> int:
-        row = await (await self.conn.execute(
-            "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM task_events WHERE task_id = ?",
-            (str(task_id),),
-        )).fetchone()
-        seq = int(row["next_seq"])
-        await self.conn.execute(
-            "INSERT INTO task_events (task_id, seq, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-            (str(task_id), seq, type_, json.dumps(payload), iso(utcnow())),
+        # Single INSERT with an inline MAX(seq)+1 subquery so the read
+        # and the write are one SQL statement — two concurrent publishes
+        # for the same task can no longer interleave their SELECT/INSERT
+        # and collide on the (task_id, seq) UNIQUE index. RETURNING
+        # gives us the chosen seq back without a second round-trip.
+        cur = await self.conn.execute(
+            """INSERT INTO task_events (task_id, seq, type, payload, created_at)
+               VALUES (
+                   ?,
+                   COALESCE((SELECT MAX(seq) FROM task_events WHERE task_id = ?), 0) + 1,
+                   ?, ?, ?
+               )
+               RETURNING seq""",
+            (str(task_id), str(task_id), type_, json.dumps(payload), iso(utcnow())),
         )
+        row = await cur.fetchone()
         await self.conn.commit()
-        return seq
+        return int(row["seq"])
 
     async def list_events(self, task_id: UUID, *, since_seq: int = 0) -> list[dict[str, Any]]:
         rows = await (await self.conn.execute(
@@ -606,6 +624,35 @@ class Database:
             "INSERT OR IGNORE INTO session_memory_shown "
             "(session_id, memory_id, shown_at) VALUES (?, ?, ?)",
             [(session_id, mid, now) for mid in memory_ids],
+        )
+        await self.conn.commit()
+
+    # ---- executor hand-off cursor ----
+
+    async def get_handoff_cursor(self, chat_session_id: str) -> int:
+        """Highest chat_messages.id already forwarded to the executor
+        via hand_off for this operator session. 0 if nothing forwarded yet."""
+        cur = await self.conn.execute(
+            "SELECT last_forwarded_message_id FROM executor_handoff_cursor "
+            "WHERE chat_session_id = ?",
+            (chat_session_id,),
+        )
+        row = await cur.fetchone()
+        return int(row["last_forwarded_message_id"]) if row else 0
+
+    async def set_handoff_cursor(
+        self, chat_session_id: str, last_forwarded_message_id: int,
+    ) -> None:
+        """Upsert the hand-off cursor. Idempotent — re-setting the same
+        value is fine."""
+        await self.conn.execute(
+            """INSERT INTO executor_handoff_cursor
+               (chat_session_id, last_forwarded_message_id, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(chat_session_id) DO UPDATE SET
+                   last_forwarded_message_id = excluded.last_forwarded_message_id,
+                   updated_at = excluded.updated_at""",
+            (chat_session_id, last_forwarded_message_id, iso(utcnow())),
         )
         await self.conn.commit()
 

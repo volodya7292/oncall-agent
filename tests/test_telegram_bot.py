@@ -805,7 +805,6 @@ async def test_clear_command_calls_operator_and_reports(bus):
         body = api.sent[0]["text"]
         assert "Context cleared" in body
         assert "7 messages" in body and "1 summaries" in body
-        assert "Memory preserved" in body
     finally:
         await svc.stop()
 

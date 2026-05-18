@@ -21,6 +21,44 @@ USER_ENV_FILE = USER_CONFIG_DIR / ".env"
 OWNER_NAME_FILE = USER_CONFIG_DIR / "owner_name.txt"
 OWNER_NAME_UNSET = "(unknown — ask the user to set their name with /setownername in the Telegram bot)"
 
+# A single long-lived claude session is reused across every executor
+# invocation, so `claude --resume` accumulates context turn-to-turn.
+# Persisted once on first read; never rotated. The "initialized" marker
+# is created after the first successful spawn — subsequent spawns then
+# use `--resume` instead of `--session-id`.
+EXECUTOR_SESSION_ID_FILE = USER_CONFIG_DIR / "executor_session_id"
+EXECUTOR_SESSION_INITIALIZED_FILE = USER_CONFIG_DIR / "executor_session_initialized"
+
+
+def get_global_executor_session_id() -> str:
+    from uuid import uuid4
+    try:
+        sid = EXECUTOR_SESSION_ID_FILE.read_text(encoding="utf-8").strip()
+        if sid:
+            return sid
+    except FileNotFoundError:
+        pass
+    sid = str(uuid4())
+    USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    EXECUTOR_SESSION_ID_FILE.write_text(sid, encoding="utf-8")
+    return sid
+
+
+def is_executor_session_initialized() -> bool:
+    return EXECUTOR_SESSION_INITIALIZED_FILE.exists()
+
+
+def mark_executor_session_initialized() -> None:
+    USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    EXECUTOR_SESSION_INITIALIZED_FILE.touch()
+
+
+def _reset_session_initialized_marker() -> None:
+    try:
+        EXECUTOR_SESSION_INITIALIZED_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
 
 def read_owner_name() -> str:
     """Return the owner's display name, or OWNER_NAME_UNSET if not set

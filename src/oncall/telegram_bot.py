@@ -87,7 +87,7 @@ _BOT_COMMANDS: list[dict[str, str]] = [
     {"command": "start",    "description": "greeting"},
     {"command": "status",   "description": "running tasks, queue, approvals, unread DMs"},
     {"command": "context",  "description": "export this session's history + summary as a markdown file"},
-    {"command": "clear",    "description": "wipe this session's history (memory preserved)"},
+    {"command": "clear",    "description": "wipe this session's history"},
     {"command": "compress", "description": "force-compress older messages into a summary"},
     {"command": "allowdm",  "description": "allowlist a chat_id for autonomous DM replies"},
     {"command": "denydm",   "description": "remove a chat_id from the DM allowlist"},
@@ -715,7 +715,7 @@ class TelegramBotService:
             out = await self._operator.clear_session(self._session_id)
             await self._send(chat_id, (
                 f"Context cleared ({out['messages_deleted']} messages, "
-                f"{out['summaries_deleted']} summaries). Memory preserved."
+                f"{out['summaries_deleted']} summaries)."
             ))
             telegram_log.info("bot clear " + fmt(
                 session=self._session_id, **out,
@@ -778,7 +778,28 @@ class TelegramBotService:
             await self._send(chat_id, "Internal error. Try again in a moment.")
             return
 
-        reply = result.text or "(empty reply)"
+        reply = result.text
+        if not reply:
+            # If the operator hand_off'd but emitted no text (Gemini
+            # sometimes returns only a tool_call with empty content),
+            # fall back to a brief ack so the user isn't shown the
+            # "(empty reply)" placeholder. Result delivery will follow
+            # with the actual answer.
+            handed_off = any(
+                c.get("name") == "hand_off"
+                and isinstance(c.get("result"), dict)
+                and c["result"].get("enqueued")
+                for c in result.tool_calls_made
+            )
+            if handed_off:
+                reply = "Looking."
+            else:
+                # Genuine empty turn (memory write, etc.) — stay silent.
+                telegram_log.info("bot reply suppressed (empty) " + fmt(
+                    session=self._session_id,
+                    tool_calls=len(result.tool_calls_made),
+                ))
+                return
         await self._send(chat_id, reply)
         telegram_log.info("bot reply " + fmt(
             session=self._session_id, len=len(reply),
