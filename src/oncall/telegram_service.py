@@ -36,6 +36,13 @@ from .db import Database
 
 ARCHIVED_CACHE_TTL_SECONDS = 1800.0  # 30 min — archive state changes rarely
 
+# Allowed reactions for the executor's `op=react` tool. Telegram's free
+# reaction set is larger; we expose only this curated 4 to keep prompt
+# guidance tight and prevent the model from probing arbitrary emojis.
+# Stored in canonical form (heart includes VS-16) — passed verbatim to
+# Telegram's SendReactionRequest.
+_ALLOWED_REACTIONS = {"👍", "🔥", "❤️", "😁"}
+
 
 log = logging.getLogger(__name__)
 
@@ -581,6 +588,30 @@ class TelegramService:
             chat=chat_id, message_id=sent_id, len=len(text), text=text,
         ))
         return {"message_id": sent_id, "chat_id": chat_id}
+
+    async def react(
+        self, chat_id: str, message_id: str, emoji: str,
+    ) -> dict[str, Any]:
+        if emoji not in _ALLOWED_REACTIONS:
+            raise ValueError(
+                f"emoji {emoji!r} not in allowed set "
+                f"{sorted(_ALLOWED_REACTIONS)}"
+            )
+        try:
+            msg_id_int = int(str(message_id).strip())
+        except (TypeError, ValueError):
+            raise ValueError(f"invalid message_id: {message_id!r}")
+        from telethon.tl.functions.messages import SendReactionRequest  # type: ignore
+        from telethon.tl.types import ReactionEmoji  # type: ignore
+        entity = _entity_arg(chat_id)
+        await self._client(SendReactionRequest(
+            peer=entity, msg_id=msg_id_int,
+            reaction=[ReactionEmoji(emoticon=emoji)],
+        ))
+        telegram_log.info("react " + fmt(
+            chat=chat_id, message_id=message_id, emoji=emoji,
+        ))
+        return {"chat_id": chat_id, "message_id": message_id, "emoji": emoji}
 
     async def download_attachment(
         self, chat_id: str, message_id: str, *, max_bytes: int = 10 * 1024 * 1024,

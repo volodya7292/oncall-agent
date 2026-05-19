@@ -819,6 +819,19 @@ def _classify_messenger(tool_input: dict[str, Any]) -> Verdict:
             canonical=f"messenger_inbox.{op}",
             blast_radius="Read-only messenger access.",
         )
+    if op == "react":
+        # Reactions are auto-allowed: single curated emoji, reversible,
+        # no content leakage. Server validates the emoji allowlist.
+        chat = str(tool_input.get("chat_id", "?"))
+        emoji = str(tool_input.get("emoji", ""))
+        return Verdict(
+            kind=ClassifierVerdict.READONLY,
+            canonical=f"messenger_inbox.react({chat}, {emoji!r})",
+            blast_radius=(
+                f"Sends a Telegram reaction ({emoji}) to one message in "
+                f"chat {chat}. Reversible; no message content."
+            ),
+        )
     if op == "send":
         chat = str(tool_input.get("chat_id", "?"))
         text = str(tool_input.get("text", ""))

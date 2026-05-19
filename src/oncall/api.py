@@ -112,7 +112,7 @@ class MemoryOpBody(BaseModel):
 
 class MessengerOpBody(BaseModel):
     op: Literal[
-        "list", "read", "mark_read", "style", "send", "read_image",
+        "list", "read", "mark_read", "style", "send", "react", "read_image",
         "transcribe",
         "history", "search", "search_messages", "list_chats",
     ]
@@ -120,6 +120,7 @@ class MessengerOpBody(BaseModel):
     message_id: str | None = None
     inbox_id: str | None = None
     text: str | None = None
+    emoji: str | None = None
     query: str | None = None
     # Per-op default applied at the router. `read_inbox` reads as True
     # if unset; `list_chats` reads as False.
@@ -1244,6 +1245,13 @@ def _register_routes(app: FastAPI) -> None:
             if not body.chat_id or not body.text:
                 raise HTTPException(400, "chat_id and text required")
             return await tg.send(body.chat_id, body.text)
+        if body.op == "react":
+            if not body.chat_id or not body.message_id or not body.emoji:
+                raise HTTPException(400, "chat_id, message_id, emoji required")
+            try:
+                return await tg.react(body.chat_id, body.message_id, body.emoji)
+            except ValueError as e:
+                raise HTTPException(422, str(e))
         raise HTTPException(400, f"unknown op {body.op!r}")
 
     @app.post("/internal/memory", dependencies=[Depends(verify_loopback)])
@@ -1363,7 +1371,7 @@ def _register_routes(app: FastAPI) -> None:
 # would have to match; for now the simplest defensible behaviour is to
 # refuse them too, since a restricted executor has no legitimate reason
 # to read arbitrary inbox ids it didn't itself discover.
-_MESSENGER_OPS_LOCKED_TO_CHAT_ID = {"style", "send", "history", "search_messages", "read_image", "transcribe"}
+_MESSENGER_OPS_LOCKED_TO_CHAT_ID = {"style", "send", "react", "history", "search_messages", "read_image", "transcribe"}
 _MESSENGER_OPS_REFUSED_WHEN_RESTRICTED = {"list", "list_chats", "search", "read", "mark_read"}
 
 
