@@ -141,7 +141,13 @@ async def list_tools() -> list[Tool]:
                 "person/group by name.\n"
                 "  history        — last N messages of one chat by `chat_id`, BOTH "
                 "directions. Each message has `message_id`, `text`, `outgoing`, "
-                "`has_media`. Works for any chat type.\n"
+                "`has_media`. Works for any chat type. `limit` is clamped to "
+                "[10, 50] for this op — pick a value in that range based on how "
+                "much context you need. Optional `since` (ISO 8601, e.g. "
+                "\"2026-05-19T14:00:00Z\" or \"2026-05-19 14:00:00\") returns up to "
+                "`limit` messages at-or-after that moment in chronological order "
+                "(oldest first); without `since`, returns the most recent `limit` "
+                "messages newest-first.\n"
                 "  search_messages— full-text search within ONE chat. Required `chat_id` "
                 "and `query`. Same row shape as history. Use for 'did we talk about X with Y'.\n"
                 "  read_image     — load a Telegram attachment as an inline image. "
@@ -177,6 +183,7 @@ async def list_tools() -> list[Tool]:
                     "text":        {"type": "string"},
                     "emoji":       {"type": "string", "enum": ["👍", "❤️", "🔥", "😁"]},
                     "query":       {"type": "string"},
+                    "since":       {"type": "string", "description": "ISO 8601 timestamp for op=history"},
                     "unread_only": {"type": "boolean", "default": True},
                     "dms_only":    {"type": "boolean", "default": False},
                     "limit":       {"type": "integer", "default": 20},

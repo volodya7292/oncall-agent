@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import httpx
 from typing import Any, Literal
@@ -122,6 +123,10 @@ class MessengerOpBody(BaseModel):
     text: str | None = None
     emoji: str | None = None
     query: str | None = None
+    # ISO 8601 timestamp for `op=history`: when set, return up to `limit`
+    # messages at-or-after this moment, oldest-first. Naive datetimes are
+    # interpreted as UTC.
+    since: str | None = None
     # Per-op default applied at the router. `read_inbox` reads as True
     # if unset; `list_chats` reads as False.
     unread_only: bool | None = None
@@ -1223,7 +1228,18 @@ def _register_routes(app: FastAPI) -> None:
         if body.op == "history":
             if not body.chat_id:
                 raise HTTPException(400, "chat_id required")
-            return {"messages": await tg.get_chat_history(body.chat_id, limit=body.limit)}
+            since_dt: datetime | None = None
+            if body.since:
+                try:
+                    since_dt = datetime.fromisoformat(body.since)
+                except ValueError:
+                    raise HTTPException(422, f"invalid since timestamp: {body.since!r}")
+                if since_dt.tzinfo is None:
+                    since_dt = since_dt.replace(tzinfo=timezone.utc)
+            history_limit = max(10, min(50, body.limit))
+            return {"messages": await tg.get_chat_history(
+                body.chat_id, limit=history_limit, since=since_dt,
+            )}
         if body.op == "search":
             if not body.query:
                 raise HTTPException(400, "query required")

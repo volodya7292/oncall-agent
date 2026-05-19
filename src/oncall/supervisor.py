@@ -17,6 +17,7 @@ import logging
 import os
 import signal
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -221,7 +222,7 @@ class Supervisor:
             "--permission-mode", "default",
             "--permission-prompt-tool", "mcp__oncall__approve",
             "--effort", "medium",
-            "--append-system-prompt", self._paths.executor_prompt.read_text(encoding="utf-8"),
+            "--append-system-prompt", self._render_executor_prompt(),
             # Persistence is REQUIRED in the single-session model: every
             # hand_off after the first uses --resume to pick up the same
             # session. --no-session-persistence would erase the session
@@ -240,6 +241,17 @@ class Supervisor:
         else:
             argv += ["--session-id", session_id]
         return argv
+
+    def _render_executor_prompt(self) -> str:
+        """Read the executor system prompt and substitute spawn-time
+        placeholders. Currently: `{{current_date}}` → ISO UTC datetime
+        captured at spawn — the executor's headless `--print` session
+        doesn't get a reliable date in its built-in context, so we inject
+        one explicitly. Long-running resumed sessions still see the
+        date refresh on each spawn (one per hand_off)."""
+        text = self._paths.executor_prompt.read_text(encoding="utf-8")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        return text.replace("{{current_date}}", now)
 
     async def _write_user_turn(self, text: str) -> None:
         assert self._proc and self._proc.stdin

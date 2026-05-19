@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 from uuid import uuid4
@@ -35,6 +35,7 @@ from .db import Database
 
 
 ARCHIVED_CACHE_TTL_SECONDS = 1800.0  # 30 min — archive state changes rarely
+_ONE_SECOND = timedelta(seconds=1)
 
 # Allowed reactions for the executor's `op=react` tool. Telegram's free
 # reaction set is larger; we expose only this curated 4 to keep prompt
@@ -358,10 +359,15 @@ class TelegramService:
         return samples
 
     async def get_chat_history(
-        self, chat_id: str, *, limit: int = 10,
+        self, chat_id: str, *, limit: int = 10, since: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        """Return the last N messages of a chat, BOTH sides. Each row:
+        """Return up to `limit` messages of a chat, BOTH sides. Each row:
             message_id, text, date, outgoing, sender_username, sender_display_name, has_media.
+
+        When `since` is None, returns the most recent `limit` messages,
+        newest first. When `since` is set, returns up to `limit` messages
+        at or after that moment, oldest first (chronological forward) —
+        used for "what was happening starting at T".
 
         Media-only messages (photo / document / etc. with no caption) get
         a synthetic body like `[photo]` / `[file: name.pdf]` so the
@@ -373,8 +379,16 @@ class TelegramService:
         includes the counterparty's messages — use it when the user asks
         'what did X say?'."""
         entity = _entity_arg(chat_id)
+        iter_kwargs: dict[str, Any] = {"limit": limit}
+        if since is not None:
+            # telethon: in default direction, offset_date returns messages
+            # STRICTLY OLDER than the date; with reverse=True, returns
+            # messages STRICTLY NEWER. We want at-or-after, so subtract
+            # 1 second to make the "strictly newer" boundary inclusive.
+            iter_kwargs["offset_date"] = since.replace(microsecond=0) - _ONE_SECOND
+            iter_kwargs["reverse"] = True
         out: list[dict[str, Any]] = []
-        async for msg in self._client.iter_messages(entity, limit=limit):
+        async for msg in self._client.iter_messages(entity, **iter_kwargs):
             text = getattr(msg, "message", None) or ""
             has_media = bool(getattr(msg, "media", None))
             if not text and not has_media:
