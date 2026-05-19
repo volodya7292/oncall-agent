@@ -1293,7 +1293,7 @@ def _register_routes(app: FastAPI) -> None:
         task = await db.get_task_by_session(body.session_id)
         if task is None:
             raise HTTPException(404, "task not found for session_id")
-        chat_session_id = task.chat_session_id
+        chat_session_id = task.dispatched_by_chat_session
         if not chat_session_id:
             raise HTTPException(409, "task has no chat_session_id; cannot ask")
         ask_id = str(uuid4())
