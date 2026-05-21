@@ -4,9 +4,10 @@ Stores the actual memory texts the user flagged from production logs, runs
 the periodic LLM dedup pass against them, and prints the decisions. The
 correctness bar:
 
-  * Cluster of same-template-different-person memories (Alex vs Anna):
-    must be KEPT separate — silently merging them is the bug we're fixing.
-  * Cluster of paraphrases of one fact about ONE person (two Sam
+  * Cluster of same-template-different-person memories (Person A vs
+    Person B): must be KEPT separate — silently merging them is the
+    bug we're fixing.
+  * Cluster of paraphrases of one fact about ONE person (two
     phrasings): must be MERGED into one consolidated entry.
   * Truly unrelated memories: not even clustered (cos < 0.80).
 
