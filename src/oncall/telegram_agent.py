@@ -26,9 +26,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re as _re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from .approval_client import is_deny_phrase, phrases_match
 from .audit import fmt, telegram_log
@@ -53,6 +55,26 @@ log = logging.getLogger(__name__)
 # Per-attachment cap. Mirrors the bot's old _ATTACHMENT_MAX_BYTES — sized for
 # screenshots, small PDFs, etc.; well within Gemini's inline-data limit.
 _ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024
+
+# Where inbound attachments are written so the executor can `Read` / `Bash`
+# them by absolute path. One subdir per attachment so collisions on
+# `filename` (multiple users sending "image.png") can't clobber each other.
+_INBOUND_DIR = Path("~/.oncall/inbound").expanduser()
+_FILENAME_SAFE = _re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _persist_inbound_attachment(data: bytes, filename: str | None) -> Path:
+    """Write `data` to ~/.oncall/inbound/<uuid>/<safe-filename> and return
+    the absolute path. Returned path is included in the operator's user
+    message so the executor can find and read the file."""
+    _INBOUND_DIR.mkdir(parents=True, exist_ok=True)
+    subdir = _INBOUND_DIR / uuid4().hex
+    subdir.mkdir(parents=True, exist_ok=False)
+    raw = (filename or "attachment").strip() or "attachment"
+    safe = _FILENAME_SAFE.sub("_", raw)[:120] or "attachment"
+    out = subdir / safe
+    out.write_bytes(data)
+    return out
 
 
 def agent_session_id(owner_user_id: int) -> str:
@@ -275,13 +297,29 @@ class TelegramAgentService:
                 mime = (getattr(f, "mime_type", None) if f else None) \
                     or "application/octet-stream"
                 fname = (getattr(f, "name", None) if f else None) or "attachment"
+                # Persist to disk so a follow-on executor turn can Read/Bash
+                # the file by path. We KEEP the inline base64 too — the
+                # operator (multimodal Gemini) reads images/PDFs directly
+                # from bytes; the disk path is for the executor.
+                local_path: Path | None = None
+                try:
+                    local_path = _persist_inbound_attachment(data, fname)
+                except Exception:
+                    log.exception("agent: persist inbound attachment failed")
                 attachments.append({
                     "data_b64": base64.b64encode(data).decode("ascii"),
                     "mime_type": mime,
                     "size_bytes": len(data),
                     "source": f"telegram agent ({fname})",
+                    **({"local_path": str(local_path)} if local_path else {}),
                 })
-                if not text:
+                if local_path:
+                    note = (
+                        f"[file attached: {local_path} "
+                        f"({mime}, {len(data)} bytes)]"
+                    )
+                    text = f"{text}\n{note}".strip() if text else note
+                elif not text:
                     text = "(attachment — please look at the image)"
         if not text:
             return

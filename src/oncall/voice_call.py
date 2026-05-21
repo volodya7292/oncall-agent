@@ -110,6 +110,16 @@ VAD_BARGE_IN_MS = 150      # voice during TTS that cancels playback
 # HTTP timeouts. TTS can return seconds of audio; STT can do long files.
 HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=60.0)
 
+# `send_frame` watchdog. A single 10 ms PCM frame should round-trip into
+# pytgcalls instantly; if ntgcalls's native send buffer back-presses, it
+# can block our outbound loop for tens of seconds. 1.0 s is generous —
+# anything longer means the call is effectively stuck.
+SEND_FRAME_TIMEOUT_S = 1.0
+# Inactivity watchdog on `_speak()`'s outer loop: if neither a frame
+# arrives nor barge-in fires for this many seconds, abandon the current
+# TTS so queued items (esp. approval prompts) can play.
+SPEAK_IDLE_TIMEOUT_S = 3.0
+
 
 @dataclass
 class _ActiveCall:
@@ -141,11 +151,15 @@ class CallService:
         stt_base_url: str,
         stt_api_key: str,
         language: str = "",
+        llm: Any = None,                   # operator's LLMClient for paraphrase
+        llm_model: str = "",
     ) -> None:
         self._client = client
         self._operator = operator
         self._events = events
         self._broker = broker
+        self._llm = llm
+        self._llm_model = llm_model
         self._owner_user_id = int(owner_user_id)
         self._tts_base_url = tts_base_url.rstrip("/")
         self._tts_api_key = tts_api_key
@@ -525,11 +539,26 @@ class CallService:
             while True:
                 get_task = asyncio.create_task(frame_queue.get())
                 barge_task = asyncio.create_task(active.barge_in.wait())
+                # Only enforce the idle watchdog AFTER playback has started.
+                # Before the first frame, we're waiting on the producer's
+                # TTS HTTP call (already bounded by HTTP_TIMEOUT=60s); a
+                # long TTS HTTP is normal for long text, not a bug.
+                wait_timeout = SPEAK_IDLE_TIMEOUT_S if sent_frames > 0 else None
                 done, pending = await asyncio.wait(
                     {get_task, barge_task}, return_when=asyncio.FIRST_COMPLETED,
+                    timeout=wait_timeout,
                 )
                 for t in pending:
                     t.cancel()
+                if not done:
+                    log.warning(
+                        "voice: TTS speak idle watchdog tripped after %.1fs "
+                        "(sent %d frames); abandoning current utterance so "
+                        "queued items can play",
+                        SPEAK_IDLE_TIMEOUT_S, sent_frames,
+                    )
+                    producer.cancel()
+                    return
                 if barge_task in done:
                     log.info("voice: barge-in after %d frames (%.0fms)",
                              sent_frames, sent_frames * FRAME_MS)
@@ -541,10 +570,21 @@ class CallService:
                              sent_frames, sent_frames * FRAME_MS)
                     return
                 try:
-                    await self._call_py.send_frame(  # type: ignore[union-attr]
-                        active.chat_id, self._Device.MICROPHONE, frame,
+                    await asyncio.wait_for(
+                        self._call_py.send_frame(  # type: ignore[union-attr]
+                            active.chat_id, self._Device.MICROPHONE, frame,
+                        ),
+                        timeout=SEND_FRAME_TIMEOUT_S,
                     )
                     sent_frames += 1
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "voice: send_frame timed out after %.1fs at frame %d; "
+                        "abandoning current utterance (ntgcalls back-pressure?)",
+                        SEND_FRAME_TIMEOUT_S, sent_frames,
+                    )
+                    producer.cancel()
+                    return
                 except Exception:
                     log.exception("voice: send_frame failed at frame %d", sent_frames)
                     producer.cancel()
@@ -642,13 +682,16 @@ class CallService:
                 canonical = (payload.get("canonical_command") or "").strip()
                 blast = (payload.get("blast_radius") or "").strip()
                 active.pending_approvals[str(approval_id)] = phrase
-                prompt = "Need approval."
-                if canonical:
-                    prompt += f" {canonical}."
-                if blast:
-                    prompt += f" {blast}"
-                prompt += f" Say '{phrase}' to allow, or 'no' to deny."
+                prompt = await self._build_voice_approval_prompt(
+                    canonical=canonical, blast=blast, phrase=phrase,
+                )
                 await self._enqueue_text(active, prompt)
+                # Approvals trump in-flight chitchat. Set barge_in so any
+                # current TTS cancels and the approval plays next. (The
+                # outbound loop clears barge_in at the start of each _speak,
+                # so the approval prompt itself plays normally.)
+                if active.is_speaking:
+                    active.barge_in.set()
                 _audit.info(
                     "voice approval prompt approval=%s task=%s canonical=%r",
                     approval_id, task_id_str, canonical,
@@ -658,6 +701,66 @@ class CallService:
         except Exception:
             log.exception("voice approval subscriber crashed")
             raise
+
+    async def _build_voice_approval_prompt(
+        self, *, canonical: str, blast: str, phrase: str,
+    ) -> str:
+        """Ask the operator's LLM for a short, speakable, localized version
+        of the approval request. Strips IDs / paths / byte counts that are
+        useful in text chat but noise when spoken.
+
+        Falls back to a generic minimal phrase if the LLM call fails or
+        isn't configured."""
+        fallback_generic = (
+            f"Потрібен дозвіл. Скажи '{phrase}' щоб підтвердити, "
+            f"або 'no' щоб відхилити."
+            if (self._language or "").lower() == "uk"
+            else f"I need your approval. Say '{phrase}' to allow, "
+                 f"or 'no' to deny."
+        )
+        if self._llm is None or not self._llm_model:
+            return fallback_generic
+        lang_clause = (
+            f"Respond in: {self._language}."
+            if self._language else
+            "Respond in the user's language (infer from the inputs)."
+        )
+        system = (
+            "Convert a security approval request into a short, conversational "
+            "single sentence that will be spoken aloud over a voice call. "
+            "Rules:\n"
+            "- ONE sentence. Plain spoken language.\n"
+            "- Drop chat IDs, full file paths, byte counts, mime types. "
+            "  Use 'file <basename>' for paths, 'a contact' for chat IDs.\n"
+            "- Drop the blast-radius warning entirely (the user sees that "
+            "  in their text chat for the full version).\n"
+            f"- {lang_clause}\n"
+            f"- End with the exact instruction: «Скажи '{phrase}' щоб "
+            f"  підтвердити, або 'no' щоб відхилити.» if you're responding "
+            f"  in Ukrainian, or the equivalent in the response language. "
+            "Use single quotes around the phrase verbatim.\n"
+            "Output ONLY the sentence — no preamble, no quotes around it."
+        )
+        user = (
+            f"Action to confirm: {canonical}\n"
+            f"Security note (do NOT include in output): {blast}"
+        )
+        try:
+            resp = await self._llm.chat(
+                model=self._llm_model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                tools=[],
+                max_tokens=200,
+            )
+            text = (resp.get("content") or "").strip()
+            if text:
+                return text
+        except Exception:
+            log.exception("voice: approval-prompt paraphrase failed")
+        return fallback_generic
 
     async def _approval_resolved_subscriber(self, active: _ActiveCall) -> None:
         """Drop pending entries once an approval is resolved (by us, by

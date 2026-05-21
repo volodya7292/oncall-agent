@@ -311,7 +311,7 @@ def create_app() -> FastAPI:
         if telegram_agent is not None and operator is not None:
             voice_call = await _maybe_start_voice_call(
                 settings, operator=operator, events=events, broker=broker,
-                telegram_agent=telegram_agent,
+                telegram_agent=telegram_agent, llm=llm,
             )
 
         app.state.db = db
@@ -1010,7 +1010,7 @@ async def _maybe_start_telegram_agent(
 
 async def _maybe_start_voice_call(
     settings, *, operator: Operator, events: EventBus, broker: Broker,
-    telegram_agent: TelegramAgentService,
+    telegram_agent: TelegramAgentService, llm: Any = None,
 ) -> CallService | None:
     """Boot the 1:1 voice CallService on the agent userbot's telethon
     session if VOICE_CALL_ENABLED + all STT/TTS env vars are set. Returns
@@ -1042,6 +1042,8 @@ async def _maybe_start_voice_call(
             stt_base_url=settings.voice_stt_base_url,
             stt_api_key=settings.voice_stt_api_key,
             language=settings.operator_language,
+            llm=llm,
+            llm_model=settings.oncall_operator_model,
         )
         await service.start()
         return service
