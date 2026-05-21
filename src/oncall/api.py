@@ -39,7 +39,7 @@ from .local_claude import ClaudeCliRunner
 from .operator import GatewayLLMClient, GenAILLMClient, Operator
 from .operator_memory import OperatorMemory
 from .result_delivery import deliver_executor_result
-from .telegram_bot import HttpxBotApi, TelegramBotService
+from .telegram_agent import TelegramAgentService
 from .telegram_service import TelegramService, make_telethon_client
 from .voice import to_voice_text
 
@@ -210,12 +210,20 @@ def create_app() -> FastAPI:
                 "falling back to vercel gateway",
                 settings.oncall_operator_backend,
             )
-        # Telegram userbot — only set up if api_id/hash + session file are
-        # all present. Inbound DMs from senders listed in
-        # `telegram_userbot_ignore_usernames` are skipped at the handler.
+        # Primary Telegram userbot — runs on the owner's account. Inbound
+        # DMs from senders listed in `telegram_userbot_ignore_usernames`
+        # are skipped at the handler, as is the chat with the agent
+        # account (TELEGRAM_AGENT_USER_ID_FILE) so the user↔agent surface
+        # is never mis-classified as a relay-able inbox.
+        from .config import read_telegram_agent_user_id
+        agent_user_id_for_filter = read_telegram_agent_user_id()
         telegram: TelegramService | None = await _maybe_start_telegram(
             settings, db, events,
             ignore_usernames=settings.userbot_ignore_usernames,
+            ignore_user_ids=(
+                {agent_user_id_for_filter}
+                if agent_user_id_for_filter is not None else None
+            ),
         )
         # Shared one-shot Claude CLI runner — used by the operator for chat
         # context compression and by the auto-ping loop for per-task summaries.
@@ -272,20 +280,25 @@ def create_app() -> FastAPI:
                                   # the configured cheap model via Settings
                 runner=cli_runner,
             )
-        # Telegram bot front-end (optional, separate from userbot above).
-        telegram_bot: TelegramBotService | None = None
+        # Telegram agent userbot (user-facing surface — separate account
+        # from the primary userbot above). Replaces the old HTTP Bot API
+        # front-end. Voice calls (future) will bind here.
+        telegram_agent: TelegramAgentService | None = None
         if operator is not None:
-            telegram_bot = await _maybe_start_telegram_bot(
+            telegram_agent = await _maybe_start_telegram_agent(
                 settings, operator, events,
                 broker=broker, db=db, telegram=telegram,
             )
-        # Tell the userbot to ignore the bot's own replies — otherwise every
-        # outbound the bot front-end sends would re-enter the user's inbox.
-        if telegram is not None and telegram_bot is not None and telegram_bot.bot_user_id:
-            telegram.add_ignore_user_id(telegram_bot.bot_user_id)
+        # If the agent service is up and reports a different user_id than
+        # what was on disk at startup, update the primary userbot's peer
+        # filter so the agent chat doesn't leak into the relay inbox even
+        # in the brand-new-install case.
+        if telegram is not None and telegram_agent is not None \
+                and telegram_agent.agent_user_id is not None:
+            telegram.add_ignore_user_id(telegram_agent.agent_user_id)
             log.info(
-                "userbot will ignore inbound from bot (@%s, id=%d)",
-                telegram_bot.bot_username, telegram_bot.bot_user_id,
+                "primary userbot will ignore inbound from agent (id=%d)",
+                telegram_agent.agent_user_id,
             )
 
         app.state.db = db
@@ -296,7 +309,7 @@ def create_app() -> FastAPI:
         app.state.operator = operator
         app.state.memory = memory
         app.state.telegram = telegram
-        app.state.telegram_bot = telegram_bot
+        app.state.telegram_agent = telegram_agent
         app.state.ask_futures = ask_futures if operator is not None else {}
         # Orphaned asks from a previous run cannot be resolved (the
         # executor processes that owned the futures died with the
@@ -316,7 +329,7 @@ def create_app() -> FastAPI:
         # its final reply, compress to ≤300 chars if needed, dual-write to
         # the user (chat.reply) and the operator's history. Operator stays
         # out of this loop entirely — it already said "Looking…" earlier.
-        notify_sid = telegram_bot.session_id if telegram_bot is not None else None
+        notify_sid = telegram_agent.session_id if telegram_agent is not None else None
         auto_ping_task: asyncio.Task | None = None
         if operator is not None:
             auto_ping_task = asyncio.create_task(
@@ -328,17 +341,17 @@ def create_app() -> FastAPI:
                 name="result-delivery",
             )
             _supervise_bg_task(auto_ping_task, events, notify_sid, "result-delivery")
-        # Inbox drain: when the userbot lands an *important* inbound DM, push
-        # it into the bot front-end's session as an auto-ping so the user
-        # finds out immediately. Non-important DMs sit silently in
-        # messenger_inbox and are picked up later via /status or
-        # `read_inbox`. Requires the bot front-end (we ping its session).
+        # Inbox drain: when the primary userbot lands an *important* inbound DM,
+        # push it into the agent's session as an auto-ping so the user finds
+        # out immediately. Non-important DMs sit silently in messenger_inbox
+        # and are picked up later via /status or `read_inbox`. Requires the
+        # agent userbot (we ping its session).
         inbox_drain_task: asyncio.Task | None = None
-        if operator is not None and telegram_bot is not None:
+        if operator is not None and telegram_agent is not None:
             inbox_drain_task = asyncio.create_task(
                 _inbox_drain_loop(
                     events=events, operator=operator, db=db,
-                    target_session_id=telegram_bot.session_id,
+                    target_session_id=telegram_agent.session_id,
                     telegram=telegram,
                 ),
                 name="inbox-drain",
@@ -376,10 +389,10 @@ def create_app() -> FastAPI:
                     stale_before, settings.oncall_memory_embed_model,
                 )
                 # Fire-and-forget — the task notifies on completion via the
-                # bot; nothing in the lifespan waits on it.
+                # agent; nothing in the lifespan waits on it.
                 asyncio.create_task(
                     _rebuild_memory_then_notify(
-                        operator.memory, telegram_bot,
+                        operator.memory, telegram_agent,
                         stale=stale_before,
                         model=settings.oncall_memory_embed_model,
                     ),
@@ -387,17 +400,17 @@ def create_app() -> FastAPI:
                 )
 
         # Startup notification to the owner — single message summarizing what
-        # came up cleanly and what's degraded. Sent only if the bot is up
-        # (no bot → no way to notify). The probes are best-effort: a failed
+        # came up cleanly and what's degraded. Sent only if the agent is up
+        # (no agent → no way to notify). The probes are best-effort: a failed
         # probe means "couldn't verify", not "definitely broken".
-        if telegram_bot is not None:
+        if telegram_agent is not None:
             status = await _build_startup_status(
                 settings=settings, operator=operator,
                 telegram_userbot=telegram is not None,
                 lifecycle=lifecycle,
                 stale_memories=stale_before,
             )
-            await telegram_bot.notify_owner(status)
+            await telegram_agent.notify_owner(status)
         try:
             yield
         finally:
@@ -410,8 +423,8 @@ def create_app() -> FastAPI:
                 except (asyncio.CancelledError, Exception):
                     pass
             await lifecycle.shutdown()
-            if telegram_bot is not None:
-                await telegram_bot.stop()
+            if telegram_agent is not None:
+                await telegram_agent.stop()
             if telegram is not None:
                 await telegram.stop()
             await db.close()
@@ -491,9 +504,9 @@ async def _result_delivery_loop(
     chat history so the operator's next turn sees "what I said."
 
     Approval requests are NOT relayed through the operator — the
-    telegram bot's `_approval_subscriber` shows the Yes/No buttons
-    directly. The operator stays out of the executor's loop entirely
-    after hand_off."""
+    telegram agent's `_approval_subscriber` sends the challenge-phrase
+    prompt directly. The operator stays out of the executor's loop
+    entirely after hand_off."""
     from uuid import UUID
     consecutive_crashes = 0
     while True:
@@ -888,7 +901,7 @@ async def _build_startup_status(
 
 
 async def _rebuild_memory_then_notify(
-    memory, telegram_bot, *, stale: int, model: str,
+    memory, telegram_agent, *, stale: int, model: str,
 ) -> None:
     """Background task: re-embed all rows whose stored model differs from
     `model`, then ping the owner with the result. Errors are surfaced as a
@@ -897,63 +910,93 @@ async def _rebuild_memory_then_notify(
         result = await memory.rebuild_stale_embeddings()
     except Exception as e:
         log.exception("memory rebuild crashed")
-        if telegram_bot is not None:
-            await telegram_bot.notify_owner(
+        if telegram_agent is not None:
+            await telegram_agent.notify_owner(
                 f"⚠️ memory rebuild crashed: {type(e).__name__}: {e}"
             )
         return
-    if telegram_bot is None:
+    if telegram_agent is None:
         return
     rebuilt = result.get("rebuilt", 0)
     failed = result.get("failed", 0)
     if failed:
-        await telegram_bot.notify_owner(
+        await telegram_agent.notify_owner(
             f"⚠️ memory rebuild partial: {rebuilt}/{stale} rebuilt, "
             f"{failed} failed (model={model}). Will retry next boot."
         )
     else:
-        await telegram_bot.notify_owner(
+        await telegram_agent.notify_owner(
             f"🔧 memory rebuilt: {rebuilt} row(s) re-embedded with {model}"
         )
 
 
-async def _maybe_start_telegram_bot(
+async def _maybe_start_telegram_agent(
     settings, operator: Operator, events: EventBus,
     *, broker, db: Database, telegram: TelegramService | None = None,
-) -> TelegramBotService | None:
-    """Boot the Telegram bot front-end if a token + owner_id are set. Uses
-    the HTTP Bot API, so api_id/api_hash are NOT required. Logs and returns
-    None on misconfiguration / start failure — the rest of the API stays up."""
-    if not settings.telegram_bot_token:
-        log.info("telegram bot disabled: TELEGRAM_BOT_TOKEN not set")
+) -> TelegramAgentService | None:
+    """Boot the Telegram agent userbot if its session file + api credentials
+    are present. The agent is the user-facing chat surface (replaces the old
+    Bot API front-end). Logs and returns None on misconfiguration / start
+    failure — the rest of the API stays up."""
+    if not (settings.telegram_api_id and settings.telegram_api_hash):
+        log.info(
+            "telegram agent disabled: TELEGRAM_API_ID/HASH not set. "
+            "Both the primary userbot and the agent userbot share the same "
+            "application credential.",
+        )
         return None
-    if not settings.telegram_bot_owner_id:
+    session_path = settings.telegram_agent_session_path
+    if not session_path.exists():
         log.warning(
-            "telegram bot disabled: TELEGRAM_BOT_OWNER_ID not set. "
+            "telegram agent disabled: session not found at %s; "
+            "run `oncall telegram-login --agent` on a SEPARATE Telegram account.",
+            session_path,
+        )
+        return None
+    if not settings.telegram_owner_user_id:
+        log.warning(
+            "telegram agent disabled: TELEGRAM_OWNER_USER_ID not set. "
             "Get your numeric user id from @userinfobot."
         )
         return None
     try:
-        owner_id = int(settings.telegram_bot_owner_id)
+        owner_id = int(settings.telegram_owner_user_id)
     except (TypeError, ValueError):
-        log.warning("telegram bot disabled: TELEGRAM_BOT_OWNER_ID must be an integer")
+        log.warning(
+            "telegram agent disabled: TELEGRAM_OWNER_USER_ID must be an integer"
+        )
         return None
     try:
-        api = HttpxBotApi(settings.telegram_bot_token)
-        service = TelegramBotService(
-            api=api, operator=operator, events=events, owner_user_id=owner_id,
-            broker=broker, db=db, telegram=telegram,
+        client = make_telethon_client(
+            api_id=int(settings.telegram_api_id),
+            api_hash=settings.telegram_api_hash,
+            session_path=session_path,
+        )
+        service = TelegramAgentService(
+            client=client, operator=operator, events=events,
+            owner_user_id=owner_id, broker=broker, db=db, telegram=telegram,
         )
         await service.start()
+        # Persist the agent's discovered user_id so the primary userbot's
+        # peer filter has it on next boot, even if this is the very first
+        # daemon start after `telegram-login --agent`.
+        if service.agent_user_id is not None:
+            from .config import (
+                read_telegram_agent_user_id, write_telegram_agent_user_id,
+            )
+            if read_telegram_agent_user_id() != service.agent_user_id:
+                write_telegram_agent_user_id(service.agent_user_id)
         return service
     except Exception:
-        log.exception("telegram bot failed to start; continuing without it")
+        log.exception("telegram agent failed to start; continuing without it")
         return None
 
 
 async def _maybe_start_telegram(
     settings, db: Database, events: EventBus,
-    *, ignore_usernames: set[str] | None = None,
+    *,
+    ignore_usernames: set[str] | None = None,
+    ignore_user_ids: set[int] | None = None,
 ) -> TelegramService | None:
     """Boot the telethon listener if credentials and a session file are present.
     Failures are logged but never crash the API — `/chat` and tasks still work
@@ -982,6 +1025,7 @@ async def _maybe_start_telegram(
             important_keywords=settings.important_keywords,
             on_new_message=_emit_received,
             ignore_usernames=ignore_usernames or set(),
+            ignore_user_ids=ignore_user_ids or set(),
         )
         await service.start()
         return service

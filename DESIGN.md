@@ -34,7 +34,11 @@ The classifier is the universal gate — it doesn't care whether a command is lo
 - **MCP servers we provide** (registered inline via `--mcp-config <json>` at spawn time by the supervisor): `oncall` (the approval broker + `messenger_inbox`). Built-in CLI tools (Bash, Read, Edit, Write, Grep, Glob, WebFetch) are used directly with the allow/deny rules; mutations route through the broker via `--permission-prompt-tool`. SSH and DB access happen via Bash (`ssh …`, `psql -c …`) under the same classifier rules as everything else.
 - **Durable state:** SQLite file (single-user; migrate to Postgres later if needed).
 - **Telephony:** deferred — defined behind an interface so any client (Android app, future SIP gateway, CLI) can drive approvals.
-- **Messenger: Telegram is the primary** (per user, 2026-05-16) — and it's a *userbot*, not a bot account. The agent reads and sends as the user's own Telegram account via MTProto (`telethon`). Bot accounts can't see inbound DMs from arbitrary people; only userbots can, which is what this flow requires. Other messengers (Slack/Discord/etc.) bolt on later via the `MessengerProvider` Protocol.
+- **Messenger: Telegram is the primary** (per user, 2026-05-16). Two userbot sessions share one application credential, distinguished by session file:
+  - **Primary userbot** runs on the user's own Telegram account. Reads inbound DMs from third parties for triage + reply-on-behalf; sends on the user's behalf through the broker. Bot accounts can't see DMs from arbitrary people; only userbots can.
+  - **Agent userbot** runs on a SECOND dedicated Telegram account. This is the user-facing chat surface: the owner DMs it, slash commands land here, approvals come here, future voice calls bind here.
+  - **Peer filter**: each session drops messages to/from the other account (1:1 chat_id == other party's user_id). The agent's user_id is auto-discovered at `telegram-login --agent` and persisted to `~/.oncall/telegram_agent_user_id` for the primary's NewMessage handler to load at boot.
+  - Rationale for two userbots instead of bot + userbot (decided 2026-05-21): bots can't receive Telegram voice calls; 1:1 userbot voice calls are E2EE; one MTProto transport beats telethon + httpx Bot API; and a prompt-injected third-party DM can no longer reach the same channel where the user issues commands. Other messengers (Slack/Discord/etc.) bolt on later via the `MessengerProvider` Protocol.
 - **First slice:** No voice. The "approval surface" is the agent's HTTP API; a fake/test client can play the role of the future phone app.
 
 ### Non-goals (this iteration)
@@ -97,7 +101,7 @@ Telegram msg
                 (operator's next turn naturally sees "what I just told the user")
 ```
 
-The Telegram bot (`telegram_bot.py`) is the primary user-facing client; it's just one HTTP client of the orchestrator. A future Android phone app or voice gateway plugs in at the same seam.
+The Telegram agent userbot (`telegram_agent.py`) is the primary user-facing client; it owns its own telethon session on a dedicated Telegram account. A future voice client (pytgcalls on the same agent session) plugs in at the same seam.
 
 ### 2. Module / package layout
 
@@ -127,7 +131,8 @@ The Telegram bot (`telegram_bot.py`) is the primary user-facing client; it's jus
     ├── api.py                          # FastAPI: /chat, /tasks, SSE
     ├── mcp_server.py                   # stdio MCP: approve, messenger_inbox, ask_user, memory, image/transcribe
     ├── telegram_service.py             # long-lived telethon userbot: inbound DMs + get_chat_unread_count
-    ├── telegram_bot.py                 # user-facing client: /clear /compress /status /allowdm /denydm; bridges Telegram ↔ operator
+    ├── telegram_agent.py               # user-facing client (telethon, second account): /clear /compress /status /allowdm /denydm; bridges Telegram ↔ operator; text-only approvals
+    ├── telegram_format.py              # pure formatting helpers shared with the agent (chunking, label rendering, relative-age)
     ├── result_delivery.py              # executor terminal → ≤300 char compress → dual-write (chat.reply + operator history)
     └── main.py                         # entrypoints: `oncall api`, `oncall mcp`, `oncall telegram-login`
 └── tests/
@@ -372,13 +377,16 @@ Before relaying, `_flush_chat` calls `telegram.get_chat_unread_count(chat_id)` v
 
 **Dialogue state.** Persisted to `chat_sessions` / `chat_messages` so a client reconnect resumes the same context. The result-delivery path (see §18) appends executor output as an `assistant`-role row before the next operator turn loads history, so the operator's next prompt naturally contains "what I just told the user" without a re-invocation. Rolling compression and `/clear` / `/compress` slash commands work as before.
 
-**Telegram bot client (`telegram_bot.py`).** Primary user-facing surface — bridges Telegram ↔ operator `chat_turn` and consumes `chat.reply` events back out. Slash commands:
+**Telegram agent client (`telegram_agent.py`).** Primary user-facing surface — bridges Telegram ↔ operator `chat_turn` and consumes `chat.reply` events back out. Runs as a telethon userbot on a SECOND Telegram account; the primary userbot (DM-relay on the user's own account) is a separate session in the same process. Slash commands:
 - `/clear` — wipes session chat history (memory untouched, cross-session).
 - `/compress` — force a compression checkpoint.
 - `/status` — DB snapshot: queue depth, busy state, current task id, pending approvals, unread DMs, operator model, memory size.
 - `/allowdm <chat_id>` / `/denydm <chat_id>` — add/remove a chat from the `dm_allowlist` table used by the broker for `op=send` auto-approve.
+- `/yes <id>` / `/no <id>` — resolve a pending deferred dispatch (operator-initiated `dispatch_task` during an autonomous reply turn). For tool-call approvals, type the challenge phrase instead.
 
-**Empty-reply fallback.** If the operator hand_off'd and emitted no visible text (model glitch), `telegram_bot._dispatch` substitutes "Looking." rather than sending "(empty reply)".
+**Approvals are text-only.** When the broker emits `approval.requested`, the agent service sends a single text message with the canonical command, blast radius, and challenge phrase. The user types the phrase as a normal chat message; `_try_resolve_approval` matches against the pending dict and calls `broker.submit_response(allow, phrase)`. Wrong phrase = the agent treats the text as a normal chat turn (operator handles it); the approval keeps waiting until timeout or an explicit `/no <approval_id>`. Userbots can't send inline keyboards — that was a Bot-API-only feature, retired with the bot.
+
+**Empty-reply fallback.** If the operator hand_off'd and emitted no visible text (model glitch), the agent's inbound handler substitutes "Looking." rather than sending "(empty reply)".
 
 **Kill-phrase pre-filter.** Removed. Without `kill_task` on the operator surface and with the single-worker FIFO, there's no operator-level kill path — emergency abort is `oncall service restart`.
 

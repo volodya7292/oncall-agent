@@ -16,10 +16,38 @@ _PACKAGE_DIR = Path(__file__).resolve().parent
 # here. The project-local .env (if present) overrides — handy for dev.
 USER_CONFIG_DIR = Path("~/.oncall").expanduser()
 USER_ENV_FILE = USER_CONFIG_DIR / ".env"
-# Owner display name (set by the bot's /setownername command). Read at
+# Owner display name (set by the agent's /setownername command). Read at
 # every operator turn so updates take effect without a daemon restart.
 OWNER_NAME_FILE = USER_CONFIG_DIR / "owner_name.txt"
-OWNER_NAME_UNSET = "(unknown — ask the user to set their name with /setownername in the Telegram bot)"
+OWNER_NAME_UNSET = "(unknown — ask the user to set their name with /setownername in the Telegram agent.)"
+
+# Auto-written by `oncall telegram-login --agent` on success. Holds the
+# numeric user_id of the agent Telegram account so the primary userbot's
+# NewMessage handler can filter the user↔agent chat out of the inbox path.
+# Missing file = filter disabled (agent hasn't been provisioned yet).
+TELEGRAM_AGENT_USER_ID_FILE = USER_CONFIG_DIR / "telegram_agent_user_id"
+
+
+def read_telegram_agent_user_id() -> int | None:
+    try:
+        s = TELEGRAM_AGENT_USER_ID_FILE.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        import logging
+        logging.getLogger(__name__).warning(
+            "read_telegram_agent_user_id failed: %s", e,
+        )
+        return None
+    try:
+        return int(s) if s else None
+    except ValueError:
+        return None
+
+
+def write_telegram_agent_user_id(user_id: int) -> None:
+    USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    TELEGRAM_AGENT_USER_ID_FILE.write_text(str(int(user_id)), encoding="utf-8")
 
 # A single long-lived claude session is reused across every executor
 # invocation, so `claude --resume` accumulates context turn-to-turn.
@@ -171,7 +199,7 @@ class Settings(BaseSettings):
     @field_validator(
         "oncall_db_path",
         "telegram_session_path",
-        "telegram_bot_session_path",
+        "telegram_agent_session_path",
         mode="before",
     )
     @classmethod
@@ -193,31 +221,40 @@ class Settings(BaseSettings):
         """Auth value for the OpenAI client. Local API key wins; OIDC fallback."""
         return self.ai_gateway_api_key or self.vercel_oidc_token
 
+    # Telegram application credentials. Both the primary and agent userbot
+    # sessions use the SAME api_id/api_hash — the credential identifies the
+    # registered application (https://my.telegram.org/apps), not an account.
+    # The two sessions are distinguished only by their session file path.
     telegram_api_id: str = ""
     telegram_api_hash: str = ""
+
+    # Primary userbot — runs on the user's own Telegram account. Reads
+    # inbound DMs from third parties for triage + reply-by-proposal, sends
+    # on the user's behalf via the broker.
     telegram_session_path: Path = Field(
         default_factory=lambda: Path("~/.oncall/telegram.session").expanduser()
     )
+
     telegram_important_senders: str = ""
     telegram_important_keywords: str = "urgent,down,production,outage,critical"
     # Senders (lowercased @handles, comma-separated) whose messages should
-    # never reach the inbox. The own-bot front-end is auto-added at startup
-    # via its user_id (see telegram_bot.py + _wire_bot_into_userbot); this
-    # is for OTHER bots/people whose DMs you'd rather not see (e.g. service
-    # bots like @userinfobot).
+    # never reach the inbox. The agent userbot's own chat with the owner is
+    # filtered separately by chat_id (TELEGRAM_AGENT_USER_ID_FILE). This list
+    # is for OTHER senders you'd rather not see (e.g. service bots like
+    # @userinfobot).
     telegram_userbot_ignore_usernames: str = ""
 
-    # Telegram BOT front-end (separate from the userbot above). Talk to the
-    # operator over Telegram. This is the primary client.
-    # Get the token from @BotFather. OWNER_ID is the Telegram numeric user_id
-    # of the only person allowed to talk to this bot — fetch it from
-    # @userinfobot, or temporarily start the bot without OWNER_ID set and
-    # watch the audit log for the inbound sender_id when you DM yours.
-    telegram_bot_token: str = ""
-    telegram_bot_owner_id: str = ""   # numeric string; parsed to int at start
-    telegram_bot_session_path: Path = Field(
-        default_factory=lambda: Path("~/.oncall/telegram_bot.session").expanduser()
+    # Agent userbot — runs on a dedicated second Telegram account. This is
+    # the user-facing surface: the owner DMs it to talk to the operator,
+    # approval prompts arrive here, chat.reply auto-pings land here. Voice
+    # calls (future milestone) will also bind here.
+    telegram_agent_session_path: Path = Field(
+        default_factory=lambda: Path("~/.oncall/telegram_agent.session").expanduser()
     )
+    # Numeric Telegram user_id of the OWNER's primary account — the only
+    # sender the agent userbot will accept messages from. Get it from
+    # @userinfobot.
+    telegram_owner_user_id: str = ""
 
     @property
     def prod_hosts(self) -> set[str]:

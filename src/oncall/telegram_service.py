@@ -110,7 +110,13 @@ class TelegramService:
 
     def add_ignore_user_id(self, user_id: int) -> None:
         """Add a numeric user_id whose messages should be dropped from the
-        inbox. Safe to call any time — checked on each inbound."""
+        inbox. Safe to call any time — checked on each inbound.
+
+        Used at startup to populate the peer filter that drops the agent
+        userbot's chat with the owner from the primary inbox stream
+        (TELEGRAM_AGENT_USER_ID_FILE). In a 1:1 DM, chat_id == sender_id ==
+        the other party's user_id, so checking sender_id covers both the
+        "agent sends to owner" and "owner views chat with agent" cases."""
         self._ignore_user_ids.add(int(user_id))
 
     # ---- lifecycle ----
@@ -878,7 +884,7 @@ def make_telethon_client(
 
 async def login_qr_interactive(
     *, api_id: int, api_hash: str, session_path: Path,
-) -> None:
+) -> int | None:
     """QR-code login. Sidesteps SMS/in-app code delivery entirely — telethon
     asks the server for a single-use login token, we render it as a QR code
     in the terminal, the user scans it from an already-logged-in Telegram
@@ -896,7 +902,7 @@ async def login_qr_interactive(
         me = await client.get_me()
         print(f"Already logged in as @{getattr(me, 'username', None)} (id={getattr(me, 'id', None)}).")
         await client.disconnect()
-        return
+        return int(getattr(me, "id", 0)) or None
 
     print("Open Telegram on your phone/desktop. Go to:")
     print("  Settings → Devices → Link Desktop Device")
@@ -931,17 +937,18 @@ async def login_qr_interactive(
             except errors.PasswordHashInvalidError:
                 print("Wrong 2FA password. Re-run `oncall telegram-login --qr`.")
                 await client.disconnect()
-                return
+                return None
 
     me = await client.get_me()
     print(f"Logged in as @{getattr(me, 'username', None)} "
           f"(id={getattr(me, 'id', None)}, name={getattr(me, 'first_name', None)}).")
     await client.disconnect()
+    return int(getattr(me, "id", 0)) or None
 
 
 async def login_interactive(
     *, api_id: int, api_hash: str, session_path: Path,
-) -> None:
+) -> int | None:
     """One-shot interactive login. Prompts for phone, code, optional 2FA.
 
     Implemented with the lower-level telethon calls (send_code_request +
@@ -961,7 +968,7 @@ async def login_interactive(
         me = await client.get_me()
         print(f"Already logged in as @{getattr(me, 'username', None)} (id={getattr(me, 'id', None)}).")
         await client.disconnect()
-        return
+        return int(getattr(me, "id", 0)) or None
 
     phone = input("Telegram phone (E.164, e.g. +14155551234): ").strip()
     if not phone.startswith("+"):
@@ -1023,14 +1030,14 @@ async def login_interactive(
             except errors.PasswordHashInvalidError:
                 print("Wrong 2FA password. Try again from the start (Ctrl-C, re-run).")
                 await client.disconnect()
-                return
+                return None
         except errors.PhoneCodeInvalidError:
             print(f"Telegram says the code is wrong. Got {len(code)} digits; should be 5.")
             continue
         except errors.PhoneCodeExpiredError:
             print("Code expired (~5 min lifetime). Re-run `oncall telegram-login`.")
             await client.disconnect()
-            return
+            return None
         except errors.PhoneCodeEmptyError:
             print("Empty code rejected; try again.")
             continue
@@ -1039,3 +1046,4 @@ async def login_interactive(
     print(f"Logged in as @{getattr(me, 'username', None)} "
           f"(id={getattr(me, 'id', None)}, name={getattr(me, 'first_name', None)}).")
     await client.disconnect()
+    return int(getattr(me, "id", 0)) or None

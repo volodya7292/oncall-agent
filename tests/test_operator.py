@@ -117,14 +117,14 @@ def test_tilde_path_is_expanded_by_settings(tmp_path, monkeypatch):
     before storage."""
     monkeypatch.setenv("TELEGRAM_SESSION_PATH", "~/.oncall/telegram.session")
     monkeypatch.setenv("ONCALL_DB_PATH", "~/.oncall/state.db")
-    monkeypatch.setenv("TELEGRAM_BOT_SESSION_PATH", "~/.oncall/telegram_bot.session")
+    monkeypatch.setenv("TELEGRAM_AGENT_SESSION_PATH", "~/.oncall/telegram_agent.session")
     monkeypatch.setattr("oncall.config.USER_ENV_FILE", tmp_path / "nonexistent.env")
     s = Settings(_env_file=None)
     home = Path.home()
     assert str(s.telegram_session_path).startswith(str(home))
     assert "~" not in str(s.telegram_session_path)
     assert str(s.oncall_db_path).startswith(str(home))
-    assert str(s.telegram_bot_session_path).startswith(str(home))
+    assert str(s.telegram_agent_session_path).startswith(str(home))
 
 
 @pytest.fixture

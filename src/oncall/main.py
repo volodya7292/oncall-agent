@@ -54,25 +54,31 @@ ONCALL_OLLAMA_HOST=http://localhost:11434
 # keychain OAuth for subscription users, or ANTHROPIC_API_KEY in your shell env
 # if you prefer a workspace API key. Nothing to configure here.
 
-# Telegram BOT (optional — talk to the operator via Telegram instead of REPL).
-# Uses the HTTP Bot API — only the token + your numeric user_id are needed.
-# 1. Create a bot via @BotFather and paste its token here.
-# 2. Get your own numeric user_id from @userinfobot and paste it as OWNER_ID.
-#    Only that id can DM the bot; everyone else is silently ignored.
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_BOT_OWNER_ID=
-
-# Telegram USERBOT (optional, separate from the bot above — reads inbound DMs
-# from arbitrary senders to the user's own account, for triage + reply-by-
-# proposal). Requires registering an app at https://my.telegram.org/apps.
+# Telegram — two userbot sessions sharing one application credential.
+# 1. Register an application at https://my.telegram.org/apps to get
+#    TELEGRAM_API_ID + TELEGRAM_API_HASH. Same credential drives both
+#    sessions; they're distinguished by session file path.
+# 2. PRIMARY userbot: runs on your own Telegram account. Reads inbound DMs
+#    from third parties for triage + reply-on-your-behalf. Set up via:
+#      oncall telegram-login
+# 3. AGENT userbot: runs on a SECOND Telegram account dedicated to the
+#    agent. This is the user-facing surface — you DM it, you call it
+#    (future), approvals land here. Set up via:
+#      oncall telegram-login --agent
+# 4. Get your own numeric user_id from @userinfobot and paste it as
+#    TELEGRAM_OWNER_USER_ID. The agent userbot only accepts messages
+#    from that id.
 TELEGRAM_API_ID=
 TELEGRAM_API_HASH=
 TELEGRAM_SESSION_PATH=~/.oncall/telegram.session
+TELEGRAM_AGENT_SESSION_PATH=~/.oncall/telegram_agent.session
+TELEGRAM_OWNER_USER_ID=
 TELEGRAM_IMPORTANT_SENDERS=
 TELEGRAM_IMPORTANT_KEYWORDS=urgent,down,production,outage,critical
-# Comma-separated @usernames the userbot should NEVER surface (e.g. service
-# bots like @userinfobot). The own bot from TELEGRAM_BOT_TOKEN is auto-added
-# at startup via its user_id; you only need this list for extra entries.
+# Comma-separated @usernames the primary userbot should NEVER surface
+# (e.g. service bots like @userinfobot). The agent userbot's chat with
+# the owner is filtered separately (by user_id, auto-discovered at
+# `telegram-login --agent`).
 TELEGRAM_USERBOT_IGNORE_USERNAMES=
 """
 
@@ -127,8 +133,12 @@ def _init(*, force: bool = False) -> None:
     print("  4. `oncall api` to run the orchestrator.")
 
 
-def _telegram_login(*, verbose: bool = False, qr: bool = False) -> None:
-    from .config import get_settings
+def _telegram_login(
+    *, verbose: bool = False, qr: bool = False, agent: bool = False,
+) -> None:
+    from .config import (
+        get_settings, write_telegram_agent_user_id,
+    )
     from .telegram_service import login_interactive, login_qr_interactive
 
     s = get_settings()
@@ -137,16 +147,36 @@ def _telegram_login(*, verbose: bool = False, qr: bool = False) -> None:
         print("  Get them at https://my.telegram.org/apps", file=sys.stderr)
         sys.exit(2)
     logging.getLogger("telethon").setLevel(logging.DEBUG if verbose else logging.INFO)
+    session_path = s.telegram_agent_session_path if agent else s.telegram_session_path
+    role = "AGENT" if agent else "PRIMARY"
+    print(f"Logging in {role} Telegram session → {session_path}")
+    if agent:
+        print(
+            "This must be a SEPARATE Telegram account from your primary "
+            "(the userbot account that reads inbound DMs)."
+        )
     runner = login_qr_interactive if qr else login_interactive
-    asyncio.run(runner(
+    user_id = asyncio.run(runner(
         api_id=int(s.telegram_api_id),
         api_hash=s.telegram_api_hash,
-        session_path=s.telegram_session_path,
+        session_path=session_path,
     ))
     print()
-    print(f"Session written to {s.telegram_session_path}.")
+    print(f"Session written to {session_path}.")
+    if agent:
+        if user_id is None:
+            print(
+                "WARNING: couldn't read agent user_id after login. The primary "
+                "userbot's peer filter for the agent chat won't be populated. "
+                "Re-run `oncall telegram-login --agent` to retry."
+            )
+        else:
+            write_telegram_agent_user_id(user_id)
+            print(f"Agent user_id={user_id} written to ~/.oncall/telegram_agent_user_id.")
+            print("The primary userbot will read this at next startup to skip "
+                  "the agent chat in inbox-relay.")
     print()
-    print("Next: the userbot only attaches at daemon startup, so restart to pick up the new session:")
+    print("Next: restart the daemon to attach the new session:")
     print("  oncall service stop && oncall service start    (LaunchAgent)")
     print("  oncall api                                     (foreground / dev)")
 
@@ -184,6 +214,12 @@ def main() -> None:
         help="Login via QR code instead of phone+code. Scan from an already-"
              "logged-in Telegram app (Settings → Devices → Link Desktop Device).",
     )
+    tg_login_p.add_argument(
+        "--agent", action="store_true",
+        help="Log in the AGENT session (TELEGRAM_AGENT_SESSION_PATH) — the "
+             "second account that serves as the user-facing chat surface. "
+             "Without this flag, the primary userbot session is logged in.",
+    )
     svc = sub.add_parser(
         "service",
         help="Install/manage the macOS LaunchAgent that runs `oncall api`.",
@@ -218,6 +254,7 @@ def main() -> None:
         _telegram_login(
             verbose=getattr(args, "verbose", False),
             qr=getattr(args, "qr", False),
+            agent=getattr(args, "agent", False),
         )
     elif args.cmd == "service":
         from . import service

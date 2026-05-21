@@ -197,11 +197,12 @@ CREATE INDEX IF NOT EXISTS idx_messenger_unread ON messenger_inbox(read_at) WHER
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messenger_dedup ON messenger_inbox(platform, chat_id, message_id);
 
 -- Operator-initiated `dispatch_task` calls made during an autonomous-reply
--- turn are not auto-spawned: they sit here until the user taps Yes/No in
--- the bot. On allow, the task is submitted with `restricted_to_chat`
--- inherited (so the executor also runs locked to that chat). On deny,
--- nothing further happens. Empty by default. See [operator.py]
--- `_execute_tool` and [telegram_bot.py] `_dispatch_approval_subscriber`.
+-- turn are not auto-spawned: they sit here until the user resolves via
+-- `/yes <id>` or `/no <id>` in the agent chat. On allow, the task is
+-- submitted with `restricted_to_chat` inherited (so the executor also runs
+-- locked to that chat). On deny, nothing further happens. Empty by default.
+-- See [operator.py] `_execute_tool` and [telegram_agent.py]
+-- `_dispatch_approval_subscriber`.
 CREATE TABLE IF NOT EXISTS pending_dispatches (
     id TEXT PRIMARY KEY,
     chat_session_id TEXT NOT NULL,
@@ -286,7 +287,83 @@ class Database:
         await self._migrate_add_column(
             "operator_memories", "model", "TEXT NOT NULL DEFAULT ''",
         )
+        # Rename existing `tg-bot-<owner>` chat sessions to `tg-agent-<owner>`.
+        # The HTTP Bot API was retired in favor of a second telethon userbot;
+        # the new session-id naming is `tg-agent-*`. This migration is
+        # idempotent: ON CONFLICT clauses skip rows that collide with an
+        # already-renamed session.
+        await self._migrate_rename_bot_sessions_to_agent()
         await self._conn.commit()
+
+    async def _migrate_rename_bot_sessions_to_agent(self) -> None:
+        """Rename `tg-bot-*` session ids to `tg-agent-*` across the schema.
+        Idempotent: a second run is a no-op because the old ids are gone.
+
+        FK constraints on chat_messages.session_id / chat_summaries.session_id
+        forbid an in-place rename of the parent row. We instead insert a new
+        parent, redirect children, then drop the old parent."""
+        try:
+            cur = await self.conn.execute(
+                "SELECT id, created_at, last_seen_at "
+                "FROM chat_sessions WHERE id LIKE 'tg-bot-%'",
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            if not rows:
+                return
+            for row in rows:
+                old = row["id"]
+                new = "tg-agent-" + old[len("tg-bot-"):]
+                # If a new-shape row already exists (partial-run recovery),
+                # discard the stale bot rows and continue.
+                cur = await self.conn.execute(
+                    "SELECT 1 FROM chat_sessions WHERE id = ?", (new,),
+                )
+                exists = await cur.fetchone()
+                await cur.close()
+                if exists:
+                    await self.conn.execute(
+                        "DELETE FROM chat_messages WHERE session_id = ?", (old,),
+                    )
+                    await self.conn.execute(
+                        "DELETE FROM chat_summaries WHERE session_id = ?", (old,),
+                    )
+                    await self.conn.execute(
+                        "DELETE FROM chat_sessions WHERE id = ?", (old,),
+                    )
+                    continue
+                # Insert new parent first so child redirects don't trip FK.
+                await self.conn.execute(
+                    "INSERT INTO chat_sessions(id, created_at, last_seen_at) "
+                    "VALUES(?, ?, ?)",
+                    (new, row["created_at"], row["last_seen_at"]),
+                )
+                await self.conn.execute(
+                    "UPDATE chat_messages SET session_id = ? WHERE session_id = ?",
+                    (new, old),
+                )
+                await self.conn.execute(
+                    "UPDATE chat_summaries SET session_id = ? WHERE session_id = ?",
+                    (new, old),
+                )
+                await self.conn.execute(
+                    "UPDATE tasks SET dispatched_by_chat_session = ? "
+                    "WHERE dispatched_by_chat_session = ?",
+                    (new, old),
+                )
+                await self.conn.execute(
+                    "UPDATE pending_dispatches SET chat_session_id = ? "
+                    "WHERE chat_session_id = ?",
+                    (new, old),
+                )
+                await self.conn.execute(
+                    "DELETE FROM chat_sessions WHERE id = ?", (old,),
+                )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "migrate tg-bot → tg-agent session ids failed",
+            )
 
     async def _migrate_add_column(self, table: str, column: str, type_decl: str) -> None:
         try:
