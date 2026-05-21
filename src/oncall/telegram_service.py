@@ -855,10 +855,23 @@ def make_telethon_client(
     *, api_id: int, api_hash: str, session_path: Path,
 ) -> Any:
     """Construct a telethon.TelegramClient. Lazy import keeps tests free of
-    the telethon dependency."""
+    the telethon dependency.
+
+    `connection_retries=None` makes telethon retry the reconnect loop
+    forever instead of giving up after the default 5 attempts. Without
+    this, a laptop going through a string of maintenance-sleep cycles +
+    Wi-Fi drops can exhaust the budget, after which every outbound call
+    raises `ConnectionError: Cannot send requests while disconnected`
+    until something explicitly re-runs `connect()`. `retry_delay=60`
+    spaces those attempts out so we don't hammer Telegram while the
+    network is genuinely down."""
     from telethon import TelegramClient  # type: ignore
     session_path.parent.mkdir(parents=True, exist_ok=True)
-    return TelegramClient(str(session_path), api_id, api_hash)
+    return TelegramClient(
+        str(session_path), api_id, api_hash,
+        connection_retries=None,
+        retry_delay=60,
+    )
 
 
 async def login_qr_interactive(
