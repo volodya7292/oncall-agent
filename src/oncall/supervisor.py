@@ -251,7 +251,16 @@ class Supervisor:
         date refresh on each spawn (one per hand_off)."""
         text = self._paths.executor_prompt.read_text(encoding="utf-8")
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        return text.replace("{{current_date}}", now)
+        text = text.replace("{{current_date}}", now)
+        lang = self._settings.operator_language
+        if lang:
+            text += (
+                f"\n\n# Output language\n\n"
+                f"Always respond in: {lang} (ISO-639-1). Tool calls, file "
+                f"contents, command output stay as-is; this only affects "
+                f"natural-language replies."
+            )
+        return text
 
     async def _write_user_turn(self, text: str) -> None:
         assert self._proc and self._proc.stdin

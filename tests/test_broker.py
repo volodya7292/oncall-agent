@@ -70,19 +70,47 @@ async def _make_task(db: Database, prompt: str = "test task") -> Task:
 # ---------------------------------------------------------------------------
 
 def test_canonicalize_strips_punct_and_case() -> None:
-    assert canonicalize_phrase("Amber Paper Compass.") == "amber paper compass"
-    assert canonicalize_phrase("amber  paper  compass") == "amber paper compass"
-    assert canonicalize_phrase("AMBER, PAPER, COMPASS!") == "amber paper compass"
+    assert canonicalize_phrase("Yes Yes Yes.") == "yes yes yes"
+    assert canonicalize_phrase("yes  yes  yes") == "yes yes yes"
+    assert canonicalize_phrase("YES, YES, YES!") == "yes yes yes"
 
 
-def test_phrases_match_tolerates_normalization() -> None:
-    assert phrases_match("amber paper compass", "AMBER, paper compass.")
-    assert not phrases_match("amber paper compass", "amber paper other")
+def test_phrases_match_affirmative() -> None:
+    # Tolerates case, commas, trailing punctuation; needs ≥3 affirm tokens.
+    assert phrases_match("", "yes yes yes")
+    assert phrases_match("", "YES, yes, yes.")
+    assert phrases_match("", "так так так")           # Ukrainian
+    assert phrases_match("", "да да да")              # Russian
+    assert phrases_match("", "yes так sí")            # mixed languages OK
+    # Too few tokens — single / double yes is too easy to type by accident.
+    assert not phrases_match("", "yes")
+    assert not phrases_match("", "yes yes")
+    # Mixed with non-affirm tokens — no.
+    assert not phrases_match("", "yes yes maybe")
 
 
-def test_generate_phrase_is_three_words() -> None:
-    p = generate_challenge_phrase()
-    assert len(p.split()) == 3
+def test_phrases_match_ignores_expected() -> None:
+    # `expected` is kept for API compat but ignored — only the supplied
+    # text matters.
+    assert phrases_match("anything", "yes yes yes")
+    assert not phrases_match("yes yes yes", "no no no")
+
+
+def test_is_deny_phrase() -> None:
+    from oncall.approval_client import is_deny_phrase
+    assert is_deny_phrase("no")
+    assert is_deny_phrase("No.")
+    assert is_deny_phrase("нет")
+    assert is_deny_phrase("ні")
+    assert is_deny_phrase("non")
+    assert is_deny_phrase("no no no")                 # repeated still deny
+    assert not is_deny_phrase("yes")
+    assert not is_deny_phrase("maybe")
+    assert not is_deny_phrase("")
+
+
+def test_generate_phrase_is_canonical_affirm() -> None:
+    assert generate_challenge_phrase() == "yes yes yes"
 
 
 def test_kill_phrase_detection() -> None:

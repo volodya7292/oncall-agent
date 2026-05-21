@@ -51,28 +51,50 @@ class Lifecycle:
         self._shutdown_flag = asyncio.Event()
         self._worker_task = asyncio.create_task(self._worker_loop(), name="executor-worker")
 
-    async def enqueue_executor(
-        self, *, prompt: str, chat_session_id: str | None = None,
-    ) -> dict[str, object]:
-        """Programmatic entry point for the operator's `hand_off()` tool.
-        Creates a Task row, pushes it onto the FIFO queue, and returns
-        immediately. The single executor worker drains the queue.
-        """
+    async def submit_task(
+        self, *, prompt: str,
+        chat_session_id: str | None = None,
+        restricted_to_chat: str | None = None,
+        model: str | None = None,
+    ) -> Task:
+        """Build, persist, queue. Returns the constructed Task so callers
+        that need state (deferred dispatch approval) can read it.
+        `enqueue_executor` is a thin wrapper around this for callers that
+        only need the lightweight dict response."""
         task = Task(
             session_id=str(uuid4()),  # per-row id for DB tracking only
             prompt=prompt,
             dispatched_by_chat_session=chat_session_id,
+            restricted_to_chat=restricted_to_chat,
+            model=model,
         )
         await self.db.insert_task(task)
         await self.events.publish(task.id, "state.changed", {"state": task.state.value})
         assert self._queue is not None
         await self._queue.put(task)
-        depth = self._queue.qsize()
-        busy = self._current_task_id is not None
+        return task
+
+    async def enqueue_executor(
+        self, *, prompt: str, chat_session_id: str | None = None,
+        restricted_to_chat: str | None = None,
+    ) -> dict[str, object]:
+        """Programmatic entry point for the operator's `hand_off()` tool.
+        Creates a Task row, pushes it onto the FIFO queue, and returns
+        immediately. The single executor worker drains the queue.
+
+        `restricted_to_chat` propagates the inbox-drain's "this task is a
+        reply to chat X" constraint to the broker, which uses it as the
+        scoping key for dm_allowlist auto-approval.
+        """
+        task = await self.submit_task(
+            prompt=prompt,
+            chat_session_id=chat_session_id,
+            restricted_to_chat=restricted_to_chat,
+        )
         return {
             "task_id": str(task.id),
-            "queue_depth": depth,
-            "busy": busy,
+            "queue_depth": self._queue.qsize() if self._queue is not None else 0,
+            "busy": self._current_task_id is not None,
         }
 
     def acting_status(self) -> dict[str, object]:

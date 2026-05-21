@@ -843,6 +843,24 @@ def _classify_messenger(tool_input: dict[str, Any]) -> Verdict:
                 f"Visible to recipient; cannot be unsent reliably."
             ),
         )
+    if op == "send_file":
+        chat = str(tool_input.get("chat_id", "?"))
+        path = str(tool_input.get("file_path", "?"))
+        caption = str(tool_input.get("caption") or "")
+        canonical = (
+            f"Send file to chat {chat}: {path}"
+            + (f" (caption {caption!r})" if caption else "")
+        )
+        return Verdict(
+            kind=ClassifierVerdict.MUTATING,
+            canonical=canonical,
+            blast_radius=(
+                f"Uploads {path} AS the user to chat {chat}. The file is "
+                f"visible to the recipient and stored in Telegram's CDN; "
+                f"cannot be unsent reliably. Verify the path does not "
+                f"contain secrets (.env, *.key, *.pem, credentials, etc)."
+            ),
+        )
     return Verdict(
         kind=ClassifierVerdict.MUTATING,
         canonical=f"messenger_inbox.{op}",

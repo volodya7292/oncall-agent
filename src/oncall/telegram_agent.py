@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
-from .approval_client import phrases_match
+from .approval_client import is_deny_phrase, phrases_match
 from .audit import fmt, telegram_log
 from .broker import Broker
 from .db import Database
@@ -313,22 +313,13 @@ class TelegramAgentService:
             await self._send("Internal error. Try again in a moment.")
             return
 
-        reply = result.text
+        reply = result.user_facing_text()
         if not reply:
-            handed_off = any(
-                c.get("name") == "hand_off"
-                and isinstance(c.get("result"), dict)
-                and c["result"].get("enqueued")
-                for c in result.tool_calls_made
-            )
-            if handed_off:
-                reply = "Looking."
-            else:
-                telegram_log.info("agent reply suppressed (empty) " + fmt(
-                    session=self._session_id,
-                    tool_calls=len(result.tool_calls_made),
-                ))
-                return
+            telegram_log.info("agent reply suppressed (empty) " + fmt(
+                session=self._session_id,
+                tool_calls=len(result.tool_calls_made),
+            ))
+            return
         await self._send(reply)
         telegram_log.info("agent reply " + fmt(
             session=self._session_id, len=len(reply),
@@ -639,8 +630,7 @@ class TelegramAgentService:
                 body_lines += ["", blast]
             body_lines += [
                 "",
-                f"Reply with: `{phrase}` to allow.",
-                f"Or `/no {approval_id}` to deny.",
+                f"Reply `{phrase}` to allow, or `no` to deny.",
             ]
             body = "\n".join(b for b in body_lines if b is not None)
             try:
@@ -663,16 +653,24 @@ class TelegramAgentService:
                 self._pending_approvals.pop(str(approval_id), None)
 
     async def _try_resolve_approval(self, text: str) -> bool:
-        """If `text` matches any pending approval's challenge phrase, resolve
-        it via the broker and return True (caller should not forward the
-        message to the operator). Returns False otherwise."""
+        """If `text` reads as an affirmative ("yes yes yes" / multilingual)
+        OR a bare deny ("no" / multilingual), resolve every pending
+        approval in this chat accordingly and return True. Returns False
+        if `text` is neither — caller forwards to the operator as usual."""
         if not self._pending_approvals:
             return False
-        # Iterate over a snapshot — the dict can mutate as approval.resolved
-        # events come in concurrently.
-        for approval_id_str, phrase in list(self._pending_approvals.items()):
-            if not phrases_match(phrase, text):
-                continue
+        affirm = phrases_match("", text)
+        deny = (not affirm) and is_deny_phrase(text)
+        if not (affirm or deny):
+            return False
+        decision = "allow" if affirm else "deny"
+        # Snapshot — the dict can mutate as approval.resolved events come
+        # in concurrently. Resolve every pending approval in this chat with
+        # the same decision; in practice there's usually one at a time, but
+        # if multiple are open the user's single "no" denies them all
+        # (predictable, no ambiguity).
+        any_resolved = False
+        for approval_id_str in list(self._pending_approvals.keys()):
             try:
                 approval_uuid = UUID(approval_id_str)
             except ValueError:
@@ -680,17 +678,18 @@ class TelegramAgentService:
                 continue
             approved, matched = await self._broker.submit_response(
                 approval_id=approval_uuid,
-                decision="allow",
+                decision=decision,
                 challenge_phrase_supplied=text,
             )
             self._pending_approvals.pop(approval_id_str, None)
             telegram_log.info("agent approval resolve " + fmt(
-                approval=approval_id_str, decision="allow",
+                approval=approval_id_str, decision=decision,
                 approved=approved, matched=matched,
             ))
-            await self._send("Approved ✓" if approved else "Denied ✗")
-            return True
-        return False
+            any_resolved = True
+        if any_resolved:
+            await self._send("Approved ✓" if affirm else "Denied ✗")
+        return any_resolved
 
     async def _dispatch_approval_subscriber(self) -> None:
         """Listen for `dispatch.approval_requested` events. The operator

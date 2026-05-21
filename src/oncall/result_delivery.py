@@ -65,7 +65,7 @@ async def deliver_executor_result(
     task_events = await db.list_events(task_id)
     raw = latest_executor_text(task_events)
     if not raw:
-        raw = f"(no output — task ended in state={terminal_state})"
+        raw = f"SYSTEM: (no output — task ended in state={terminal_state})"
 
     if len(raw) <= MAX_USER_FACING_CHARS:
         final = raw

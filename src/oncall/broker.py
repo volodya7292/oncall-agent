@@ -177,7 +177,7 @@ class Broker:
         if (
             verdict.kind == ClassifierVerdict.MUTATING
             and tool_name == "mcp__oncall__messenger_inbox"
-            and tool_input.get("op") == "send"
+            and tool_input.get("op") in ("send", "send_file")
         ):
             send_chat = str(tool_input.get("chat_id") or "")
             if (

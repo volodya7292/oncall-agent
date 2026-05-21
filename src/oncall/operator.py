@@ -333,14 +333,26 @@ OPERATOR_TOOLS: list[dict[str, Any]] = [
                 "short (one sentence) and factual; do NOT restate the "
                 "user's message.\n"
                 "\n"
-                "In the SAME response, emit one short ack to the user "
-                "(e.g. \"Looking.\", \"Let me check.\", \"On it.\") and "
-                "then say nothing else. The user's answer will be "
-                "delivered to them by the system when acting completes."
+                "`ack_msg` is REQUIRED — the one-line acknowledgement the "
+                "user will see immediately. Pick varied phrasing each turn "
+                "(see the menu in your system prompt). Do NOT emit a text "
+                "body alongside this tool call; the ack lives in this "
+                "parameter and nothing else."
             ),
             "parameters": {
                 "type": "object",
+                "required": ["ack_msg"],
                 "properties": {
+                    "ack_msg": {
+                        "type": "string",
+                        "description": (
+                            "Short one-line acknowledgement shown to the "
+                            "user right now (e.g. \"Looking.\", \"On it.\", "
+                            "\"Let me check.\"). Match the user's language. "
+                            "Vary each turn — do not repeat the previous "
+                            "ack."
+                        ),
+                    },
                     "hint": {
                         "type": "string",
                         "description": (
@@ -457,6 +469,23 @@ class OperatorTurnResult:
     # `/clear`'d session doesn't silently consume the inbox.
     ran: bool = True
 
+    def user_facing_text(self) -> str:
+        """The single string a transport (Telegram text / voice TTS) should
+        show the user for this turn. Prefers any non-empty assistant text
+        body; otherwise pulls `ack_msg` from a successful `hand_off` tool
+        call (the canonical ack channel since hand_off requires the arg).
+        Empty string when there's nothing to show — caller may suppress."""
+        if self.text:
+            return self.text
+        for tc in self.tool_calls_made:
+            if (
+                tc.get("name") == "hand_off"
+                and isinstance(tc.get("result"), dict)
+                and tc["result"].get("enqueued")
+            ):
+                return ((tc.get("args") or {}).get("ack_msg") or "").strip()
+        return ""
+
 
 AUTO_PING_PREFIX = "[system note: "
 MEMORY_NOTE_PREFIX = "[memory note: "
@@ -533,6 +562,13 @@ class Operator:
         # and task result summaries). Injectable for tests.
         self._runner: OneShotRunner = runner or ClaudeCliRunner()
         self._system_prompt_base = paths.operator_prompt.read_text(encoding="utf-8")
+        if settings.operator_language:
+            self._system_prompt_base += (
+                f"\n\n# Output language\n\n"
+                f"Always respond in: {settings.operator_language} "
+                f"(ISO-639-1). Match the user's dialect/register where you "
+                f"have evidence, but the LANGUAGE is fixed by this setting."
+            )
         # One lock per chat session. Serializes user-initiated chat_turn calls
         # against auto-ping calls so chat_messages append in a consistent order
         # and the LLM never sees an interleaved state.
@@ -566,7 +602,12 @@ class Operator:
         compatibility."""
         del query
         from .config import read_owner_name
-        return self._system_prompt_base.replace("{{owner_name}}", read_owner_name())
+        agent_name = self._settings.agent_name or "On-call agent"
+        return (
+            self._system_prompt_base
+            .replace("{{owner_name}}", read_owner_name())
+            .replace("{{agent_name}}", agent_name)
+        )
 
     async def _inject_session_memory(
         self, session_id: str, query: str,
@@ -1442,7 +1483,7 @@ class Operator:
                 msg = msg[:brace].rstrip(" .:,-")
             if len(msg) > 160:
                 msg = msg[:157] + "…"
-            text = f"_Memory extraction failed: {type(e).__name__}: {msg}_"
+            text = f"SYSTEM: Memory extraction failed: {type(e).__name__}: {msg}"
             operator_log.exception("memory extraction failed for session %s", session_id)
             await self._emit_breadcrumb(session_id, text)
             return
@@ -1582,7 +1623,7 @@ class Operator:
         tool_calls_made: list[dict[str, Any]] | None = None,
         user_text: str = "",
     ) -> dict[str, Any]:
-        del restricted_to_chat, tool_calls_made  # vestigial; kept for compat
+        del tool_calls_made  # vestigial; kept for compat
         if name == "hand_off":
             text = (user_text or "").strip()
             if not text:
@@ -1599,6 +1640,7 @@ class Operator:
             try:
                 outcome = await self._lifecycle.enqueue_executor(
                     prompt=forwarded, chat_session_id=chat_session_id,
+                    restricted_to_chat=restricted_to_chat,
                 )
             except Exception as e:
                 log.exception("hand_off: enqueue_executor failed")
@@ -1646,7 +1688,7 @@ class Operator:
                 joined = ", ".join(written)
                 if len(joined) > 400:
                     joined = joined[:397] + "…"
-                breadcrumb = f"_Remembered: {joined}_"
+                breadcrumb = f"SYSTEM: Remembered: {joined}"
                 await self._db.append_chat_message(
                     chat_session_id, "assistant", breadcrumb,
                 )

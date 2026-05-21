@@ -94,45 +94,126 @@ class HttpLongPollApprovalClient:
 
 import random
 import re
+import unicodedata
 
 
-_PHRASE_WORDS: tuple[str, ...] = (
-    "amber", "anchor", "apple", "arrow", "atlas", "bamboo", "basin", "beacon",
-    "boulder", "branch", "breeze", "candle", "canyon", "cedar", "cipher", "clove",
-    "comet", "compass", "copper", "coral", "cotton", "crater", "crystal", "delta",
-    "ember", "falcon", "ferret", "flint", "forest", "garnet", "geyser", "ginger",
-    "glacier", "granite", "harbor", "harvest", "hollow", "horizon", "iris",
-    "ivory", "jasper", "juniper", "kestrel", "kettle", "lantern", "lichen",
-    "linen", "lotus", "magnet", "marble", "meadow", "meteor", "mosaic", "nectar",
-    "nimbus", "oaken", "obsidian", "orchid", "otter", "paper", "pebble", "penguin",
-    "petal", "pewter", "pillar", "pollen", "prairie", "quartz", "quill", "raven",
-    "ribbon", "river", "rocket", "saffron", "sapphire", "sequoia", "shoal",
-    "silver", "snowfall", "sparrow", "stalk", "summit", "sundial", "syrup",
-    "tangent", "tassel", "thicket", "thunder", "topaz", "trellis", "tundra",
-    "umber", "valley", "velvet", "viola", "walnut", "willow", "yarrow", "zenith",
-)
+# Multilingual affirm / deny vocab. Curated for words people actually type to
+# confirm or refuse; not a full dictionary. Diacritic-bearing forms are
+# spelled exactly as native speakers write them. We lowercase + NFC-normalize
+# input before lookup — we do NOT strip diacritics (matches what someone
+# with the right keyboard would type).
+_AFFIRM_WORDS = frozenset({
+    # English
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay",
+    # Russian
+    "да", "ага", "угу", "давай",
+    # Ukrainian
+    "так", "авжеж", "аякже",
+    # Polish
+    "tak",
+    # German / Dutch / Swedish / Danish / Norwegian
+    "ja",
+    # Spanish
+    "sí", "si", "vale", "claro",
+    # French
+    "oui", "ouais",
+    # Italian
+    "sì", "certo",
+    # Portuguese
+    "sim",
+    # Finnish
+    "joo", "kyllä",
+    # Turkish
+    "evet", "tamam",
+})
+
+_DENY_WORDS = frozenset({
+    # English
+    "no", "nope", "nah",
+    # Russian
+    "нет",
+    # Ukrainian
+    "ні",
+    # Polish
+    "nie",
+    # German
+    "nein",
+    # French (also colloquial "nan")
+    "non", "nan",
+    # Portuguese
+    "não", "nao",
+    # Dutch
+    "nee",
+    # Swedish / Danish
+    "nej",
+    # Norwegian
+    "nei",
+    # Finnish
+    "ei",
+    # Turkish
+    "hayır",
+})
+
+# Required affirmative-token count. 3 = deliberate friction; "yes" alone is
+# too easy to type by accident. A single "no" is enough to deny.
+_AFFIRM_MIN_TOKENS = 3
 
 
 def generate_challenge_phrase(rng: random.Random | None = None) -> str:
-    """Three random words from a low-ambiguity dictionary, space-separated."""
-    r = rng or random.SystemRandom()
-    return " ".join(r.choice(_PHRASE_WORDS) for _ in range(3))
+    """Returns the canonical affirm phrase the user types to allow an action.
+    `rng` is kept for API compatibility with the old random generator but
+    ignored — the phrase is fixed so the prompt to the user is consistent
+    and easy to type."""
+    del rng
+    return "yes yes yes"
 
 
-_NON_ALPHA = re.compile(r"[^a-z\s]+")
-_WHITESPACE = re.compile(r"\s+")
+def _tokenize(text: str) -> list[str]:
+    """Lowercase + NFC-normalize, replace anything that isn't a letter or
+    whitespace with a space, split on whitespace. Preserves diacritics."""
+    s = unicodedata.normalize("NFC", text).lower()
+    out: list[str] = []
+    cur: list[str] = []
+    for ch in s:
+        if unicodedata.category(ch).startswith("L"):
+            cur.append(ch)
+        else:
+            if cur:
+                out.append("".join(cur))
+                cur = []
+    if cur:
+        out.append("".join(cur))
+    return out
 
 
 def canonicalize_phrase(phrase: str) -> str:
-    """Normalize for comparison: lowercase, strip punctuation, collapse whitespace."""
-    s = phrase.lower()
-    s = _NON_ALPHA.sub(" ", s)
-    s = _WHITESPACE.sub(" ", s).strip()
-    return s
+    """Kept for audit-log callers — lowercase + collapse whitespace + strip
+    non-letter chars. Don't use for matching logic; use phrases_match /
+    is_deny_phrase instead."""
+    return " ".join(_tokenize(phrase))
 
 
 def phrases_match(expected: str, supplied: str) -> bool:
-    return canonicalize_phrase(expected) == canonicalize_phrase(supplied)
+    """True iff `supplied` is an affirmative reply: ≥3 tokens, every one of
+    them in the affirmative-word set (any supported language). `expected`
+    is ignored — the canonical phrase is fixed; only the supplied text
+    matters. Mixed case, commas, trailing punctuation, and mixed
+    languages are all tolerated."""
+    del expected
+    tokens = _tokenize(supplied)
+    if len(tokens) < _AFFIRM_MIN_TOKENS:
+        return False
+    return all(t in _AFFIRM_WORDS for t in tokens)
+
+
+def is_deny_phrase(supplied: str) -> bool:
+    """True iff `supplied` is a deny reply: ≥1 deny tokens, every one of
+    them in the deny-word set. A bare 'no' (or 'нет', 'ні', etc.)
+    suffices."""
+    tokens = _tokenize(supplied)
+    if not tokens:
+        return False
+    return all(t in _DENY_WORDS for t in tokens)
 
 
 # ---------------------------------------------------------------------------

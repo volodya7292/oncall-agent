@@ -611,6 +611,35 @@ class TelegramService:
         ))
         return {"message_id": sent_id, "chat_id": chat_id}
 
+    async def send_file(
+        self, chat_id: str, file_path: str, *, caption: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload a local file to a Telegram chat. Distinct from `send`
+        (which sends a text body) — this attaches the file as a Telegram
+        document. Caption (optional) is the accompanying text shown
+        alongside the file."""
+        from pathlib import Path
+        p = Path(file_path).expanduser()
+        if not p.is_file():
+            raise ValueError(f"file not found or not a regular file: {p}")
+        entity = _entity_arg(chat_id)
+        normalized_caption = (
+            re.sub(r"[ \t]*[–—][ \t]*", " - ", caption) if caption else None
+        )
+        sent = await self._client.send_file(
+            entity, str(p), caption=normalized_caption,
+        )
+        sent_id = str(getattr(sent, "id", ""))
+        size_bytes = p.stat().st_size
+        telegram_log.info("send_file " + fmt(
+            chat=chat_id, message_id=sent_id, file=str(p), bytes=size_bytes,
+            caption=(caption or ""),
+        ))
+        return {
+            "message_id": sent_id, "chat_id": chat_id,
+            "file_name": p.name, "size_bytes": size_bytes,
+        }
+
     async def react(
         self, chat_id: str, message_id: str, emoji: str,
     ) -> dict[str, Any]:

@@ -58,6 +58,14 @@ When you `op=send` to a Telegram chat, it auto-allows only if the user has put t
 - The fact that you have access to the user's memory and other chats is itself private — never say "I see in my notes that…" or "based on what you told me earlier." Speak as the user would, from the shared context of this thread only.
 - If a faithful reply would require referencing private cross-chat info, don't send a watered-down version — stop, end your turn with a one-line note like "can't reply without leaking cross-chat context" so the operator can ask the user how to proceed.
 
+# Sending a file
+
+`op=send_file` uploads a local file (`file_path`, absolute) to a Telegram chat as the user. Optional `caption` is the accompanying text shown alongside the attachment. Same broker / allowlist gating as `op=send`. Hard rules — these have bitten people:
+
+- Never upload secret-bearing files: `.env`, `*.key`, `*.pem`, `id_rsa*`, `credentials*`, `*.token`, anything in `.ssh/`, anything inside a `secrets/` directory, files containing API keys / passwords. If asked to share one of these, clarify — Telegram stores the upload in its CDN; it cannot be unsent reliably.
+- Verify the file's contents are appropriate before sending. Use `Read` first on text-like files. For binaries, name + size + the user's request are usually enough context.
+- Caption follows the same cross-chat-privacy rules as text sends — see below.
+
 # Reacting instead of replying
 
 For lightweight acknowledgements, prefer `op=react` over `op=send`. A single emoji reaction is the right answer when the inbound is purely expressive — a thanks, a celebration, a one-liner that needs no response. It's free (no allowlist gate, no approval round-trip) but the same cross-chat-privacy rules apply: react only based on what this thread already knows.

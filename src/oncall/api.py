@@ -42,6 +42,7 @@ from .result_delivery import deliver_executor_result
 from .telegram_agent import TelegramAgentService
 from .telegram_service import TelegramService, make_telethon_client
 from .voice import to_voice_text
+from .voice_call import CallService
 
 
 log = logging.getLogger(__name__)
@@ -113,14 +114,16 @@ class MemoryOpBody(BaseModel):
 
 class MessengerOpBody(BaseModel):
     op: Literal[
-        "list", "read", "mark_read", "style", "send", "react", "read_image",
-        "transcribe",
+        "list", "read", "mark_read", "style", "send", "send_file", "react",
+        "read_image", "transcribe",
         "history", "search", "search_messages", "list_chats",
     ]
     chat_id: str | None = None
     message_id: str | None = None
     inbox_id: str | None = None
     text: str | None = None
+    file_path: str | None = None
+    caption: str | None = None
     emoji: str | None = None
     query: str | None = None
     # ISO 8601 timestamp for `op=history`: when set, return up to `limit`
@@ -301,6 +304,16 @@ def create_app() -> FastAPI:
                 telegram_agent.agent_user_id,
             )
 
+        # Voice calls — owner places a 1:1 voice call to the agent userbot.
+        # Binds py-tgcalls to the agent's existing telethon client. Opt-in
+        # via VOICE_CALL_ENABLED + STT/TTS endpoint env vars.
+        voice_call: CallService | None = None
+        if telegram_agent is not None and operator is not None:
+            voice_call = await _maybe_start_voice_call(
+                settings, operator=operator, events=events, broker=broker,
+                telegram_agent=telegram_agent,
+            )
+
         app.state.db = db
         app.state.events = events
         app.state.approval_client = approval_client
@@ -310,6 +323,7 @@ def create_app() -> FastAPI:
         app.state.memory = memory
         app.state.telegram = telegram
         app.state.telegram_agent = telegram_agent
+        app.state.voice_call = voice_call
         app.state.ask_futures = ask_futures if operator is not None else {}
         # Orphaned asks from a previous run cannot be resolved (the
         # executor processes that owned the futures died with the
@@ -423,6 +437,8 @@ def create_app() -> FastAPI:
                 except (asyncio.CancelledError, Exception):
                     pass
             await lifecycle.shutdown()
+            if voice_call is not None:
+                await voice_call.stop()
             if telegram_agent is not None:
                 await telegram_agent.stop()
             if telegram is not None:
@@ -456,7 +472,7 @@ async def _notify_system_error(
     effort: a failed publish logs but never re-raises into the caller."""
     if session_id is None:
         return
-    msg = f"⚠️ system error in {where}: {type(exc).__name__}: {str(exc)[:200]}"
+    msg = f"SYSTEM: ⚠️ error in {where}: {type(exc).__name__}: {str(exc)[:200]}"
     try:
         await events.publish_global("chat.reply", {
             "session_id": session_id,
@@ -992,6 +1008,48 @@ async def _maybe_start_telegram_agent(
         return None
 
 
+async def _maybe_start_voice_call(
+    settings, *, operator: Operator, events: EventBus, broker: Broker,
+    telegram_agent: TelegramAgentService,
+) -> CallService | None:
+    """Boot the 1:1 voice CallService on the agent userbot's telethon
+    session if VOICE_CALL_ENABLED + all STT/TTS env vars are set. Returns
+    None on misconfiguration or start failure — text chat stays up."""
+    if not settings.voice_call_enabled:
+        log.info("voice call disabled (VOICE_CALL_ENABLED unset)")
+        return None
+    missing = [
+        name for name, val in (
+            ("VOICE_STT_BASE_URL", settings.voice_stt_base_url),
+            ("VOICE_STT_API_KEY", settings.voice_stt_api_key),
+            ("VOICE_TTS_BASE_URL", settings.voice_tts_base_url),
+            ("VOICE_TTS_API_KEY", settings.voice_tts_api_key),
+        ) if not val
+    ]
+    if missing:
+        log.warning(
+            "voice call disabled: required env vars empty: %s", ", ".join(missing),
+        )
+        return None
+    try:
+        service = CallService(
+            client=telegram_agent._client,
+            operator=operator, events=events, broker=broker,
+            owner_user_id=int(settings.telegram_owner_user_id),
+            tts_base_url=settings.voice_tts_base_url,
+            tts_api_key=settings.voice_tts_api_key,
+            tts_voice=settings.voice_tts_voice,
+            stt_base_url=settings.voice_stt_base_url,
+            stt_api_key=settings.voice_stt_api_key,
+            language=settings.operator_language,
+        )
+        await service.start()
+        return service
+    except Exception:
+        log.exception("voice CallService failed to start; continuing without it")
+        return None
+
+
 async def _maybe_start_telegram(
     settings, db: Database, events: EventBus,
     *,
@@ -1305,6 +1363,15 @@ def _register_routes(app: FastAPI) -> None:
             if not body.chat_id or not body.text:
                 raise HTTPException(400, "chat_id and text required")
             return await tg.send(body.chat_id, body.text)
+        if body.op == "send_file":
+            if not body.chat_id or not body.file_path:
+                raise HTTPException(400, "chat_id and file_path required")
+            try:
+                return await tg.send_file(
+                    body.chat_id, body.file_path, caption=body.caption,
+                )
+            except ValueError as e:
+                raise HTTPException(422, str(e))
         if body.op == "react":
             if not body.chat_id or not body.message_id or not body.emoji:
                 raise HTTPException(400, "chat_id, message_id, emoji required")
@@ -1373,20 +1440,37 @@ def _register_routes(app: FastAPI) -> None:
         fut: asyncio.Future[str] = loop.create_future()
         ask_futures[ask_id] = fut
         # If nothing else is currently presented in this chat, surface this
-        # one. Otherwise it stays pending and the operator picks it up after
-        # the current ask resolves (see respond_to_task).
+        # one. Otherwise it stays pending and the next-ask chaining (in
+        # operator._intercept_ask_answer) picks it up when the user
+        # answers the current one.
         if not await db.has_presented_ask_for_chat(chat_session_id):
             await db.mark_ask_presented(ask_id)
-            note = (
-                f"task {str(task.id)[:8]} is asking: {question!r}. "
-                f"Relay this question to the user verbatim. The user's next "
-                f"message in this chat will be auto-relayed back to the "
-                f"task — no tool call needed."
-            )
+            # Deliver the executor's question STRAIGHT to the user — no
+            # operator round. Bypasses paraphrase / translation / token
+            # spend, and avoids the operator deciding to "improve" the
+            # text. The user's next message in this chat is intercepted by
+            # operator._intercept_ask_answer, which resolves the future
+            # and feeds the answer back to the executor.
+            events: EventBus = request.app.state.events
+            display = f"[task {str(task.id)[:8]}] {question}"
             try:
-                await operator.auto_ping(session_id=chat_session_id, note=note)
+                await events.publish_global("chat.reply", {
+                    "session_id": chat_session_id,
+                    "text": display,
+                    "voice_text": to_voice_text(question),
+                    "trigger": "ask_user",
+                    "task_id": str(task.id),
+                })
             except Exception:
-                log.exception("ask_user: initial auto_ping failed")
+                log.exception("ask_user: chat.reply publish failed")
+            # Persist as an assistant message so the operator sees on its
+            # next turn that this question is open in chat history.
+            try:
+                await db.append_chat_message(
+                    chat_session_id, "assistant", display,
+                )
+            except Exception:
+                log.exception("ask_user: append_chat_message failed")
         try:
             answer = await fut
         finally:
@@ -1431,7 +1515,7 @@ def _register_routes(app: FastAPI) -> None:
 # would have to match; for now the simplest defensible behaviour is to
 # refuse them too, since a restricted executor has no legitimate reason
 # to read arbitrary inbox ids it didn't itself discover.
-_MESSENGER_OPS_LOCKED_TO_CHAT_ID = {"style", "send", "react", "history", "search_messages", "read_image", "transcribe"}
+_MESSENGER_OPS_LOCKED_TO_CHAT_ID = {"style", "send", "send_file", "react", "history", "search_messages", "read_image", "transcribe"}
 _MESSENGER_OPS_REFUSED_WHEN_RESTRICTED = {"list", "list_chats", "search", "read", "mark_read"}
 
 
