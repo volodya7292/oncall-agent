@@ -677,6 +677,19 @@ class TelegramAgentService:
                     session=self._session_id, approval=approval_id,
                     task=task_id_str, canonical=canonical,
                 ))
+                # Mirror the prompt into operator chat history as an
+                # assistant message so the operator's next turn sees that
+                # an approval was asked. No LLM inference — just a DB
+                # write. Runs regardless of voice state; the operator
+                # benefits from this context in both modes.
+                try:
+                    await self._db.append_chat_message(
+                        self._session_id, "assistant", body,
+                    )
+                except Exception:
+                    log.exception(
+                        "agent approval: append_chat_message failed",
+                    )
             except Exception:
                 log.exception("failed to send approval prompt for %s", approval_id)
 
