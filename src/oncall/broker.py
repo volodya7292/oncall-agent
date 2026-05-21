@@ -163,13 +163,28 @@ class Broker:
         # The executor's system prompt carries the no-cross-chat-leak rule;
         # this table is the final byte-level gate before a message leaves
         # the box on the user's behalf.
+        #
+        # Scoped to autonomous-reply tasks ONLY: the auto-approve fires
+        # only when the task is restricted_to_chat (spawned by the
+        # inbox-drain to handle an inbound DM on that exact chat). When
+        # the user explicitly hand-offs a free-form task — e.g. "check
+        # Alex's messages" — the executor's downstream decision to send
+        # to an allowlisted chat falls through to the normal approval
+        # path so the user can confirm THIS specific send instead of
+        # discovering it after the fact. Without this gate, /allowdm
+        # effectively becomes "let the agent send freely whenever I
+        # mention this person," which is not what users mean by it.
         if (
             verdict.kind == ClassifierVerdict.MUTATING
             and tool_name == "mcp__oncall__messenger_inbox"
             and tool_input.get("op") == "send"
         ):
             send_chat = str(tool_input.get("chat_id") or "")
-            if send_chat and await self._db.is_dm_allowed(send_chat):
+            if (
+                send_chat
+                and task.restricted_to_chat == send_chat
+                and await self._db.is_dm_allowed(send_chat)
+            ):
                 await self._db.record_auto_approval(req, "allow", "auto:dm_allowlist")
                 await self._publish(task.id, "approval.resolved", {
                     "approval_id": str(req_id),

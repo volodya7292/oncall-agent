@@ -225,11 +225,20 @@ async def decide(session_id, tool_use_id, tool_name, tool_input) -> dict:
     # Per-chat allowlist auto-approve for Telegram sends.
     # `mcp__oncall__messenger_inbox` with op=send → if chat_id is in
     # `dm_allowlist` (populated via `/allowdm <chat_id>`), auto-allow without
-    # a challenge phrase. The executor's system prompt carries the
-    # no-cross-chat-leak rule; the table is the final byte-level gate.
+    # a challenge phrase. Scoped to AUTONOMOUS-REPLY tasks only: the task
+    # must be `restricted_to_chat == send_chat` (spawned by inbox-drain to
+    # handle an inbound DM on that exact chat). A user-initiated free-form
+    # task that decides to send to an allowlisted chat — e.g. "check
+    # Alex's messages" — falls through to the normal approval path so
+    # the user can confirm THIS specific send. Without that scoping,
+    # /allowdm becomes "send freely whenever I mention this person,"
+    # which isn't what users mean by it. The executor's system prompt
+    # carries the no-cross-chat-leak rule; the table is the final
+    # byte-level gate.
     if (verdict.kind == "mutating"
         and tool_name == "mcp__oncall__messenger_inbox"
         and tool_input.get("op") == "send"
+        and task.restricted_to_chat == str(tool_input.get("chat_id") or "")
         and await db.is_dm_allowed(str(tool_input.get("chat_id") or ""))):
         return {"behavior": "allow", "updatedInput": tool_input}
 
@@ -583,7 +592,7 @@ CREATE INDEX idx_operator_memories_lru ON operator_memories(last_accessed_at);
 
 `approvals` is append-only by convention.
 
-**Dead columns retained without migration churn.** `tasks.consecutive_denials`, `tasks.pre_approved_send_chat`, `tasks.dispatched_by_chat_session`, `tasks.restricted_to_chat` survive in the schema but are no longer written from the operator path (their old setters were on tools that were removed). The broker still reads `consecutive_denials` for the denial-loop halt, but only the executor's own denials advance it; auto-allows via `dm_allowlist` bypass that counter. A future cleanup migration can drop them.
+**Dead columns retained without migration churn.** `tasks.consecutive_denials`, `tasks.pre_approved_send_chat`, `tasks.dispatched_by_chat_session` are no longer load-bearing for their original use cases but stay in the schema (their old setters are on tools that were removed). The broker still reads `consecutive_denials` for the denial-loop halt, but only the executor's own denials advance it. `tasks.restricted_to_chat` IS load-bearing — it's how the broker distinguishes autonomous-reply tasks from user-initiated ones in the dm_allowlist gate. A future cleanup migration can drop the others.
 
 ### 12. Config files
 
