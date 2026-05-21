@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -596,6 +597,7 @@ class TelegramService:
 
     async def send(self, chat_id: str, text: str) -> dict[str, Any]:
         entity = _entity_arg(chat_id)
+        text = re.sub(r"[ \t]*[–—][ \t]*", " - ", text)
         sent = await self._client.send_message(entity, text)
         sent_id = str(getattr(sent, "id", ""))
         telegram_log.info("send " + fmt(
