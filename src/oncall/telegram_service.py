@@ -253,6 +253,14 @@ class TelegramService:
             return
 
         body = getattr(event.message, "message", None) or getattr(event, "raw_text", None) or ""
+        # Voice / photo / document messages with no caption arrive with an
+        # empty text body but a populated `media`. Substitute a synthetic
+        # `[voice: 12s]` / `[photo]` / `[file: …]` placeholder so the row
+        # still lands in the inbox — the operator can then transcribe or
+        # read_image via the message_id. Without this, voice-only messages
+        # were silently dropped at the empty-body filter below.
+        if (not isinstance(body, str) or not body.strip()) and getattr(event.message, "media", None) is not None:
+            body = _media_placeholder(event.message)
         if not isinstance(body, str) or not body.strip():
             log.info(
                 "inbound skipped reason=empty_body chat=%s sender_id=%s",
