@@ -2,10 +2,10 @@
 
 A personal on-call agent. Two tiers:
 
-- **Operator** (Gemma via Vercel AI Gateway) — operator. Handles dialogue, routes work.
+- **Operator** (Gemini AI Studio via Vercel AI Gateway) — handles dialogue, routes work.
 - **Executor** (`claude` CLI, per-task subprocess) — does the actual work, gated by a deterministic permission broker.
 
-User talks only to the operator. Operator dispatches tasks to the executor. Executor's tool calls go through a classifier (readonly auto-allows, mutating escalates for voice approval with a challenge phrase). Telegram is the primary inbound messenger (read DMs, propose replies in the user's own voice, send on approval).
+User talks only to the operator. Operator dispatches tasks to the executor. Executor's tool calls go through a classifier (read-only auto-allows, mutating escalates to the user with a challenge phrase — typed as a normal message in the Telegram agent chat, or paraphrased yes/no inside a voice call). Telegram is the primary inbound messenger (read DMs, propose replies in the user's own voice, send on approval).
 
 The operator keeps a **semantic memory** in SQLite: short declarative facts extracted automatically from each user turn (hostnames, conventions, preferences, people the user names), embedded via the same gateway and retrieved by hybrid cosine + token-overlap score. Storage and forgetting are both automatic — extraction happens off the hot path after each reply, LRU evicts at capacity (default 500). The operator never manages memory by hand; it just sees the entries most relevant to the current message.
 
@@ -25,7 +25,7 @@ oncall init                # writes ~/.oncall/.env with a fresh token
 oncall api                 # boots the orchestrator on 127.0.0.1:8765
 ```
 
-The Telegram bot is the primary client — see "Optional Telegram" below. For ad-hoc testing without the bot, hit the HTTP API directly:
+The Telegram agent (a telethon userbot on a dedicated second account) is the primary client — see "Optional Telegram" below. For ad-hoc testing without it, hit the HTTP API directly:
 
 ```sh
 TOKEN=$(grep ^ONCALL_TOKEN ~/.oncall/.env | cut -d= -f2)
@@ -34,26 +34,34 @@ curl -sS -X POST http://127.0.0.1:8765/chat \
   -d '{"text": "what tasks are running?"}'
 ```
 
-Optional Telegram (lets the operator read your DMs and draft replies in your voice):
+Telegram setup (two userbot sessions on one API credential, distinguished by session file):
 
 ```sh
-# Get api_id + api_hash at https://my.telegram.org/apps, paste into ~/.oncall/.env
-oncall telegram-login      # interactive: phone, code, optional 2FA password
-oncall api                 # now also starts the Telegram listener
+# Get api_id + api_hash at https://my.telegram.org/apps, paste into ~/.oncall/.env.
+# Also set TELEGRAM_OWNER_USER_ID to your own numeric user id (find via @userinfobot)
+# — the agent userbot only accepts messages from that id.
+
+oncall telegram-login           # primary userbot on YOUR account — reads inbound DMs for triage
+oncall telegram-login --agent   # agent userbot on a SECOND dedicated account — the user-facing chat surface
+oncall api                      # boots both userbots
 ```
 
-### Telegram bot commands
+The agent userbot is what you DM with. Approvals, voice calls, and slash commands all land there.
 
-The bot is the primary CLI. Slash commands:
+### Telegram commands
+
+The agent userbot is the primary interface. Slash commands you can send to it:
 
 - `/start` — greeting.
 - `/status` — running tasks, queue, pending approvals, unread DMs, operator-side memory + context stats.
 - `/context` — export this session's chat history + latest compression summary as a markdown file.
 - `/clear` — wipe this chat session's rolling history (operator memory is preserved).
 - `/compress` — force-compress older messages into a summary now (don't wait for the auto-threshold).
+- `/allowdm <chat_id>` / `/denydm <chat_id>` — add or remove a chat from the per-chat send allowlist (the broker auto-approves sends to allowlisted chats during autonomous-reply tasks).
+- `/yes <id>` / `/no <id>` — resolve a pending deferred dispatch (operator-initiated `dispatch_task` during an autonomous reply).
 - `/help` — list commands.
 
-The bot registers these via `setMyCommands` at startup — no BotFather setup needed; the slash-command menu and autocomplete populate automatically. Anything else is a chat turn. Approvals arrive as inline Yes/No buttons.
+Userbots can't register a slash-command menu (no `setMyCommands`), so there's no autocomplete in the Telegram UI — type commands as plain text. Anything else is a chat turn. **Approvals arrive as a single text message** with the canonical command, blast radius, and a challenge phrase. Type the phrase back as a normal message to allow, or `/no <approval_id>` to deny explicitly; a wrong phrase routes back to the operator as a normal chat turn and the approval keeps waiting until timeout.
 
 ## Install (development)
 
@@ -84,4 +92,4 @@ State lives in `~/.oncall/state.db` (SQLite, WAL).
 
 ## Status
 
-Milestone 1 (orchestrator + broker), Milestone 2 (operator), Milestone 3 (Telegram), and the operator-memory rework (auto-extracted, LRU-evicted, semantic retrieval via `alibaba/qwen3-embedding-8b`) are all complete. The Telegram bot is the primary client; the standalone `oncall chat` REPL was retired. 343 tests passing, plus 3 live-gateway integration tests (skipped unless `AI_GATEWAY_API_KEY` is set).
+Milestone 1 (orchestrator + broker), Milestone 2 (operator), Milestone 3 (Telegram), and the operator-memory rework (auto-extracted, LRU-evicted, semantic retrieval via `alibaba/qwen3-embedding-8b`) are all complete. The Telegram agent userbot is the primary client; the older Bot API front-end and the standalone `oncall chat` REPL were both retired. Live-gateway integration tests (3 of them) skip unless `AI_GATEWAY_API_KEY` is set.
