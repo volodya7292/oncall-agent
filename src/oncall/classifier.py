@@ -823,13 +823,14 @@ def _classify_messenger(tool_input: dict[str, Any]) -> Verdict:
         # Reactions are auto-allowed: single curated emoji, reversible,
         # no content leakage. Server validates the emoji allowlist.
         chat = str(tool_input.get("chat_id", "?"))
+        msg_id = str(tool_input.get("message_id", "?"))
         emoji = str(tool_input.get("emoji", ""))
         return Verdict(
             kind=ClassifierVerdict.READONLY,
-            canonical=f"messenger_inbox.react({chat}, {emoji!r})",
+            canonical=f"messenger_inbox.react({chat}, msg={msg_id}, {emoji!r})",
             blast_radius=(
-                f"Sends a Telegram reaction ({emoji}) to one message in "
-                f"chat {chat}. Reversible; no message content."
+                f"Sends a Telegram reaction ({emoji}) to message {msg_id} "
+                f"in chat {chat}. Reversible; no message content."
             ),
         )
     if op == "send":

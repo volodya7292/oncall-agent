@@ -217,28 +217,62 @@ class TelegramService:
         return _on_new_message
 
     async def _handle_inbound(self, event: Any) -> None:
+        # Single entry-log so we can prove whether telethon is delivering
+        # NewMessage events at all when no inbound shows up downstream.
+        chat_id_raw = str(
+            getattr(event, "chat_id", None)
+            or getattr(getattr(event, "message", None), "chat_id", "")
+        )
+        body_raw = getattr(getattr(event, "message", None), "message", None) or ""
+        log.info(
+            "telethon NewMessage chat=%s is_private=%s body_preview=%r",
+            chat_id_raw, getattr(event, "is_private", None),
+            str(body_raw)[:60],
+        )
         # MVP: private chats only. Telethon: event.is_private is True for 1:1 DMs.
         if not getattr(event, "is_private", False):
+            log.info("inbound skipped reason=not_private chat=%s", chat_id_raw)
             return
         sender = await _maybe_await(event.get_sender()) if hasattr(event, "get_sender") else None
         if sender is None:
+            log.info("inbound skipped reason=no_sender chat=%s", chat_id_raw)
             return
         # Don't loop on our own outgoing messages.
         if getattr(sender, "is_self", False) or getattr(event.message, "out", False):
+            log.info(
+                "inbound skipped reason=self_or_outgoing chat=%s sender_id=%s",
+                chat_id_raw, getattr(sender, "id", None),
+            )
             return
         # Skip bots.
         if getattr(sender, "bot", False):
+            log.info(
+                "inbound skipped reason=bot chat=%s sender_id=%s",
+                chat_id_raw, getattr(sender, "id", None),
+            )
             return
 
         body = getattr(event.message, "message", None) or getattr(event, "raw_text", None) or ""
         if not isinstance(body, str) or not body.strip():
+            log.info(
+                "inbound skipped reason=empty_body chat=%s sender_id=%s",
+                chat_id_raw, getattr(sender, "id", None),
+            )
             return
 
         username = (getattr(sender, "username", None) or "").lower() or None
         sender_id = getattr(sender, "id", None)
         if sender_id is not None and sender_id in self._ignore_user_ids:
+            log.info(
+                "inbound skipped reason=ignored_user_id chat=%s sender_id=%s",
+                chat_id_raw, sender_id,
+            )
             return
         if username is not None and username in self._ignore_usernames:
+            log.info(
+                "inbound skipped reason=ignored_username chat=%s username=%s",
+                chat_id_raw, username,
+            )
             return
         display = _display_name(sender)
         chat_id = str(getattr(event, "chat_id", None) or getattr(event.message, "chat_id", ""))
@@ -247,7 +281,10 @@ class TelegramService:
 
         # Archived = user has deliberately hidden this chat. Don't surface.
         if await self._is_archived(chat_id, event=event):
-            log.debug("skipping inbound from archived chat %s", chat_id)
+            log.info(
+                "inbound skipped reason=archived chat=%s sender_id=%s username=%s",
+                chat_id, sender_id, username,
+            )
             return
 
         important = self._triage(username, body)
@@ -342,27 +379,48 @@ class TelegramService:
     # ---- telethon-backed reads/writes ----
 
     async def get_chat_style(
-        self, chat_id: str, *, limit: int = 20,
+        self, chat_id: str, *, limit: int = 10,
     ) -> list[dict[str, Any]]:
-        """Return the USER'S OWN recent outgoing messages in this chat — the
-        source material for mimicking the user's voice. Each entry is
-        {'message_id', 'text', 'date'}.
+        """Return the USER'S OWN outgoing messages in this chat, sampled
+        from three temporal windows (latest, ~2 days ago, ~30 days ago) so
+        the voice profile reflects how the user writes across different
+        conversational moods rather than just the latest exchange. Each
+        entry is {'message_id', 'text', 'date'}. Deduplicated across
+        windows by message_id; returned newest-first.
 
-        We deliberately filter to the user's own side (from_user='me'); reading
-        the counterparty's messages would teach the model the wrong voice."""
+        We deliberately filter to the user's own side (from_user='me');
+        reading the counterparty's messages would teach the wrong voice.
+        We also exclude messages ≥200 chars — long messages tend to be
+        structured/informational (lists, briefings, code) and are bad
+        examples of the user's casual voice. `limit` applies PER WINDOW;
+        the caller may receive up to ~3×limit samples in total."""
         entity = _entity_arg(chat_id)
+        now = datetime.now(timezone.utc)
+        windows: list[datetime | None] = [
+            None,                          # 1) latest messages
+            now - timedelta(days=2),       # 2) ~2 days ago
+            now - timedelta(days=30),      # 3) ~30 days ago
+        ]
+        seen: set[str] = set()
         samples: list[dict[str, Any]] = []
-        async for msg in self._client.iter_messages(
-            entity, limit=limit, from_user="me",
-        ):
-            text = getattr(msg, "message", None)
-            if not text:
-                continue
-            samples.append({
-                "message_id": str(getattr(msg, "id", "")),
-                "text": text,
-                "date": _iso_or_none(getattr(msg, "date", None)),
-            })
+        for offset_date in windows:
+            kwargs: dict[str, Any] = {"limit": limit, "from_user": "me"}
+            if offset_date is not None:
+                kwargs["offset_date"] = offset_date
+            async for msg in self._client.iter_messages(entity, **kwargs):
+                text = getattr(msg, "message", None)
+                if not text or len(text) >= 200:
+                    continue
+                mid = str(getattr(msg, "id", ""))
+                if not mid or mid in seen:
+                    continue
+                seen.add(mid)
+                samples.append({
+                    "message_id": mid,
+                    "text": text,
+                    "date": _iso_or_none(getattr(msg, "date", None)),
+                })
+        samples.sort(key=lambda s: s["date"] or "", reverse=True)
         return samples
 
     async def get_chat_history(
@@ -652,13 +710,24 @@ class TelegramService:
             msg_id_int = int(str(message_id).strip())
         except (TypeError, ValueError):
             raise ValueError(f"invalid message_id: {message_id!r}")
+        from telethon import errors  # type: ignore
         from telethon.tl.functions.messages import SendReactionRequest  # type: ignore
         from telethon.tl.types import ReactionEmoji  # type: ignore
         entity = _entity_arg(chat_id)
-        await self._client(SendReactionRequest(
-            peer=entity, msg_id=msg_id_int,
-            reaction=[ReactionEmoji(emoticon=emoji)],
-        ))
+        try:
+            await self._client(SendReactionRequest(
+                peer=entity, msg_id=msg_id_int,
+                reaction=[ReactionEmoji(emoticon=emoji)],
+            ))
+        except errors.RPCError as e:
+            telegram_log.warning("react failed " + fmt(
+                chat=chat_id, message_id=message_id, emoji=emoji,
+                error=f"{type(e).__name__}: {e}",
+            ))
+            raise ValueError(
+                f"telegram rejected reaction on message {message_id} "
+                f"in chat {chat_id}: {type(e).__name__}: {e}"
+            )
         telegram_log.info("react " + fmt(
             chat=chat_id, message_id=message_id, emoji=emoji,
         ))

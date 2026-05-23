@@ -229,8 +229,7 @@ class Supervisor:
             # the moment the subprocess exited, so the next spawn would
             # fail with "No conversation found".
         ]
-        if task.model:
-            argv += ["--model", task.model]
+        argv += ["--model", task.model or "sonnet"]
         if task.max_turns:
             # claude uses --max-turns or similar — we keep it generic; if not
             # supported in this CLI version, drop silently. For now: skip if

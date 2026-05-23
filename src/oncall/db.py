@@ -514,6 +514,29 @@ class Database:
             for r in rows
         ]
 
+    # Event types that signal the model actually started doing work
+    # (a tool call went out, text was produced, approval was requested, or
+    # the task completed). State-changed and CLI-bookkeeping events are
+    # excluded — they fire even when claude never read its first turn. Used
+    # by crash recovery: a RUNNING task with none of these can be safely
+    # re-queued, since nothing observable has happened yet.
+    _MODEL_ACTIVITY_EVENT_TYPES = (
+        "tool_use.requested",
+        "assistant.text",
+        "approval.requested",
+        "result.final",
+    )
+
+    async def has_model_activity(self, task_id: UUID) -> bool:
+        placeholders = ",".join("?" * len(self._MODEL_ACTIVITY_EVENT_TYPES))
+        cur = await self.conn.execute(
+            f"SELECT 1 FROM task_events WHERE task_id = ? "
+            f"AND type IN ({placeholders}) LIMIT 1",
+            (str(task_id), *self._MODEL_ACTIVITY_EVENT_TYPES),
+        )
+        row = await cur.fetchone()
+        return row is not None
+
     # ---- approvals ----
 
     async def get_resolved_approval(

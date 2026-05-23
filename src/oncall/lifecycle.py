@@ -108,22 +108,60 @@ class Lifecycle:
         }
 
     async def recover(self) -> None:
-        """On boot, re-enqueue any tasks left in {pending}, mark stale
-        RUNNING/AWAITING_APPROVAL as failed (the prior daemon's worker
-        died mid-turn; with a single shared session we can't safely
-        resume two), and sweep orphan approvals."""
-        # Stale in-flight: a prior daemon was running this; we can't
-        # cleanly resume because the new shared-session model doesn't
-        # allow concurrent re-attach against an unknown number of
-        # interrupted turns. Mark them failed so the queue starts clean.
-        stale = await self.db.list_tasks_in_states(
-            TaskState.RUNNING, TaskState.AWAITING_APPROVAL,
-        )
-        for task in stale:
+        """On boot, re-enqueue any tasks left in {pending}, decide what to
+        do with stale RUNNING/AWAITING_APPROVAL tasks (re-queue if they
+        never produced any model activity, fail otherwise), and sweep
+        orphan approvals.
+
+        The re-queue path covers the case where the daemon was restarted
+        within a few hundred ms of enqueueing — the task was marked RUNNING
+        in the DB but claude hadn't produced any output yet, so retrying is
+        observably safe. Once any tool_use / assistant text / approval has
+        fired, we can't cleanly resume because side effects may already
+        have landed and the shared executor session has moved.
+        """
+        stale_running = await self.db.list_tasks_in_states(TaskState.RUNNING)
+        stale_awaiting = await self.db.list_tasks_in_states(TaskState.AWAITING_APPROVAL)
+        # Snapshot the pre-existing PENDING set BEFORE the stale-running loop —
+        # otherwise tasks we transition RUNNING→PENDING below would also appear
+        # in the post-loop PENDING re-queue and get double-enqueued.
+        pending = await self.db.list_tasks_in_states(TaskState.PENDING)
+        assert self._queue is not None
+        for task in stale_running:
+            # RUNNING with no model events = killed before claude said anything.
+            # Safe to retry: put it back in PENDING and re-queue.
+            if not await self.db.has_model_activity(task.id):
+                log.info(
+                    "recover: stale task %s (RUNNING) has no model activity — "
+                    "re-queueing as PENDING",
+                    task.id,
+                )
+                await self.db.update_task_state(task.id, TaskState.PENDING)
+                await self.events.publish(task.id, "state.changed", {
+                    "state": TaskState.PENDING.value,
+                })
+                refreshed = await self.db.get_task(task.id)
+                if refreshed is not None:
+                    await self._queue.put(refreshed)
+                continue
             log.warning(
-                "recover: marking stale task %s (state=%s) as FAILED — "
-                "single-session model can't safely resume mid-turn",
-                task.id, task.state.value,
+                "recover: marking stale task %s (state=RUNNING) as FAILED — "
+                "model activity recorded; single-session model can't safely "
+                "resume mid-turn",
+                task.id,
+            )
+            await self.db.update_task_state(
+                task.id, TaskState.FAILED, TerminalReason.KILLED,
+            )
+            await self.events.publish(task.id, "state.changed", {
+                "state": TaskState.FAILED.value, "terminal_reason": "killed",
+            })
+        for task in stale_awaiting:
+            # AWAITING_APPROVAL by definition had a tool call go out — fail.
+            log.warning(
+                "recover: marking stale task %s (state=AWAITING_APPROVAL) as "
+                "FAILED — approval inflight when daemon died",
+                task.id,
             )
             await self.db.update_task_state(
                 task.id, TaskState.FAILED, TerminalReason.KILLED,
@@ -132,9 +170,8 @@ class Lifecycle:
                 "state": TaskState.FAILED.value, "terminal_reason": "killed",
             })
         # Queued before the crash: still valid to run, just push them
-        # back onto the queue in submission order.
-        pending = await self.db.list_tasks_in_states(TaskState.PENDING)
-        assert self._queue is not None
+        # back onto the queue in submission order. (`pending` was snapshot
+        # above, before any RUNNING→PENDING transitions, so no duplicates.)
         for task in pending:
             log.info("recover: re-queueing pending task %s", task.id)
             await self._queue.put(task)
