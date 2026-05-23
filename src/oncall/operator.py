@@ -489,6 +489,29 @@ class OperatorTurnResult:
 
 AUTO_PING_PREFIX = "[system note: "
 
+# Marker introducing an operator-only "next action" footer inside an
+# auto-ping system-note body. Stripped before forwarding the note as
+# `user_text` to the executor so the executor doesn't read role
+# instructions addressed at the operator (a class of leak that earlier
+# caused "you do not decide what to send" to confuse the executor).
+_OPERATOR_ACTION_MARKER = "\n\n→ ACTION:"
+
+
+def _strip_operator_only_action(text: str) -> str:
+    """Drop the operator-only `→ ACTION:` footer from a system-note
+    string. The auto-ping wraps the note with a trailing `]`; we
+    preserve that boundary. No-op for any text that doesn't contain the
+    marker, so regular user messages pass through unchanged."""
+    idx = text.find(_OPERATOR_ACTION_MARKER)
+    if idx == -1:
+        return text
+    head = text[:idx]
+    # Re-attach a closing `]` if the original had one — keeps the
+    # `[system note: …]` framing intact for the executor.
+    if text.rstrip().endswith("]"):
+        return head + "]"
+    return head
+
 
 def _fmt_ts(ts: str) -> str:
     """Compact form for chat_messages.created_at when prefixing hand-off
@@ -1628,7 +1651,7 @@ class Operator:
         if hint:
             parts.append(f"[operator hint: {hint}]")
             parts.append("")
-        parts.append(user_text)
+        parts.append(_strip_operator_only_action(user_text))
         return "\n".join(parts)
 
     async def _execute_tool(

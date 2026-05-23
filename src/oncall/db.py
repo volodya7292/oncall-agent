@@ -926,6 +926,17 @@ class Database:
                 body_tail = "…" + joined[-body_tail_chars:]
             else:
                 body_tail = joined
+            # Per-message details for callers that want to render structured
+            # notes (msg_id + timestamp per row) instead of just a concatenated
+            # body tail. body_tail stays for backwards compat.
+            messages = [
+                {
+                    "message_id": m["message_id"],
+                    "received_at": m["received_at"],
+                    "body": m["body"] or "",
+                }
+                for m in msgs
+            ]
             out.append({
                 "chat_id": chat_id,
                 "sender_username": latest["sender_username"],
@@ -934,6 +945,7 @@ class Database:
                 "first_unread_at": msgs[0]["received_at"],
                 "last_unread_at": latest["received_at"],
                 "body_tail": body_tail,
+                "messages": messages,
             })
         # Most-recently-updated chats first — matches what the operator
         # would expect to see if asked "any DMs?".
