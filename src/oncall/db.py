@@ -890,16 +890,24 @@ class Database:
         )
         await self.conn.commit()
 
+    # Total-body-char cap on what `messages` carries per chat. Bursts can
+    # be 50+ messages (typing-in-progress, voice-then-text, etc.); the
+    # note we send to the operator only needs enough signal to ack and
+    # hand off. Newer messages are preferred — walk newest→oldest and
+    # stop once their bodies sum past the cap.
+    _PENDING_MSG_TOTAL_CHARS = 500
+
     async def list_pending_chats(self) -> list[dict[str, Any]]:
         """One row per chat_id that has unread, not-yet-triaged inbox messages.
 
         Each row carries: sender (from the latest unread row),
         `unread_count`, `first_unread_at` / `last_unread_at`, and a
-        `messages` list — every unread row's `{message_id, received_at,
-        body}` in chronological order. Callers render notes from
-        `messages` directly so they can include per-message timestamps
-        and ids; an older flat `body_tail` field was removed since it
-        was derivable from `messages` and obscured the structure."""
+        bounded `messages` list — most-recent unread rows in
+        chronological order, each `{message_id, received_at, body}`,
+        with their bodies summing to ≤500 chars. Older messages in a
+        burst are dropped from `messages` (but still counted in
+        `unread_count`). Callers render notes from `messages` directly
+        so they can include per-message timestamps and ids."""
         rows = await (await self.conn.execute(
             """
             SELECT id, chat_id, message_id, sender_username,
@@ -917,13 +925,27 @@ class Database:
         out: list[dict[str, Any]] = []
         for chat_id, msgs in grouped.items():
             latest = msgs[-1]
+            # Walk newest→oldest, take up to N msgs, stop when bodies sum
+            # past the char cap. Reverse back to chronological for output.
+            picked: list[Any] = []
+            total = 0
+            for m in reversed(msgs):
+                body = m["body"] or ""
+                # Always take the newest one (the `if picked` guard) so the
+                # operator gets at least one row even if that row alone is
+                # over the char cap; otherwise enforce the char cap.
+                if picked and total + len(body) > self._PENDING_MSG_TOTAL_CHARS:
+                    break
+                picked.append(m)
+                total += len(body)
+            picked.reverse()
             messages = [
                 {
                     "message_id": m["message_id"],
                     "received_at": m["received_at"],
                     "body": m["body"] or "",
                 }
-                for m in msgs
+                for m in picked
             ]
             out.append({
                 "chat_id": chat_id,
