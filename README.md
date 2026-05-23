@@ -92,4 +92,4 @@ State lives in `~/.oncall/state.db` (SQLite, WAL).
 
 ## Status
 
-Milestone 1 (orchestrator + broker), Milestone 2 (operator), Milestone 3 (Telegram), and the operator-memory rework (auto-extracted, LRU-evicted, semantic retrieval via `alibaba/qwen3-embedding-8b`) are all complete. The Telegram agent userbot is the primary client; the older Bot API front-end and the standalone `oncall chat` REPL were both retired. Live-gateway integration tests (3 of them) skip unless `AI_GATEWAY_API_KEY` is set.
+All four DESIGN.md milestones shipped: orchestrator + broker, operator, Telegram (two-userbot topology — primary on the user's account for DM triage, agent on a dedicated second account for the user-facing chat), and voice (1:1 calls with multilingual yes/no in-call approvals). Live-gateway integration tests skip unless `AI_GATEWAY_API_KEY` is set.
