@@ -1289,6 +1289,15 @@ def _register_routes(app: FastAPI) -> None:
         try:
             return await _messenger_dispatch(tg, body)
         except RPCError as e:
+            # Emit on the audit channel too so messenger failures show up
+            # in the same place as `inbound` / `send` / `react` success
+            # lines. Previously the per-op tg.* methods owned this; now
+            # the top-level catch is the single source of truth.
+            logging.getLogger("oncall.audit.telegram").warning(
+                "op failed op=%s chat=%s message_id=%s error=%s: %s",
+                body.op, body.chat_id or "?", body.message_id or "?",
+                type(e).__name__, e,
+            )
             raise HTTPException(
                 422, f"telegram rejected {body.op}: {type(e).__name__}: {e}",
             )

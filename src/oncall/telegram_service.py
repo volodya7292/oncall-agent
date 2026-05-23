@@ -722,24 +722,19 @@ class TelegramService:
             msg_id_int = int(str(message_id).strip())
         except (TypeError, ValueError):
             raise ValueError(f"invalid message_id: {message_id!r}")
-        from telethon import errors  # type: ignore
         from telethon.tl.functions.messages import SendReactionRequest  # type: ignore
         from telethon.tl.types import ReactionEmoji  # type: ignore
         entity = _entity_arg(chat_id)
-        try:
-            await self._client(SendReactionRequest(
-                peer=entity, msg_id=msg_id_int,
-                reaction=[ReactionEmoji(emoticon=emoji)],
-            ))
-        except errors.RPCError as e:
-            telegram_log.warning("react failed " + fmt(
-                chat=chat_id, message_id=message_id, emoji=emoji,
-                error=f"{type(e).__name__}: {e}",
-            ))
-            raise ValueError(
-                f"telegram rejected reaction on message {message_id} "
-                f"in chat {chat_id}: {type(e).__name__}: {e}"
-            )
+        # Telethon RPCError (MessageIdInvalidError, ChatWriteForbidden,
+        # FloodWait, …) bubbles up to the top-level catch in
+        # api.messenger_op, which logs to the audit channel and converts
+        # to 422. We no longer translate locally — the executor's
+        # tool_use record carries chat_id/message_id/emoji right next to
+        # the error result, so the per-react context isn't lost.
+        await self._client(SendReactionRequest(
+            peer=entity, msg_id=msg_id_int,
+            reaction=[ReactionEmoji(emoticon=emoji)],
+        ))
         telegram_log.info("react " + fmt(
             chat=chat_id, message_id=message_id, emoji=emoji,
         ))
