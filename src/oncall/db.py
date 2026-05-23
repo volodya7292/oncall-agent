@@ -927,17 +927,16 @@ class Database:
             latest = msgs[-1]
             # Walk newest→oldest, take up to N msgs, stop when bodies sum
             # past the char cap. Reverse back to chronological for output.
+            # Take messages newest→oldest. Always include at least the
+            # newest (the loop body appends BEFORE the cap check), then
+            # stop once the running total has reached the char cap.
             picked: list[Any] = []
             total = 0
             for m in reversed(msgs):
-                body = m["body"] or ""
-                # Always take the newest one (the `if picked` guard) so the
-                # operator gets at least one row even if that row alone is
-                # over the char cap; otherwise enforce the char cap.
-                if picked and total + len(body) > self._PENDING_MSG_TOTAL_CHARS:
-                    break
                 picked.append(m)
-                total += len(body)
+                total += len(m["body"] or "")
+                if total >= self._PENDING_MSG_TOTAL_CHARS:
+                    break
             picked.reverse()
             messages = [
                 {
