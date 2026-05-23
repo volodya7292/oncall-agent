@@ -625,7 +625,7 @@ async def _inbox_drain_loop(
     # boot is dirty. subscribe_global() only yields future events, so
     # without this the daemon would forget about pre-restart unreads.
     try:
-        pending = await db.list_pending_chats(body_tail_chars=1)
+        pending = await db.list_pending_chats()
     except Exception:
         log.exception("inbox-drain: recovery query failed; starting empty")
         pending = []
@@ -735,7 +735,7 @@ async def _flush_chat(
     # per-chat fetch — fine because the list is tiny and we already
     # paid for `list_pending_chats` in the recovery path.
     try:
-        rows = await db.list_pending_chats(body_tail_chars=500)
+        rows = await db.list_pending_chats()
     except Exception:
         log.exception("inbox-drain: list_pending_chats failed for %s", chat_id)
         return
@@ -774,7 +774,6 @@ async def _flush_chat(
 
     sender_username = summary.get("sender_username") or "unknown"
     sender_display = summary.get("sender_display_name") or ""
-    body_tail = summary.get("body_tail") or "(empty)"
     unread = summary.get("unread_count") or 0
     messages = summary.get("messages") or []
     # Render per-message lines with `[YYYY-MM-DD HH:MM | msg=ID] body`. Gives
@@ -789,9 +788,6 @@ async def _flush_chat(
         mid = str(m.get("message_id") or "?")
         body = (m.get("body") or "").replace("\n", "\n  ")
         msg_lines.append(f"- [{ts_compact} | msg={mid}] {body}")
-    if not msg_lines:
-        # Fallback when `messages` is missing (e.g. older drain path).
-        msg_lines = [body_tail]
     sender_label = f"@{sender_username}" + (
         f" ({sender_display})" if sender_display and sender_display != sender_username else ""
     )
@@ -805,7 +801,11 @@ async def _flush_chat(
         + "\n".join(msg_lines)
         + "\n\n→ ACTION: apply Inbound DM notes rule — hand_off if memory mentions sender, otherwise silence."
     )
-    retrieval_query = (sender_username + " " + body_tail).strip()[:1200] or None
+    # Retrieval query for memory lookup — derive from message bodies
+    # directly now that body_tail is gone. Cap at 1200 chars; that's
+    # enough to give the embedder semantic signal without bloating.
+    retrieval_body = "\n".join(m.get("body") or "" for m in messages)
+    retrieval_query = (sender_username + " " + retrieval_body).strip()[:1200] or None
     try:
         result = await operator.auto_ping(
             session_id=target_session_id,

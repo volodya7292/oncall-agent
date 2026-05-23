@@ -339,16 +339,14 @@ class TelegramService:
         filtered = [r for r in rows if r["chat_id"] not in self._archived]
         return filtered[:limit]
 
-    async def list_pending_chats(
-        self, *, body_tail_chars: int = 500,
-    ) -> list[dict[str, Any]]:
+    async def list_pending_chats(self) -> list[dict[str, Any]]:
         """One entry per chat with unread DMs. Archived chats are excluded
         — they're the same things `list_inbox` filters out. Used by the
         inbox-drain triage path and by the operator's `read_inbox` tool
         in the new chat-centric flow (the operator sees the dirty chat
         and then calls `read_chat` for full context if it wants it)."""
         await self._refresh_archived()
-        rows = await self._db.list_pending_chats(body_tail_chars=body_tail_chars)
+        rows = await self._db.list_pending_chats()
         return [r for r in rows if r["chat_id"] not in self._archived]
 
     async def get_message(self, inbox_id: str) -> dict[str, Any] | None:

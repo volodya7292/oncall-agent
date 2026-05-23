@@ -12,7 +12,7 @@ These cover:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -302,12 +302,15 @@ async def test_duplicate_message_dedup(service, db):
 
 @pytest.mark.asyncio
 async def test_get_chat_style_returns_user_outgoing(db):
-    """Style samples must be the USER'S own messages, not the counterparty's."""
+    """Style samples must be the USER'S own messages, not the counterparty's.
+    Results are sorted newest-first (combined across the 3 temporal sampling
+    windows that get_chat_style fans out across)."""
+    base = datetime(2026, 5, 22, 10, 0, tzinfo=timezone.utc)
     client = FakeTelegramClient(outgoing={
         12345: [
-            {"id": 5, "message": "ало", "date": datetime.now(timezone.utc)},
-            {"id": 6, "message": "ща приду", "date": datetime.now(timezone.utc)},
-            {"id": 7, "message": "+1", "date": datetime.now(timezone.utc)},
+            {"id": 5, "message": "ало", "date": base},
+            {"id": 6, "message": "ща приду", "date": base + timedelta(minutes=1)},
+            {"id": 7, "message": "+1", "date": base + timedelta(minutes=2)},
         ],
     })
     s = TelegramService(db=db, client=client, important_senders=set(), important_keywords=set())
@@ -317,7 +320,7 @@ async def test_get_chat_style_returns_user_outgoing(db):
     finally:
         await s.stop()
     texts = [m["text"] for m in samples]
-    assert texts == ["ало", "ща приду", "+1"]
+    assert texts == ["+1", "ща приду", "ало"]
 
 
 @pytest.mark.asyncio
@@ -335,10 +338,11 @@ async def test_send_calls_underlying_client(db):
 
 
 @pytest.mark.asyncio
-async def test_list_pending_chats_groups_by_chat_with_body_tail(service, db):
+async def test_list_pending_chats_groups_by_chat_with_messages(service, db):
     """Multiple unread DMs in the same chat collapse to ONE pending-chats
-    row with a `unread_count` and a `body_tail` of the unread bodies
-    joined oldest→newest. A second chat gets its own row."""
+    row with `unread_count` and a `messages` list — one entry per unread
+    row in chronological order, each carrying message_id/received_at/body.
+    A second chat gets its own row."""
     s, client = service
     await client.handler(make_event(
         sender_username="alex", body="ping 1", chat_id=111, message_id=1,
@@ -353,42 +357,13 @@ async def test_list_pending_chats_groups_by_chat_with_body_tail(service, db):
     by_chat = {r["chat_id"]: r for r in rows}
     assert set(by_chat.keys()) == {"111", "222"}
     assert by_chat["111"]["unread_count"] == 2
-    assert by_chat["111"]["body_tail"] == "ping 1\nping 2"
     assert by_chat["111"]["sender_username"] == "alex"
+    bodies_111 = [m["body"] for m in by_chat["111"]["messages"]]
+    assert bodies_111 == ["ping 1", "ping 2"]
+    mids_111 = [m["message_id"] for m in by_chat["111"]["messages"]]
+    assert mids_111 == ["1", "2"]
     assert by_chat["222"]["unread_count"] == 1
-    assert by_chat["222"]["body_tail"] == "hey"
-
-
-@pytest.mark.asyncio
-async def test_list_pending_chats_body_tail_truncates_from_start(db):
-    """Once the concatenated unread bodies exceed `body_tail_chars`, the
-    tail is preserved (most recent content) and an ellipsis is prepended
-    so the operator can tell truncation happened."""
-    client = FakeTelegramClient()
-    s = TelegramService(
-        db=db, client=client,
-        important_senders=set(), important_keywords=set(),
-    )
-    await s.start()
-    try:
-        # 3 bodies of 200 chars each → ~600 chars joined; body_tail_chars=300
-        # should yield the last 300 chars prefixed with "…".
-        for i in range(3):
-            await client.handler(make_event(
-                sender_username="alex",
-                body=("X" * 199 + str(i)),
-                chat_id=111, message_id=100 + i,
-            ))
-        rows = await s.list_pending_chats(body_tail_chars=300)
-    finally:
-        await s.stop()
-    assert len(rows) == 1
-    tail = rows[0]["body_tail"]
-    assert tail.startswith("…")
-    # The "…" prefix + exactly 300 chars of trailing body.
-    assert len(tail) == 301
-    # The tail must contain the final body's content (suffix preserved).
-    assert tail.endswith("2")
+    assert [m["body"] for m in by_chat["222"]["messages"]] == ["hey"]
 
 
 @pytest.mark.asyncio

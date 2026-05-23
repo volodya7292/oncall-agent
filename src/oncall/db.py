@@ -890,24 +890,20 @@ class Database:
         )
         await self.conn.commit()
 
-    async def list_pending_chats(
-        self, *, body_tail_chars: int = 500,
-    ) -> list[dict[str, Any]]:
+    async def list_pending_chats(self) -> list[dict[str, Any]]:
         """One row per chat_id that has unread, not-yet-triaged inbox messages.
 
-        Each row carries the metadata the inbox-drain needs to build an
-        auto-ping without ever batching bodies: sender (from the latest
-        unread row), `unread_count`, `first_unread_at` / `last_unread_at`,
-        and a `body_tail` — the most recent unread bodies concatenated
-        oldest→newest and truncated from the START to `body_tail_chars`
-        (so the suffix is always intact; an ellipsis is prepended when
-        truncation happened). Bodies live in the audit table; this is
-        only a thin pointer the operator uses to decide whether to call
-        `read_chat` for full context."""
+        Each row carries: sender (from the latest unread row),
+        `unread_count`, `first_unread_at` / `last_unread_at`, and a
+        `messages` list — every unread row's `{message_id, received_at,
+        body}` in chronological order. Callers render notes from
+        `messages` directly so they can include per-message timestamps
+        and ids; an older flat `body_tail` field was removed since it
+        was derivable from `messages` and obscured the structure."""
         rows = await (await self.conn.execute(
             """
-            SELECT id, chat_id, sender_username, sender_display_name,
-                   body, received_at
+            SELECT id, chat_id, message_id, sender_username,
+                   sender_display_name, body, received_at
             FROM messenger_inbox
             WHERE read_at IS NULL
               AND id NOT IN (SELECT inbox_id FROM messenger_inbox_triaged)
@@ -921,14 +917,6 @@ class Database:
         out: list[dict[str, Any]] = []
         for chat_id, msgs in grouped.items():
             latest = msgs[-1]
-            joined = "\n".join((m["body"] or "") for m in msgs)
-            if len(joined) > body_tail_chars:
-                body_tail = "…" + joined[-body_tail_chars:]
-            else:
-                body_tail = joined
-            # Per-message details for callers that want to render structured
-            # notes (msg_id + timestamp per row) instead of just a concatenated
-            # body tail. body_tail stays for backwards compat.
             messages = [
                 {
                     "message_id": m["message_id"],
@@ -944,7 +932,6 @@ class Database:
                 "unread_count": len(msgs),
                 "first_unread_at": msgs[0]["received_at"],
                 "last_unread_at": latest["received_at"],
-                "body_tail": body_tail,
                 "messages": messages,
             })
         # Most-recently-updated chats first — matches what the operator
