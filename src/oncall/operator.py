@@ -488,6 +488,18 @@ class OperatorTurnResult:
 
 
 AUTO_PING_PREFIX = "[system note: "
+
+
+def _fmt_ts(ts: str) -> str:
+    """Compact form for chat_messages.created_at when prefixing hand-off
+    tail lines. Input is an ISO-8601 string (e.g.
+    `2026-05-23T20:23:16.823+00:00`); output is `YYYY-MM-DD HH:MM`. Empty
+    or unparseable inputs return ''. We trim aggressively because the
+    tail is char-capped; the spawn-date anchor in the executor prompt
+    handles the timezone implicitly."""
+    if not ts or len(ts) < 16:
+        return ""
+    return ts[:10] + " " + ts[11:16]
 MEMORY_NOTE_PREFIX = "[memory note: "
 
 
@@ -1567,7 +1579,7 @@ class Operator:
                 tail=[], user_text=user_text, hint=hint,
             ), 0
 
-        tail: list[tuple[str, str]] = []  # (label, content)
+        tail: list[tuple[str, str, str]] = []  # (label, content, ts)
         new_cursor = cursor
         for row in history:
             mid = int(row["id"])
@@ -1587,11 +1599,12 @@ class Operator:
                 # The latest user turn — printed as "user (now)" below.
                 continue
             label = "user" if role == "user" else "operator"
-            tail.append((label, content))
+            tail.append((label, content, _fmt_ts(row.get("created_at") or "")))
 
         # Trim from the FRONT until under the char cap (keep most recent).
-        def total(items: list[tuple[str, str]]) -> int:
-            return sum(len(lbl) + len(c) + 3 for lbl, c in items)  # ": " + "\n"
+        # Per-line overhead is label + content + ts + brackets + ": " + "\n".
+        def total(items: list[tuple[str, str, str]]) -> int:
+            return sum(len(lbl) + len(c) + len(ts) + 6 for lbl, c, ts in items)
         while tail and total(tail) > self._HANDOFF_CONTEXT_MAX_CHARS:
             tail.pop(0)
 
@@ -1601,15 +1614,16 @@ class Operator:
 
     @staticmethod
     def _format_handoff_body(
-        *, tail: list[tuple[str, str]], user_text: str, hint: str,
+        *, tail: list[tuple[str, str, str]], user_text: str, hint: str,
     ) -> str:
         parts: list[str] = []
         if tail:
             parts.append(
                 "[recent operator↔user dialogue, for context — newest last]"
             )
-            for label, content in tail:
-                parts.append(f"{label}: {content}")
+            for label, content, ts in tail:
+                prefix = f"[{ts}] " if ts else ""
+                parts.append(f"{prefix}{label}: {content}")
             parts.append("")
         if hint:
             parts.append(f"[operator hint: {hint}]")

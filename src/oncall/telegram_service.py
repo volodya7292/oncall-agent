@@ -425,8 +425,8 @@ class TelegramService:
                 seen.add(mid)
                 samples.append({
                     "message_id": mid,
-                    "text": text,
                     "date": _iso_or_none(getattr(msg, "date", None)),
+                    "text": text,
                 })
         samples.sort(key=lambda s: s["date"] or "", reverse=True)
         return samples
@@ -472,10 +472,12 @@ class TelegramService:
                 await _maybe_await(msg.get_sender())
                 if hasattr(msg, "get_sender") else None
             )
+            # `date` placed right after `message_id` so the model reads
+            # recency before content — easy to miss when buried mid-record.
             out.append({
                 "message_id": str(getattr(msg, "id", "")),
-                "text": text,
                 "date": _iso_or_none(getattr(msg, "date", None)),
+                "text": text,
                 "outgoing": bool(getattr(msg, "out", False)),
                 "sender_username": getattr(sender, "username", None) if sender else None,
                 "sender_display_name": _display_name(sender) if sender else None,
@@ -544,10 +546,12 @@ class TelegramService:
                 await _maybe_await(msg.get_sender())
                 if hasattr(msg, "get_sender") else None
             )
+            # `date` placed right after `message_id` so the model reads
+            # recency before content — easy to miss when buried mid-record.
             out.append({
                 "message_id": str(getattr(msg, "id", "")),
-                "text": text,
                 "date": _iso_or_none(getattr(msg, "date", None)),
+                "text": text,
                 "outgoing": bool(getattr(msg, "out", False)),
                 "sender_username": getattr(sender, "username", None) if sender else None,
                 "sender_display_name": _display_name(sender) if sender else None,
