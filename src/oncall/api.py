@@ -1276,6 +1276,26 @@ def _register_routes(app: FastAPI) -> None:
                 err = _messenger_restriction_error(body, locked)
                 if err is not None:
                     raise HTTPException(403, err)
+        # Top-level safety net for telethon-side rejections (FloodWait,
+        # ChatWriteForbidden, PeerIdInvalid, MessageIdInvalid, …). Without
+        # this, Telethon RPCError bubbles up as a generic 500 and the
+        # executor sees an opaque infra-style failure instead of a tool
+        # error it can act on. Op-specific catches inside tg.* methods
+        # (e.g. tg.react's RPCError→ValueError translation, which carries
+        # message_id-specific guidance) run first and win for their cases.
+        # Lazy import so api.py doesn't take a hard telethon dependency
+        # at module-load time (tests stub TelegramService without it).
+        from telethon.errors import RPCError  # type: ignore
+        try:
+            return await _messenger_dispatch(tg, body)
+        except RPCError as e:
+            raise HTTPException(
+                422, f"telegram rejected {body.op}: {type(e).__name__}: {e}",
+            )
+
+    async def _messenger_dispatch(
+        tg: TelegramService, body: MessengerOpBody,
+    ) -> dict[str, Any]:
         if body.op == "list":
             unread_only = True if body.unread_only is None else body.unread_only
             return {"messages": await tg.list_inbox(unread_only=unread_only, limit=body.limit)}
