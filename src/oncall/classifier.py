@@ -808,6 +808,22 @@ def _stmt_is_read_only(stmt: exp.Expression) -> bool:
 # MCP tool classifiers
 # ---------------------------------------------------------------------------
 
+def enrich_canonical_with_chat_label(
+    canonical: str, chat_id: str, label: str,
+) -> str:
+    """Rewrite a canonical command's bare chat_id into `<label> (<chat_id>)`
+    so approval prompts show human-readable names. Whole-word boundaries
+    prevent accidentally substituting message_ids that happen to share
+    digits. No-op when either side is empty."""
+    if not canonical or not chat_id or not label:
+        return canonical
+    return re.sub(
+        rf"\b{re.escape(chat_id)}\b",
+        f"{label} ({chat_id})",
+        canonical,
+    )
+
+
 def _classify_messenger(tool_input: dict[str, Any]) -> Verdict:
     op = str(tool_input.get("op", ""))
     if op in (
@@ -860,6 +876,22 @@ def _classify_messenger(tool_input: dict[str, Any]) -> Verdict:
                 f"visible to the recipient and stored in Telegram's CDN; "
                 f"cannot be unsent reliably. Verify the path does not "
                 f"contain secrets (.env, *.key, *.pem, credentials, etc)."
+            ),
+        )
+    if op == "place_call":
+        chat = str(tool_input.get("chat_id", "?"))
+        reason = str(tool_input.get("reason") or "").strip()
+        # Reason is required by the dispatcher; surface its absence early
+        # in the canonical so the owner sees what's missing in the approval.
+        reason_clause = f" — reason: {reason!r}" if reason else " — reason: <MISSING>"
+        return Verdict(
+            kind=ClassifierVerdict.MUTATING,
+            canonical=f"Place voice call to chat {chat}{reason_clause}",
+            blast_radius=(
+                f"Rings chat {chat}'s Telegram as an incoming call from "
+                f"the agent's account. Non-owner calls run in a fresh chat-session so no "
+                f"prior text-chat context leaks, but the agent retains "
+                f"memory access."
             ),
         )
     return Verdict(

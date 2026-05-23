@@ -117,6 +117,7 @@ class MessengerOpBody(BaseModel):
         "list", "read", "mark_read", "style", "send", "send_file", "react",
         "read_image", "transcribe",
         "history", "search", "search_messages", "list_chats",
+        "place_call",
     ]
     chat_id: str | None = None
     message_id: str | None = None
@@ -126,6 +127,11 @@ class MessengerOpBody(BaseModel):
     caption: str | None = None
     emoji: str | None = None
     query: str | None = None
+    # `place_call` only: operator-supplied purpose for the call. Surfaced
+    # in the approval prompt so the owner consents to a specific scope,
+    # and threaded into the operator's call-start system note so it
+    # constrains in-call conversation drift.
+    reason: str | None = None
     # ISO 8601 timestamp for `op=history`: when set, return up to `limit`
     # messages at-or-after this moment, oldest-first. Naive datetimes are
     # interpreted as UTC.
@@ -174,9 +180,41 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await db.connect()
+
+        async def _resolve_chat_label(chat_id: str) -> str | None:
+            """Broker hook: turn a bare chat_id into a human-readable name
+            for approval prompts. Uses the live telegram client when
+            available; returns None on any failure (broker falls back to
+            the bare id)."""
+            tg: TelegramService | None = getattr(app.state, "telegram", None)
+            if tg is None:
+                log.debug("chat label resolver: telegram service not in app.state")
+                return None
+            try:
+                info = await tg.resolve_chat_name(chat_id)
+            except Exception:
+                log.warning(
+                    "chat label resolver: resolve_chat_name(%s) raised",
+                    chat_id, exc_info=True,
+                )
+                return None
+            if not info:
+                log.debug("chat label resolver: no info for chat_id=%s", chat_id)
+                return None
+            name = info.get("display_name") or None
+            username = info.get("username") or None
+            if name and username:
+                return f"{name} (@{username})"
+            if name:
+                return name
+            if username:
+                return f"@{username}"
+            return None
+
         broker = Broker(
             db, approval_client, events.publish,
             approval_timeout_seconds=settings.oncall_approval_timeout_seconds,
+            chat_label_resolver=_resolve_chat_label,
         )
         lifecycle = Lifecycle(
             db=db, broker=broker, approval_client=approval_client,
@@ -311,7 +349,7 @@ def create_app() -> FastAPI:
         if telegram_agent is not None and operator is not None:
             voice_call = await _maybe_start_voice_call(
                 settings, operator=operator, events=events, broker=broker,
-                telegram_agent=telegram_agent, llm=llm,
+                telegram_agent=telegram_agent, telegram=telegram, llm=llm,
             )
 
         app.state.db = db
@@ -1019,11 +1057,20 @@ async def _maybe_start_telegram_agent(
 
 async def _maybe_start_voice_call(
     settings, *, operator: Operator, events: EventBus, broker: Broker,
-    telegram_agent: TelegramAgentService, llm: Any = None,
+    telegram_agent: TelegramAgentService,
+    telegram: TelegramService | None = None,
+    llm: Any = None,
 ) -> CallService | None:
-    """Boot the 1:1 voice CallService on the agent userbot's telethon
-    session if VOICE_CALL_ENABLED + all STT/TTS env vars are set. Returns
-    None on misconfiguration or start failure — text chat stays up."""
+    """Boot the 1:1 voice CallService.
+
+    The agent userbot's telethon session handles INBOUND calls (owner →
+    agent). The primary userbot's telethon session (when available) is
+    used to PLACE outbound calls so the callee sees them coming from the
+    owner's account, not the agent's. If `telegram` is None the service
+    still runs but `place_call` will fail.
+
+    Returns None on misconfiguration or start failure — text chat stays
+    up."""
     if not settings.voice_call_enabled:
         log.info("voice call disabled (VOICE_CALL_ENABLED unset)")
         return None
@@ -1043,6 +1090,7 @@ async def _maybe_start_voice_call(
     try:
         service = CallService(
             client=telegram_agent._client,
+            primary_client=(telegram._client if telegram is not None else None),
             operator=operator, events=events, broker=broker,
             owner_user_id=int(settings.telegram_owner_user_id),
             tts_base_url=settings.voice_tts_base_url,
@@ -1302,7 +1350,12 @@ def _register_routes(app: FastAPI) -> None:
         # at module-load time (tests stub TelegramService without it).
         from telethon.errors import RPCError  # type: ignore
         try:
-            return await _messenger_dispatch(tg, body)
+            return await _messenger_dispatch(
+                tg, body,
+                call_service=request.app.state.voice_call,
+                db=_db(request),
+                owner_user_id=get_settings().telegram_owner_user_id,
+            )
         except RPCError as e:
             # Emit on the audit channel too so messenger failures show up
             # in the same place as `inbound` / `send` / `react` success
@@ -1319,6 +1372,10 @@ def _register_routes(app: FastAPI) -> None:
 
     async def _messenger_dispatch(
         tg: TelegramService, body: MessengerOpBody,
+        *,
+        call_service: CallService | None = None,
+        db: Database | None = None,
+        owner_user_id: str | None = None,
     ) -> dict[str, Any]:
         if body.op == "list":
             unread_only = True if body.unread_only is None else body.unread_only
@@ -1419,6 +1476,44 @@ def _register_routes(app: FastAPI) -> None:
                 return await tg.react(body.chat_id, body.message_id, body.emoji)
             except ValueError as e:
                 raise HTTPException(422, str(e))
+        if body.op == "place_call":
+            if not body.chat_id:
+                raise HTTPException(400, "chat_id required")
+            reason = (body.reason or "").strip()
+            if not reason:
+                raise HTTPException(400, "reason required")
+            if len(reason) > 200:
+                raise HTTPException(422, "reason must be ≤200 chars")
+            try:
+                target = int(body.chat_id)
+            except ValueError:
+                raise HTTPException(422, f"chat_id must be int, got {body.chat_id!r}")
+            if call_service is None or not call_service.is_started:
+                raise HTTPException(503, "voice service not running")
+            if db is None:
+                raise HTTPException(503, "db not available")
+            # Allowlist: owner is always callable; everyone else must be
+            # on the DM allowlist (the same one `/dmlist` shows).
+            allowed = False
+            if owner_user_id and str(target) == str(owner_user_id):
+                allowed = True
+            else:
+                allowed = await db.is_dm_allowed(str(target))
+            if not allowed:
+                raise HTTPException(
+                    403,
+                    f"chat_id {target} is not on the call allowlist "
+                    f"(must be the owner or on /dmlist)",
+                )
+            try:
+                await call_service.place_call(target, reason=reason)
+            except RuntimeError as e:
+                # CallService raises RuntimeError with a human-readable
+                # message for every expected failure (not started, busy,
+                # tts unhealthy, callee privacy, etc.). Map to 422 so the
+                # operator sees a clean tool error rather than 500.
+                raise HTTPException(422, str(e))
+            return {"ok": True, "chat_id": target, "reason": reason}
         raise HTTPException(400, f"unknown op {body.op!r}")
 
     @app.post("/internal/memory", dependencies=[Depends(verify_loopback)])

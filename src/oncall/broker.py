@@ -30,7 +30,7 @@ from .approval_client import (
     phrases_match,
 )
 from .audit import broker_log, fmt
-from .classifier import classify
+from .classifier import classify, enrich_canonical_with_chat_label
 from .db import Database
 from .models import (
     ApprovalRequest,
@@ -48,6 +48,7 @@ MAX_CONSECUTIVE_DENIALS = 3
 
 
 EventPublisher = Callable[[UUID, str, dict[str, Any]], Awaitable[None]]
+ChatLabelResolver = Callable[[str], Awaitable[str | None]]
 
 
 class Broker:
@@ -59,6 +60,7 @@ class Broker:
         *,
         max_consecutive_denials: int = MAX_CONSECUTIVE_DENIALS,
         approval_timeout_seconds: int | None = None,
+        chat_label_resolver: ChatLabelResolver | None = None,
     ) -> None:
         self._db = db
         self._client = approval_client
@@ -67,6 +69,12 @@ class Broker:
         # None → use the ApprovalRequest model's own default. In production
         # api.py passes settings.oncall_approval_timeout_seconds.
         self._approval_timeout_seconds = approval_timeout_seconds
+        # Optional. When set, the broker calls this with a chat_id before
+        # constructing approval rows so messenger-op canonicals (`send`,
+        # `place_call`, `react`, …) display human-readable names like
+        # "Rostislav (1756925023)" instead of the bare id. Resolver
+        # returning None → no enrichment, fall back to the bare id.
+        self._chat_label_resolver = chat_label_resolver
 
     async def decide(
         self,
@@ -112,6 +120,28 @@ class Broker:
 
         # 2. Classify (deterministic, model-free).
         verdict = classify(tool_name, tool_input)
+        # Enrich messenger-op canonicals with a human-readable chat label
+        # ("Rostislav (1756925023)" instead of bare digits) so approval
+        # prompts read naturally. Pure cosmetics — the verdict.kind and
+        # all decision paths below are unaffected. Best-effort: any
+        # resolver failure or empty result is silently skipped.
+        if (
+            self._chat_label_resolver is not None
+            and tool_name == "mcp__oncall__messenger_inbox"
+            and tool_input.get("chat_id")
+        ):
+            chat_id_str = str(tool_input["chat_id"])
+            try:
+                label = await self._chat_label_resolver(chat_id_str)
+            except Exception:
+                broker_log.warning("chat label resolver raised; skipping enrichment", exc_info=True)
+                label = None
+            if label:
+                verdict = verdict.model_copy(update={
+                    "canonical": enrich_canonical_with_chat_label(
+                        verdict.canonical, chat_id_str, label,
+                    ),
+                })
         task = await self._db.get_task_by_session(session_id)
         if task is None:
             broker_log.warning("decide " + fmt(
@@ -157,12 +187,13 @@ class Broker:
             ))
             return PermissionResult(behavior="allow", updatedInput=tool_input)
 
-        # Pre-approved Telegram send: chat_id is on the user's per-chat
-        # allowlist (populated via `/allowdm <chat_id>`). Mutating `op=send`
-        # to that chat auto-allows without a challenge-phrase round-trip.
-        # The executor's system prompt carries the no-cross-chat-leak rule;
-        # this table is the final byte-level gate before a message leaves
-        # the box on the user's behalf.
+        # Pre-approved Telegram send / call: chat_id is on the user's
+        # per-chat allowlist (populated via `/allowdm <chat_id>`). Mutating
+        # `op=send` / `send_file` / `place_call` to that chat auto-allows
+        # without a challenge-phrase round-trip. The executor's system
+        # prompt carries the no-cross-chat-leak rule; this table is the
+        # final byte-level gate before a message leaves the box on the
+        # user's behalf.
         #
         # Scoped to autonomous-reply tasks ONLY: the auto-approve fires
         # only when the task is restricted_to_chat (spawned by the
@@ -174,10 +205,14 @@ class Broker:
         # discovering it after the fact. Without this gate, /allowdm
         # effectively becomes "let the agent send freely whenever I
         # mention this person," which is not what users mean by it.
+        #
+        # Note for place_call: place_call's own dispatcher refuses
+        # self-call to the owner; here it just inherits the allowlist
+        # check that send already passes.
         if (
             verdict.kind == ClassifierVerdict.MUTATING
             and tool_name == "mcp__oncall__messenger_inbox"
-            and tool_input.get("op") in ("send", "send_file")
+            and tool_input.get("op") in ("send", "send_file", "place_call")
         ):
             send_chat = str(tool_input.get("chat_id") or "")
             if (

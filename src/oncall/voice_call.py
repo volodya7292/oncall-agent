@@ -76,7 +76,7 @@ def _ensure_libopus_discoverable() -> None:
 
 _ensure_libopus_discoverable()
 
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from .approval_client import is_deny_phrase, phrases_match
 from .broker import Broker
@@ -124,9 +124,29 @@ SPEAK_IDLE_TIMEOUT_S = 3.0
 @dataclass
 class _ActiveCall:
     chat_id: int
+    # Per-call session id. For inbound (owner) calls this is the shared
+    # agent_session_id so voice continues the owner's text chat. For
+    # outbound calls to a non-owner, this is a fresh ephemeral id so the
+    # operator runs in a clean session with no owner chat history.
+    session_id: str
+    is_owner: bool                         # drives memory isolation + system note variant
+    callee_label: str                      # human-readable; "owner", "Alice", "id=12345"
+    reason: str                            # operator's stated purpose; "" for inbound
     outbound_text_queue: asyncio.Queue[str]
     inbound_frames: asyncio.Queue[bytes]
     barge_in: asyncio.Event
+    # Which PyTgCalls instance owns this call. Inbound calls use the
+    # agent-client instance; outbound calls use the primary-client
+    # instance. send_frame / leave_call must be routed to the right one.
+    call_py: Any = None
+    # Watchdog clocks (monotonic seconds). placed_at is set when the call
+    # is initiated; connected_at is set on first inbound audio frame (i.e.
+    # actual pickup — for inbound calls we set it equal to placed_at since
+    # _on_incoming only fires after acceptance); last_activity_at is bumped
+    # on every utterance and TTS playback.
+    placed_at: float = 0.0
+    connected_at: float | None = None
+    last_activity_at: float = 0.0
     tasks: list[asyncio.Task] = field(default_factory=list)
     is_speaking: bool = False              # outbound is currently emitting TTS audio
     in_flight_tts: asyncio.Task | None = None
@@ -136,11 +156,20 @@ class _ActiveCall:
     pending_approvals: dict[str, str] = field(default_factory=dict)
 
 
+# Call-lifecycle timeouts (seconds, monotonic). Tuned in CallService below
+# but kept here so they sit next to _ActiveCall for easy review.
+RING_TIMEOUT_S = 40.0       # outbound call dropped if not picked up by then
+IDLE_TIMEOUT_S = 90.0       # any call torn down after this much silence
+MAX_CALL_DURATION_S = 600.0  # hard cap on any single call (10 min)
+WATCHDOG_TICK_S = 5.0       # how often _call_watchdog re-checks
+
+
 class CallService:
     def __init__(
         self,
         *,
-        client: Any,                       # telethon TelegramClient
+        client: Any,                       # telethon TelegramClient — AGENT userbot (inbound)
+        primary_client: Any = None,        # telethon TelegramClient — OWNER's userbot (outbound)
         operator: Operator,
         events: EventBus,
         broker: Broker,
@@ -155,6 +184,10 @@ class CallService:
         llm_model: str = "",
     ) -> None:
         self._client = client
+        # Owner's primary userbot client — used to PLACE outbound calls
+        # so the callee sees them coming from the owner's account, not
+        # the agent's. When None, place_call refuses.
+        self._primary_client = primary_client
         self._operator = operator
         self._events = events
         self._broker = broker
@@ -167,13 +200,29 @@ class CallService:
         self._stt_base_url = stt_base_url.rstrip("/")
         self._stt_api_key = stt_api_key
         self._language = language
-        self._session_id = agent_session_id(owner_user_id)
+        # Owner's shared session: voice ↔ text continuity for inbound calls.
+        # Outbound calls to non-owners use a fresh per-call ephemeral id.
+        self._owner_session_id = agent_session_id(owner_user_id)
+        # Two PyTgCalls instances: `_call_py` on the agent client receives
+        # inbound owner calls; `_call_py_primary` on the primary client
+        # places outbound calls. Both are populated in start(); either may
+        # be None when corresponding client wasn't provided.
         self._call_py: Any | None = None
+        self._call_py_primary: Any | None = None
         self._started = False
         self._active: _ActiveCall | None = None
         self._vad: Any | None = None
         # Resample state for 48k → 16k.
         self._resample_state: Any = None
+        # TTS-health probe cache. Calls (in/outbound) hit a tiny TTS endpoint
+        # before connecting; a healthy result stays valid for this many
+        # seconds so back-to-back checks don't add latency.
+        self._tts_health_until: float = 0.0
+        self._tts_health_ttl_s: float = 10.0
+        # Strong refs for fire-and-forget post-call brief tasks. Without
+        # this the event loop only holds a weak reference and Python GC
+        # destroys the coroutine mid-flight (see asyncio.create_task docs).
+        self._brief_tasks: set[asyncio.Task] = set()
 
     @property
     def is_started(self) -> bool:
@@ -181,7 +230,10 @@ class CallService:
 
     @property
     def session_id(self) -> str:
-        return self._session_id
+        """The owner's session — used by `telegram_agent` to scope events
+        even when no call is active. Per-call session ids (which may differ
+        for outbound non-owner calls) live on `_ActiveCall.session_id`."""
+        return self._owner_session_id
 
     # ---- lifecycle ----
 
@@ -212,27 +264,49 @@ class CallService:
 
         self._vad = load_silero_vad()
 
+        # --- Agent client: receives INBOUND owner calls. ---
         self._call_py = PyTgCalls(self._client)
         await self._call_py.start()
 
         @self._call_py.on_update(fl.chat_update(ChatUpdate.Status.INCOMING_CALL))
-        async def _on_incoming(_, update):
+        async def _on_incoming_agent(_, update):
             await self._on_incoming(update)
 
         @self._call_py.on_update(fl.chat_update(ChatUpdate.Status.LEFT_CALL))
-        async def _on_left(_, update):
+        async def _on_left_agent(_, update):
             await self._on_left(update)
 
         @self._call_py.on_update(
             fl.stream_frame(Direction.INCOMING, Device.MICROPHONE),
         )
-        async def _on_frames(_, update):
+        async def _on_frames_agent(_, update):
             await self._on_frames(update)
+
+        # --- Primary client: places OUTBOUND calls.
+        # No INCOMING_CALL handler on purpose: registering one would
+        # intercept the owner's real-person phone calls coming in on
+        # their primary account.
+        if self._primary_client is not None:
+            self._call_py_primary = PyTgCalls(self._primary_client)
+            await self._call_py_primary.start()
+
+            @self._call_py_primary.on_update(
+                fl.chat_update(ChatUpdate.Status.LEFT_CALL),
+            )
+            async def _on_left_primary(_, update):
+                await self._on_left(update)
+
+            @self._call_py_primary.on_update(
+                fl.stream_frame(Direction.INCOMING, Device.MICROPHONE),
+            )
+            async def _on_frames_primary(_, update):
+                await self._on_frames(update)
 
         self._started = True
         log.info(
-            "voice CallService started (owner_user_id=%d, session=%s)",
-            self._owner_user_id, self._session_id,
+            "voice CallService started (owner_user_id=%d, session=%s, primary=%s)",
+            self._owner_user_id, self._owner_session_id,
+            "yes" if self._primary_client is not None else "no",
         )
 
     async def stop(self) -> None:
@@ -274,6 +348,19 @@ class CallService:
             except Exception:
                 log.exception("voice: leave_call on busy rejection failed")
             return
+        # TTS gates call acceptance: without it the operator's replies can't
+        # be spoken and the owner hears nothing back. Dropping the call now
+        # is friendlier than connecting and going silent.
+        if not await self._tts_health_ok():
+            log.warning(
+                "voice: TTS unhealthy; dropping incoming call from owner=%s",
+                caller,
+            )
+            try:
+                await self._call_py.leave_call(caller)  # type: ignore[union-attr]
+            except Exception:
+                log.exception("voice: leave_call after TTS-unhealthy failed")
+            return
         try:
             params = self._AudioParameters(PCM_RATE, PCM_CHANNELS)
             await self._call_py.play(  # type: ignore[union-attr]
@@ -291,11 +378,60 @@ class CallService:
                 pass
             return
 
-        active = _ActiveCall(
+        active = self._attach_active_call(
             chat_id=caller,
+            session_id=self._owner_session_id,
+            is_owner=True,
+            callee_label="owner",
+            reason="",
+            awaiting_pickup=False,  # owner is on the line by the time we're here
+            call_py=self._call_py,
+        )
+
+        log.info("voice: call accepted from owner=%s", caller)
+
+        # Tell the operator the call started so it can greet. We use
+        # auto_ping (the existing system-event path) rather than chat_turn
+        # so memory extraction sees this as a procedural ping, not a user
+        # message. The operator's reply lands as chat.reply → TTS via the
+        # subscriber → owner hears the greeting.
+        asyncio.create_task(self._announce_call_start(active), name="voice-greet")
+
+    # ---- shared setup for inbound and outbound calls ----
+
+    def _attach_active_call(
+        self, *,
+        chat_id: int,
+        session_id: str,
+        is_owner: bool,
+        callee_label: str,
+        reason: str,
+        awaiting_pickup: bool,
+        call_py: Any,
+    ) -> _ActiveCall:
+        """Construct the _ActiveCall, install it as `self._active`, and
+        spawn the per-call asyncio tasks. Used by both the inbound
+        (`_on_incoming`) and outbound (`place_call`) paths so they share
+        the same task lifecycle / done-callback wiring.
+
+        `awaiting_pickup=True` for outbound calls — `connected_at` stays
+        None until first inbound audio frame arrives, which is when the
+        no-answer watchdog stops counting. False for inbound calls (we
+        only see them post-acceptance)."""
+        now = time.monotonic()
+        active = _ActiveCall(
+            chat_id=chat_id,
+            session_id=session_id,
+            is_owner=is_owner,
+            callee_label=callee_label,
+            reason=reason,
             outbound_text_queue=asyncio.Queue(),
             inbound_frames=asyncio.Queue(maxsize=4096),
             barge_in=asyncio.Event(),
+            placed_at=now,
+            connected_at=None if awaiting_pickup else now,
+            last_activity_at=now,
+            call_py=call_py,
         )
         self._active = active
         self._resample_state = None  # reset audioop ratecv state for new call
@@ -313,18 +449,239 @@ class CallService:
                 self._approval_resolved_subscriber(active),
                 name="voice-approval-resolved",
             ),
+            asyncio.create_task(
+                self._call_watchdog(active), name="voice-watchdog",
+            ),
         ]
         for t in active.tasks:
             t.add_done_callback(self._on_call_task_done)
+        return active
 
-        log.info("voice: call accepted from owner=%s", caller)
+    async def _call_watchdog(self, active: _ActiveCall) -> None:
+        """Two timeouts:
+          * No-answer: outbound calls dropped after RING_TIMEOUT_S without
+            inbound audio (callee never picked up or rejected silently).
+          * Idle: any call torn down after IDLE_TIMEOUT_S of mutual silence
+            (no utterance, no TTS playback). Prevents stale calls from
+            hogging the single _active slot if both sides stop talking.
 
-        # Tell the operator the call started so it can greet. We use
-        # auto_ping (the existing system-event path) rather than chat_turn
-        # so memory extraction sees this as a procedural ping, not a user
-        # message. The operator's reply lands as chat.reply → TTS via the
-        # subscriber → owner hears the greeting.
-        asyncio.create_task(self._announce_call_start(active), name="voice-greet")
+        Ticks every WATCHDOG_TICK_S. Bails when the call is no longer
+        active (already torn down)."""
+        try:
+            while True:
+                await asyncio.sleep(WATCHDOG_TICK_S)
+                if self._active is not active:
+                    return
+                now = time.monotonic()
+                if active.connected_at is None:
+                    waited = now - active.placed_at
+                    if waited >= RING_TIMEOUT_S:
+                        log.info(
+                            "voice: outbound call to %s no-answer after %.0fs; "
+                            "tearing down", active.callee_label, waited,
+                        )
+                        await self._teardown_active(active, reason="no-answer")
+                        return
+                    continue
+                # Hard cap on call duration — prevents the agent from
+                # being trapped on a runaway call (held line, stalking,
+                # bug). Measured from pickup, not from placement.
+                duration = now - active.connected_at
+                if duration >= MAX_CALL_DURATION_S:
+                    log.info(
+                        "voice: max-duration %.0fs reached in call with %s; "
+                        "tearing down", duration, active.callee_label,
+                    )
+                    await self._teardown_active(active, reason="max-duration")
+                    return
+                # Don't count "currently speaking" as idle — that's the
+                # agent actively producing audio.
+                if active.is_speaking:
+                    continue
+                idle = now - active.last_activity_at
+                if idle >= IDLE_TIMEOUT_S:
+                    log.info(
+                        "voice: idle %.0fs in call with %s; tearing down",
+                        idle, active.callee_label,
+                    )
+                    await self._teardown_active(active, reason="idle-timeout")
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("voice watchdog crashed")
+            raise
+
+    # ---- outbound call initiation ----
+
+    async def place_call(self, chat_id: int, *, reason: str) -> None:
+        """Place an outbound 1:1 voice call from the OWNER's primary
+        userbot to `chat_id`. The callee sees an incoming Telegram call
+        from the owner's account, not from the agent userbot.
+
+        Raises a descriptive RuntimeError on any pre-flight failure (not
+        started, no primary client, self-call, busy, TTS unhealthy,
+        callee's Telegram privacy settings, etc.) so the dispatcher can
+        map to a clean tool error. On success, sets up an _ActiveCall
+        whose LEFT_CALL / inbound-frame events flow through the primary
+        PyTgCalls instance back into the shared lifecycle.
+
+        `reason`: the operator's stated purpose for the call. Surfaced to
+        the operator at call-start so it knows what it's permitted to
+        discuss."""
+        if not self._started:
+            raise RuntimeError("voice service not started")
+        if self._call_py_primary is None:
+            raise RuntimeError(
+                "primary userbot not available — cannot place outbound calls",
+            )
+        if chat_id == self._owner_user_id:
+            raise RuntimeError(
+                "cannot place a call to the owner from the owner's own account",
+            )
+        if self._active is not None:
+            raise RuntimeError("agent is currently on another call")
+        if not await self._tts_health_ok():
+            raise RuntimeError("tts_unhealthy")
+
+        # All outbound calls are to non-owners (self-call rejected above),
+        # so each gets a fresh ephemeral session — clean chat history,
+        # the owner's persistent memory is still accessible.
+        session_id = f"voice-out-{uuid4()}"
+        callee_label = await self._resolve_callee_label(chat_id)
+
+        params = self._AudioParameters(PCM_RATE, PCM_CHANNELS)
+        try:
+            await self._call_py_primary.play(
+                chat_id, self._MediaStream(self._ExternalMedia.AUDIO, params),
+            )
+        except Exception as exc:
+            # Translate typed exceptions into clear, operator-facing
+            # messages. The raw class names (CallDeclined, CallBusy, …)
+            # are confusing — the operator was reading "CallDeclined" +
+            # 422 status as "broker blocked the request", which is wrong.
+            cls_name = type(exc).__name__
+            log.warning(
+                "voice: outbound play(%s) failed: %s: %s",
+                chat_id, cls_name, exc,
+            )
+            try:
+                await self._call_py_primary.leave_call(chat_id)
+            except Exception:
+                pass
+            friendly = {
+                "UserPrivacyRestrictedError": (
+                    f"{callee_label} did not pick up — their Telegram "
+                    f"privacy settings prevent voice calls from this account"
+                ),
+                "CallDeclined": f"{callee_label} declined the call",
+                "CallBusy": f"{callee_label} is on another call",
+                "CallDiscarded": f"call to {callee_label} was discarded before connecting",
+                "TimedOutAnswer": f"{callee_label} did not answer in time",
+            }.get(cls_name)
+            if friendly is not None:
+                raise RuntimeError(friendly) from exc
+            raise RuntimeError(f"failed to place call: {cls_name}: {exc}") from exc
+        try:
+            await self._call_py_primary.record(
+                chat_id,
+                self._RecordStream(audio=True, audio_parameters=params),
+            )
+        except Exception:
+            log.exception("voice: outbound record() failed for %s", chat_id)
+            try:
+                await self._call_py_primary.leave_call(chat_id)
+            except Exception:
+                pass
+            raise RuntimeError("failed to start audio recording") from None
+
+        active = self._attach_active_call(
+            chat_id=chat_id,
+            session_id=session_id,
+            is_owner=False,  # self-call refused above, so this is always a non-owner
+            callee_label=callee_label,
+            reason=reason,
+            awaiting_pickup=True,  # watchdog will count ring time until first frame
+            call_py=self._call_py_primary,
+        )
+
+        log.info(
+            "voice: outbound call (via primary userbot) initiated to %s "
+            "(session=%s reason=%r)",
+            callee_label, session_id, reason[:80],
+        )
+
+        # Prewarm: generate the first message text + TTS while the call
+        # is ringing; play it 2 s after pickup is detected. Replaces the
+        # inbound-only _announce_call_start path for outbound calls.
+        task = asyncio.create_task(
+            self._prewarm_and_play_first(active),
+            name="voice-prewarm-greet",
+        )
+        active.tasks.append(task)
+        task.add_done_callback(self._on_call_task_done)
+
+    async def _resolve_callee_label(self, chat_id: int) -> str:
+        """Best-effort human-readable name for the callee, used in the
+        operator's call-start system note and in logs. Falls back to the
+        bare id if telethon can't resolve the entity."""
+        try:
+            entity = await self._client.get_entity(chat_id)
+        except Exception:
+            log.warning("voice: get_entity(%s) failed; using bare id", chat_id)
+            return f"id={chat_id}"
+        first = (getattr(entity, "first_name", None) or "").strip()
+        last = (getattr(entity, "last_name", None) or "").strip()
+        username = (getattr(entity, "username", None) or "").strip()
+        if first or last:
+            full = (first + " " + last).strip()
+            return full if not username else f"{full} (@{username})"
+        if username:
+            return f"@{username}"
+        return f"id={chat_id}"
+
+    # ---- TTS health probe ----
+
+    async def _tts_health_ok(self) -> bool:
+        """Quick check that TTS is reachable. Returns True if a recent
+        probe succeeded (within `_tts_health_ttl_s`) or if a fresh probe
+        succeeds now; False otherwise. A call without working TTS is
+        useless — the operator can think but can't speak."""
+        now = time.monotonic()
+        if now < self._tts_health_until:
+            return True
+        url = f"{self._tts_base_url}/v1/audio/speech"
+        body = {
+            "model": "tts-1",
+            "voice": self._tts_voice,
+            "input": " ",
+            "response_format": "opus",
+        }
+        try:
+            # `read` covers the actual TTS synthesis — even input=" " takes
+            # 2–3 s on a healthy provider, occasionally up to ~4. 5 s gives
+            # headroom for normal variance without letting the daemon hang
+            # if the provider is truly stuck.
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=2.0, read=5.0, write=2.0, pool=5.0),
+            ) as client:
+                r = await client.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {self._tts_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                )
+                ok = 200 <= r.status_code < 300
+        except Exception as exc:
+            log.warning("voice: TTS health probe failed: %r", exc)
+            return False
+        if not ok:
+            log.warning("voice: TTS health probe returned status=%d", r.status_code)
+            return False
+        self._tts_health_until = time.monotonic() + self._tts_health_ttl_s
+        return True
 
     async def _on_left(self, update: Any) -> None:
         chat_id = int(update.chat_id)
@@ -338,6 +695,22 @@ class CallService:
         active = self._active
         if active is None:
             return
+        # Guard against cross-talk on the primary userbot: it may receive
+        # frame events for unrelated calls (e.g. the owner's own real-world
+        # voice activity through other PyTgCalls bindings or normal Telegram
+        # use). Only handle frames addressed to OUR active call's chat_id.
+        frame_chat_id = getattr(update, "chat_id", None)
+        if frame_chat_id is not None and int(frame_chat_id) != active.chat_id:
+            return
+        # First inbound audio frame on an outbound call = the callee picked
+        # up. This stops the no-answer watchdog and starts the idle clock.
+        if active.connected_at is None:
+            active.connected_at = time.monotonic()
+            active.last_activity_at = active.connected_at
+            log.info(
+                "voice: outbound call to %s connected after %.1fs",
+                active.callee_label, active.connected_at - active.placed_at,
+            )
         for frame in update.frames:
             # py-tgcalls 2.2 attaches a `frame` bytes attribute. Defensive
             # against future renames — fall back to bytes(...).
@@ -436,26 +809,52 @@ class CallService:
             log.exception("voice inbound loop crashed")
             raise
 
-    async def _announce_call_start(self, active: _ActiveCall) -> None:
-        """Inject a procedural system note announcing the call. Operator
-        produces a greeting which we enqueue to outbound TTS.
+    def _call_start_note(self, active: _ActiveCall) -> str:
+        """Procedural system note announcing the call. Phrasing matters:
+        this text is read by both the operator (to decide what to do) AND
+        the memory extractor (to decide what facts to save). It must be a
+        per-call procedural directive, never a user-attributed preference,
+        so the extractor finds nothing to keep. The previous attempt —
+        chat_turn with "[system] keep replies short and conversational" —
+        was paraphrased into memory as "user prefers short replies".
+        Don't repeat that mistake.
 
-        Phrasing matters: this text is read by both the operator (to decide
-        what to do) AND the memory extractor (to decide what facts to
-        save). It must be a per-call procedural directive, never a
-        user-attributed preference, so the extractor finds nothing to
-        keep. The previous attempt — chat_turn with "[system] keep replies
-        short and conversational" — was paraphrased into memory as
-        "user prefers short replies". Don't repeat that mistake."""
-        note = (
-            "voice call from the owner just started. greet them briefly "
-            "(one sentence, conversational, no markdown). your reply will "
-            "be spoken aloud by TTS. this note is procedural — do not save "
-            "anything to memory based on it."
+        For outbound calls to non-owners, this note is also the
+        load-bearing place where the operator is told who it's speaking
+        to. Memory access isn't gated — the prompt asks for judgement."""
+        if active.is_owner:
+            return (
+                "voice call from the owner just started. greet them briefly "
+                "(one sentence, conversational, no markdown). your reply will "
+                "be spoken aloud by TTS. this note is procedural — do not save "
+                "anything to memory based on it."
+            )
+        return (
+            f"you have just placed an outbound voice call from the "
+            f"owner's account to {active.callee_label}. you are speaking "
+            f"AS the owner's assistant, NOT as the owner. the owner "
+            f"authorized this call for: {active.reason!r} — stay on that "
+            f"topic. consult your memory for what the owner has documented "
+            f"about {active.callee_label} (authorizations, prior context, "
+            f"shared facts you may freely use); rely on judgement for "
+            f"anything else and don't volunteer owner facts that aren't "
+            f"relevant (location, schedule, unrelated contacts). YOU speak "
+            f"first — produce a brief one-sentence opener that identifies "
+            f"you as the owner's assistant and states why you're calling, "
+            f"so the callee knows immediately what this is. your reply "
+            f"will be spoken aloud by TTS. this note is procedural — do "
+            f"not save anything to memory based on it."
         )
+
+    async def _announce_call_start(self, active: _ActiveCall) -> None:
+        """Inbound path: operator generates a greeting which we enqueue
+        to outbound TTS. The outbound path uses _prewarm_and_play_first
+        instead, so it can synthesize during the ring and start playback
+        on a known delay after pickup."""
+        note = self._call_start_note(active)
         try:
             result = await self._operator.auto_ping(
-                session_id=self._session_id, note=note,
+                session_id=active.session_id, note=note,
             )
         except Exception:
             log.exception("voice: call-start auto_ping failed")
@@ -464,10 +863,119 @@ class CallService:
         if text and self._active is active:
             await self._enqueue_text(active, text)
 
+    async def _prewarm_and_play_first(self, active: _ActiveCall) -> None:
+        """Outbound path: kick off the operator turn AND TTS synthesis
+        immediately (during the ring), then wait POST_PICKUP_DELAY_S
+        after pickup before sending the audio. This hides the multi-second
+        gen+synth latency that would otherwise be a dead air gap right
+        after the callee says 'hello'."""
+        POST_PICKUP_DELAY_S = 2.0
+        note = self._call_start_note(active)
+        try:
+            result = await self._operator.auto_ping(
+                session_id=active.session_id, note=note,
+            )
+        except Exception:
+            log.exception("voice: prewarm auto_ping failed")
+            return
+        if self._active is not active:
+            return
+        text = (result.text or "").strip()
+        if not text:
+            log.info("voice: prewarm produced no text; nothing to play")
+            return
+        log.info(
+            "voice: prewarm text generated (%d chars); synthesizing TTS",
+            len(text),
+        )
+        # Synthesize while still (likely) ringing — saves seconds vs. the
+        # in-line _speak path.
+        try:
+            opus_bytes = await self._tts_http(text)
+            pcm = self._opus_decode(opus_bytes)
+        except Exception:
+            log.exception(
+                "voice: prewarm TTS failed; falling back to enqueue path",
+            )
+            # Fallback: let _outbound_loop synthesize again post-pickup.
+            await self._enqueue_text(active, text)
+            return
+        log.info(
+            "voice: prewarm TTS ready (%d PCM bytes); waiting for pickup",
+            len(pcm),
+        )
+        # Wait for first inbound frame (heuristic for pickup). The
+        # watchdog will tear down via no-answer if this never fires.
+        while active.connected_at is None:
+            if self._active is not active:
+                return
+            await asyncio.sleep(0.1)
+        # Natural pause so we don't talk over the connection beep / the
+        # callee's "hello".
+        await asyncio.sleep(POST_PICKUP_DELAY_S)
+        if self._active is not active:
+            return
+        # Play the prewarmed audio directly, bypassing the outbound text
+        # queue. Mirrors _speak's send_frame loop with barge-in support
+        # but without TTS synthesis.
+        await self._play_pcm(active, pcm, label="prewarm")
+
+    async def _play_pcm(
+        self, active: _ActiveCall, pcm: bytes, *, label: str = "pcm",
+    ) -> None:
+        """Send pre-rendered PCM out as 10 ms frames. Sets is_speaking,
+        respects barge_in, bumps last_activity_at. Shared between the
+        prewarm path and any other future direct-playback needs."""
+        active.barge_in.clear()
+        active.is_speaking = True
+        active.last_activity_at = time.monotonic()
+        sent = 0
+        try:
+            for i in range(0, len(pcm), BYTES_PER_FRAME):
+                if active.barge_in.is_set():
+                    log.info(
+                        "voice: %s barge-in after %d frames (%.0fms)",
+                        label, sent, sent * FRAME_MS,
+                    )
+                    return
+                if self._active is not active:
+                    return
+                chunk = pcm[i:i + BYTES_PER_FRAME]
+                if len(chunk) < BYTES_PER_FRAME:
+                    chunk += b"\x00" * (BYTES_PER_FRAME - len(chunk))
+                try:
+                    await asyncio.wait_for(
+                        active.call_py.send_frame(
+                            active.chat_id, self._Device.MICROPHONE, chunk,
+                        ),
+                        timeout=SEND_FRAME_TIMEOUT_S,
+                    )
+                    sent += 1
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "voice: %s send_frame timed out at frame %d", label, sent,
+                    )
+                    return
+                except Exception:
+                    log.exception(
+                        "voice: %s send_frame failed at frame %d", label, sent,
+                    )
+                    return
+                await asyncio.sleep(FRAME_MS / 1000)
+            log.info(
+                "voice: %s playback complete (%d frames, %.0fms)",
+                label, sent, sent * FRAME_MS,
+            )
+        finally:
+            active.is_speaking = False
+
     async def _handle_utterance(self, active: _ActiveCall, pcm_bytes: bytes) -> None:
         if len(pcm_bytes) < PCM_RATE * 2 * 0.2:  # <200ms ≈ noise
             log.info("voice: dropping <200ms utterance")
             return
+        # Real speech resets the idle watchdog. (Frame-level audio doesn't
+        # — Telegram sends frames continuously even when nobody speaks.)
+        active.last_activity_at = time.monotonic()
         try:
             text = await self._stt(pcm_bytes)
         except Exception:
@@ -485,7 +993,7 @@ class CallService:
             return
         try:
             result = await self._operator.chat_turn(
-                session_id=self._session_id, user_text=text,
+                session_id=active.session_id, user_text=text,
             )
         except Exception:
             log.exception("voice: operator.chat_turn failed")
@@ -509,6 +1017,7 @@ class CallService:
                 text = await active.outbound_text_queue.get()
                 active.barge_in.clear()
                 active.is_speaking = True
+                active.last_activity_at = time.monotonic()
                 try:
                     await self._speak(active, text)
                 except asyncio.CancelledError:
@@ -571,7 +1080,7 @@ class CallService:
                     return
                 try:
                     await asyncio.wait_for(
-                        self._call_py.send_frame(  # type: ignore[union-attr]
+                        active.call_py.send_frame(  # type: ignore[union-attr]
                             active.chat_id, self._Device.MICROPHONE, frame,
                         ),
                         timeout=SEND_FRAME_TIMEOUT_S,
@@ -636,7 +1145,7 @@ class CallService:
                 if self._active is not active:
                     return
                 payload = env.get("payload") or {}
-                if payload.get("session_id") != self._session_id:
+                if payload.get("session_id") != active.session_id:
                     continue
                 text = (payload.get("voice_text") or payload.get("text") or "").strip()
                 if not text or text.startswith("SYSTEM:"):
@@ -674,7 +1183,7 @@ class CallService:
                 except Exception:
                     log.exception("voice approval: get_task %s failed", task_id_str)
                     continue
-                if task is None or task.dispatched_by_chat_session != self._session_id:
+                if task is None or task.dispatched_by_chat_session != active.session_id:
                     continue
                 phrase = (payload.get("challenge_phrase") or "").strip()
                 if not phrase:
@@ -905,10 +1414,112 @@ class CallService:
             except (asyncio.CancelledError, Exception):
                 pass
         try:
-            await self._call_py.leave_call(active.chat_id)  # type: ignore[union-attr]
+            await active.call_py.leave_call(active.chat_id)  # type: ignore[union-attr]
         except Exception:
             log.debug("leave_call during teardown raised (often benign): ", exc_info=True)
         log.info("voice: call torn down (reason=%s)", reason)
+        # Outbound calls to non-owners ran in an ephemeral session — the
+        # owner's text chat saw "call placed" and then silence. Brief the
+        # owner now so they know whether it connected and what was said.
+        # Inbound (owner) calls share the owner's session, so no extra
+        # notification is needed — they already saw the conversation.
+        if not active.is_owner:
+            task = asyncio.create_task(
+                self._brief_owner_on_call_end(active, reason),
+                name="voice-post-call-brief",
+            )
+            self._brief_tasks.add(task)
+            task.add_done_callback(self._brief_tasks.discard)
+
+    async def _brief_owner_on_call_end(
+        self, active: _ActiveCall, reason: str,
+    ) -> None:
+        """Post a system note to the owner's session with the call's
+        transcript and a directive to summarize the outcome. The
+        operator's reply lands in the owner's text chat through the
+        normal chat-reply pipeline."""
+        log.info(
+            "voice: post-call brief starting (callee=%s reason=%s)",
+            active.callee_label, reason,
+        )
+        try:
+            rows = await self._operator._db.load_chat_history(
+                active.session_id, limit=80,
+            )
+        except Exception:
+            log.exception("voice: failed to load post-call transcript")
+            rows = []
+        # Compact transcript: skip auto-injected memory/system notes;
+        # label `user`=callee, `assistant`=you (the agent on the call).
+        lines: list[str] = []
+        for row in rows:
+            role = row.get("role") or ""
+            content = (row.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "user" and (
+                content.startswith("[memory note") or
+                content.startswith("[system note")
+            ):
+                continue
+            if role == "user":
+                lines.append(f"  {active.callee_label}: {content}")
+            elif role == "assistant":
+                lines.append(f"  you (agent): {content}")
+            # tool / assistant_tool_calls rows aren't speech — skip.
+        transcript = "\n".join(lines) if lines else "  (no spoken exchange captured)"
+        connected = active.connected_at is not None
+        connected_clause = (
+            "call CONNECTED and ran to completion" if connected and reason == "left-call"
+            else f"call CONNECTED but ended with reason={reason!r}" if connected
+            else f"call DID NOT CONNECT (reason={reason!r}, no one picked up)"
+        )
+        note = (
+            f"the outbound voice call you placed to {active.callee_label} "
+            f"just ended. {connected_clause}. original reason for the call: "
+            f"{active.reason!r}. brief the owner in ONE short line: did it "
+            f"connect, what was the outcome, anything actionable. don't "
+            f"recite the transcript verbatim — summarize.\n\n"
+            f"transcript (oldest first; '{active.callee_label}' is what they "
+            f"said, 'you (agent)' is what was spoken on your side):\n"
+            f"{transcript}"
+        )
+        try:
+            result = await self._operator.auto_ping(
+                session_id=self._owner_session_id, note=note,
+            )
+        except Exception:
+            log.exception(
+                "voice: failed to brief owner about call end (callee=%s)",
+                active.callee_label,
+            )
+            return
+        # auto_ping persists the assistant turn to chat history, but it
+        # doesn't fire `chat.reply` — that's the caller's responsibility
+        # (cf. dispatch_denied in operator.py). Without this publish, the
+        # telegram_agent subscriber never wakes and the owner sees only
+        # the original "call placed" ack and silence.
+        text = (result.text or "").strip() if result else ""
+        if text:
+            try:
+                await self._events.publish_global("chat.reply", {
+                    "session_id": self._owner_session_id,
+                    "text": text,
+                    "voice_text": text,
+                    "trigger": "voice.call_ended",
+                    "task_id": None,
+                })
+                log.info(
+                    "voice: post-call brief delivered (callee=%s, reply_len=%d)",
+                    active.callee_label, len(text),
+                )
+            except Exception:
+                log.exception("voice: failed to publish post-call chat.reply")
+        else:
+            log.info(
+                "voice: post-call brief generated no text (callee=%s)",
+                active.callee_label,
+            )
 
     def _on_call_task_done(self, task: asyncio.Task) -> None:
         if task.cancelled():
