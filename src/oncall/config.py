@@ -151,15 +151,12 @@ class Settings(BaseSettings):
     # at retrieval time is `alpha * cosine + beta * token_overlap`, candidates
     # below `relevance_floor` are not injected.
     oncall_memory_capacity: int = 500
-    # Default embedder: local Ollama with nomic-embed-text. Picked over the
-    # Vercel-hosted qwen3-embedding-8b because of ~30× lower latency (12ms
-    # vs 1.8s median) and no rate limits. The same dedup threshold (0.88)
-    # transfers cleanly per the live integration tests. Override to e.g.
-    # "alibaba/qwen3-embedding-8b" to send embeddings via the Vercel gateway
-    # instead — useful if you don't want to run Ollama on this host.
-    oncall_memory_embed_model: str = "nomic-embed-text:137m-v1.5-fp16"
-    # Where to find the Ollama daemon when the embed model is an Ollama tag.
-    oncall_ollama_host: str = "http://localhost:11434"
+    # In-process embedder via sentence-transformers. Loaded once at startup,
+    # cached in ~/.cache/huggingface/ — no daemon, no network calls at
+    # runtime. The same dedup threshold (0.88) is calibrated to this model
+    # family per the live integration tests; swapping models may require
+    # retuning ONCALL_MEMORY_DEDUP_SIM.
+    oncall_memory_embed_model: str = "nomic-ai/nomic-embed-text-v1.5"
     # Cheap conversational model for extracting facts from the user's turn.
     # Empty string disables auto-extraction (operator memory still works for
     # retrieval, just never grows). Defaults to the operator model.

@@ -39,16 +39,16 @@ ONCALL_OPERATOR_REASONING_EFFORT=low
 GEMINI_API_KEY=
 
 # Vercel AI Gateway — used as the operator backend when
-# ONCALL_OPERATOR_BACKEND=vercel, or as the embeddings backend when
-# ONCALL_MEMORY_EMBED_MODEL is a vendor-prefixed slug.
+# ONCALL_OPERATOR_BACKEND=vercel.
 # https://vercel.com/dashboard/ai-gateway/api-keys
 AI_GATEWAY_BASE_URL=https://ai-gateway.vercel.sh/v1
 AI_GATEWAY_API_KEY=
 
-# Memory embedder. Default uses local Ollama (~30× faster). Pull first:
-#   ollama pull nomic-embed-text:137m-v1.5-fp16
-ONCALL_MEMORY_EMBED_MODEL=nomic-embed-text:137m-v1.5-fp16
-ONCALL_OLLAMA_HOST=http://localhost:11434
+# Memory embedder runs in-process via sentence-transformers. The model is
+# downloaded once from HuggingFace into ~/.cache/huggingface/ on first
+# startup and loaded from disk thereafter — no daemon, no network at
+# runtime. Override to swap models (any sentence-transformers id works).
+ONCALL_MEMORY_EMBED_MODEL=nomic-ai/nomic-embed-text-v1.5
 
 # Executor (Claude CLI) uses whatever auth `claude` already has on this host —
 # keychain OAuth for subscription users, or ANTHROPIC_API_KEY in your shell env

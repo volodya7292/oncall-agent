@@ -172,14 +172,15 @@ def test_operator_tool_surface_is_exactly_four():
     assert names == {"hand_off", "save_memory", "query_memory", "forget_memory"}
 
 
-def test_hand_off_tool_only_takes_optional_hint():
-    """hand_off forwards the user's verbatim message; the only optional
-    parameter is `hint` for deictic-reply context."""
+def test_hand_off_tool_shape():
+    """hand_off forwards the user's verbatim message; takes a required
+    `ack_msg` (the canonical user-facing acknowledgement) and an optional
+    `hint` for deictic-reply context. The user message itself is never an
+    arg — it's read from chat history."""
     hand_off = next(t for t in OPERATOR_TOOLS if t["function"]["name"] == "hand_off")
-    props = hand_off["function"]["parameters"].get("properties", {})
-    assert set(props.keys()) == {"hint"}
-    # hint is optional (not in required).
-    assert "hint" not in hand_off["function"]["parameters"].get("required", [])
+    params = hand_off["function"]["parameters"]
+    assert set(params.get("properties", {}).keys()) == {"ack_msg", "hint"}
+    assert params.get("required", []) == ["ack_msg"]
 
 
 # ---------------------------------------------------------------------------

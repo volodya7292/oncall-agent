@@ -1,18 +1,20 @@
 """Embedding client + numeric helpers for operator memory.
 
-Production uses Vercel AI Gateway with `alibaba/qwen3-embedding-8b` (4096
-dims). Tests inject a deterministic stub; the Protocol below is the only
-contract OperatorMemory depends on.
+Uses an in-process sentence-transformers model (default
+`nomic-ai/nomic-embed-text-v1.5`). No daemon, no network calls at runtime
+— the model is downloaded once from HuggingFace into `~/.cache/huggingface/`
+on first use and loaded from disk thereafter.
 
-Storage format: float32 packed via numpy.tobytes — fixed bytes per row, fast
-unpack with np.frombuffer.
+Storage format: float32 packed via numpy.tobytes — fixed bytes per row,
+fast unpack with np.frombuffer.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
-from typing import Protocol
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -24,64 +26,53 @@ class EmbeddingClient(Protocol):
     async def embed(self, texts: list[str]) -> list[list[float]]: ...
 
 
-class GatewayEmbeddingClient:
-    """OpenAI-compatible embeddings via Vercel AI Gateway."""
+class LocalEmbeddingClient:
+    """In-process sentence-transformers embedder.
 
-    def __init__(self, base_url: str, api_key: str, *, model: str) -> None:
-        from openai import AsyncOpenAI
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-        self._model = model
+    Lazy-loads the model on first `embed()` call so daemon startup isn't
+    blocked by the (~1–3s on CPU) load. Subsequent calls reuse the loaded
+    model; `encode` is wrapped in `asyncio.to_thread` so the event loop
+    stays responsive during inference.
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
-        if not texts:
-            return []
-        resp = await self._client.embeddings.create(
-            model=self._model, input=texts,
-        )
-        return [list(d.embedding) for d in resp.data]
-
-
-class OllamaEmbeddingClient:
-    """Local-Ollama embeddings via the /api/embed endpoint.
-
-    ~30× faster than the Vercel gateway path on the production embedding
-    workload (12ms vs 1800ms median) AND it has no rate limits or per-call
-    cost. Default embedder for the operator. Falls back gracefully if
-    Ollama is down — the operator just sees empty memory for that turn.
+    `trust_remote_code=True` is required by some models (e.g.
+    `nomic-ai/nomic-embed-text-v1.5`) and is harmless for the rest.
     """
 
-    def __init__(self, host: str, *, model: str, timeout: float = 30.0) -> None:
-        import httpx
-        self._host = host.rstrip("/")
-        self._model = model
-        self._http = httpx.AsyncClient(timeout=timeout)
+    def __init__(self, model: str) -> None:
+        self._model_name = model
+        self._model: Any | None = None
+        self._load_lock = asyncio.Lock()
+
+    def _load_model_sync(self) -> Any:
+        from sentence_transformers import SentenceTransformer
+        log.info("loading embedding model %r (this may download on first run)",
+                 self._model_name)
+        return SentenceTransformer(self._model_name, trust_remote_code=True)
+
+    async def _ensure_loaded(self) -> Any:
+        if self._model is not None:
+            return self._model
+        async with self._load_lock:
+            if self._model is None:
+                self._model = await asyncio.to_thread(self._load_model_sync)
+        return self._model
+
+    async def warmup(self) -> None:
+        """Eagerly load the model. Call once at startup if you want the
+        first user turn to skip the load cost."""
+        await self._ensure_loaded()
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        # Ollama's /api/embed accepts `input` as either str or list[str].
-        # Sending a list lets us batch when callers do multi-store; for a
-        # single query we still want list shape to keep the response uniform.
-        r = await self._http.post(
-            f"{self._host}/api/embed",
-            json={"model": self._model, "input": texts},
+        model = await self._ensure_loaded()
+        arr = await asyncio.to_thread(
+            model.encode, texts,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
         )
-        r.raise_for_status()
-        body = r.json()
-        return [list(v) for v in body.get("embeddings", [])]
-
-    async def aclose(self) -> None:
-        await self._http.aclose()
-
-
-def is_ollama_model(name: str) -> bool:
-    """Heuristic: gateway slugs are vendor-prefixed (`alibaba/...`,
-    `google/...`); Ollama tags carry a `:` version suffix before any slash.
-    Used to route the configured embed model to the right backend."""
-    if not name:
-        return False
-    head, _, _ = name.partition(":")
-    return ":" in name and "/" not in head
+        return arr.tolist()
 
 
 # ---- storage helpers -------------------------------------------------------

@@ -651,13 +651,12 @@ ONCALL_TOKEN=replace-with-long-random-string
 ONCALL_PORT=8765
 ONCALL_DB_PATH=~/.oncall/state.db
 ONCALL_PROD_HOSTS=                       # comma-separated; matches in classifier promote `ssh <host> …` → mutating
-ONCALL_OPERATOR_MODEL=gemma3:latest       # or whichever Gemma you've pulled
-ONCALL_OLLAMA_URL=http://localhost:11434
+ONCALL_OPERATOR_MODEL=gemini-3.1-flash-lite   # any Vercel-AI-Gateway / Google AI Studio model id
 ANTHROPIC_API_KEY=                       # if not using subscription auth
 
 # Operator memory (semantic, LRU-evicted — see §17)
 ONCALL_MEMORY_CAPACITY=500               # LRU eviction threshold
-ONCALL_MEMORY_EMBED_MODEL=alibaba/qwen3-embedding-8b
+ONCALL_MEMORY_EMBED_MODEL=nomic-ai/nomic-embed-text-v1.5   # any sentence-transformers id; loaded in-process
 ONCALL_MEMORY_EXTRACT_MODEL=             # cheap model for fact extraction; default = ONCALL_OPERATOR_MODEL
 ONCALL_MEMORY_HYBRID_ALPHA=0.7           # cosine weight in hybrid retrieval score
 ONCALL_MEMORY_HYBRID_BETA=0.3            # token-overlap weight

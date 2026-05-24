@@ -32,7 +32,7 @@ from .approval_client import HttpLongPollApprovalClient, is_kill_phrase
 from .broker import Broker
 from .config import get_paths, get_settings
 from .db import Database
-from .embeddings import GatewayEmbeddingClient, OllamaEmbeddingClient, is_ollama_model
+from .embeddings import LocalEmbeddingClient
 from .events import EventBus
 from .lifecycle import Lifecycle
 from .local_claude import ClaudeCliRunner
@@ -271,34 +271,15 @@ def create_app() -> FastAPI:
         # Single instance: it's a fresh subprocess per call, no shared state.
         cli_runner = ClaudeCliRunner()
         # Operator construction requires (a) an LLM client and (b) an
-        # embedder. Embedder backend is chosen by the model name shape:
-        # ollama tags ("nomic-embed-text:...") route to the local daemon,
-        # vendor-prefixed slugs ("alibaba/...") go through the Vercel
-        # gateway. Local Ollama is the default — ~30× lower latency.
-        embedder: GatewayEmbeddingClient | OllamaEmbeddingClient | None = None
+        # embedder. The embedder is an in-process sentence-transformers
+        # model; no daemon or network calls at runtime.
+        embedder: LocalEmbeddingClient | None = None
         if llm is not None:
-            if is_ollama_model(settings.oncall_memory_embed_model):
-                embedder = OllamaEmbeddingClient(
-                    host=settings.oncall_ollama_host,
-                    model=settings.oncall_memory_embed_model,
-                )
-                log.info("memory embedder: ollama / %s",
-                         settings.oncall_memory_embed_model)
-            elif settings.gateway_key:
-                embedder = GatewayEmbeddingClient(
-                    base_url=settings.ai_gateway_base_url,
-                    api_key=settings.gateway_key,
-                    model=settings.oncall_memory_embed_model,
-                )
-                log.info("memory embedder: vercel gateway / %s",
-                         settings.oncall_memory_embed_model)
-            else:
-                log.warning(
-                    "no embedder configured: model %r looks like a gateway "
-                    "slug but AI_GATEWAY_API_KEY is unset; operator memory "
-                    "will be disabled",
-                    settings.oncall_memory_embed_model,
-                )
+            embedder = LocalEmbeddingClient(
+                model=settings.oncall_memory_embed_model,
+            )
+            log.info("memory embedder: local / %s",
+                     settings.oncall_memory_embed_model)
         if embedder is not None:
             memory = OperatorMemory(
                 db, embedder,
@@ -457,7 +438,7 @@ def create_app() -> FastAPI:
         # probe means "couldn't verify", not "definitely broken".
         if telegram_agent is not None:
             status = await _build_startup_status(
-                settings=settings, operator=operator,
+                operator=operator,
                 telegram_userbot=telegram is not None,
                 lifecycle=lifecycle,
                 stale_memories=stale_before,
@@ -921,20 +902,8 @@ async def _memory_dedup_loop(
                 raise
 
 
-async def _probe_ollama(host: str = "http://localhost:11434") -> str | None:
-    """Return the Ollama version string if reachable, None otherwise. Best-
-    effort, 1s timeout — we use this in the startup notification only."""
-    try:
-        async with httpx.AsyncClient(timeout=1.0) as c:
-            r = await c.get(f"{host}/api/version")
-            r.raise_for_status()
-            return r.json().get("version", "?")
-    except Exception:
-        return None
-
-
 async def _build_startup_status(
-    *, settings, operator: Operator | None,
+    *, operator: Operator | None,
     telegram_userbot: bool, lifecycle: Lifecycle,
     stale_memories: int = 0,
 ) -> str:
@@ -945,12 +914,6 @@ async def _build_startup_status(
     lines: list[str] = ["🔧 oncall up"]
     if operator is None:
         lines.append("⚠️ operator: NOT configured (no LLM key)")
-    if is_ollama_model(settings.oncall_memory_embed_model):
-        if await _probe_ollama(settings.oncall_ollama_host) is None:
-            lines.append(
-                f"⚠️ ollama: unreachable at {settings.oncall_ollama_host} "
-                f"(memory embedder won't work)"
-            )
     if not telegram_userbot:
         lines.append("⚠️ telegram userbot: disabled (DM triage unavailable)")
     recovered = len(lifecycle.running)

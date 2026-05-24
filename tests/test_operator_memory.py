@@ -252,90 +252,39 @@ async def test_retrieval_protects_row_from_eviction(db):
 
 
 # ---------------------------------------------------------------------------
-# Integration — real Vercel AI Gateway + qwen3-embedding-8b. Skipped unless
-# AI_GATEWAY_API_KEY is set. Confirms the model produces vectors that:
-#   (a) actually have the dimensionality we expect (sanity),
-#   (b) score semantically related text above unrelated text (the whole
+# Integration — real in-process sentence-transformers model. Skipped
+# unless ONCALL_RUN_EMBEDDING_TESTS=1 is set in the environment, because
+# the first run downloads ~140MB from HuggingFace and we don't want that
+# surprising people running the default `pytest` invocation. Confirms:
+#   (a) the model produces vectors with consistent dimensionality (sanity),
+#   (b) it scores semantically related text above unrelated text (the
 #       premise of using embeddings here),
-#   (c) push near-duplicate paraphrases over the 0.88 dedup threshold.
-# Network test — runs only when the user opts in via the env var.
+#   (c) it pushes near-duplicate paraphrases over the 0.88 dedup threshold.
 # ---------------------------------------------------------------------------
 
 
-GATEWAY_KEY = os.environ.get("AI_GATEWAY_API_KEY", "")
-GATEWAY_BASE_URL = os.environ.get(
-    "AI_GATEWAY_BASE_URL", "https://ai-gateway.vercel.sh/v1",
-)
 EMBED_MODEL = os.environ.get(
-    "ONCALL_MEMORY_EMBED_MODEL", "alibaba/qwen3-embedding-8b",
+    "ONCALL_MEMORY_EMBED_MODEL", "nomic-ai/nomic-embed-text-v1.5",
 )
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 
-def _is_ollama_tag(model: str) -> bool:
-    """Heuristic: gateway slugs are vendor-prefixed (e.g. "alibaba/...");
-    Ollama tags carry a `:` version suffix without a slash before it."""
-    return ":" in model and "/" not in model.split(":", 1)[0]
-
-
-def _embed_backend_available() -> bool:
-    if _is_ollama_tag(EMBED_MODEL):
-        try:
-            import httpx
-            with httpx.Client(timeout=2.0) as c:
-                return c.get(f"{OLLAMA_BASE_URL}/api/tags").status_code == 200
-        except Exception:
-            return False
-    return bool(GATEWAY_KEY)
-
-
-requires_gateway = pytest.mark.skipif(
-    not _embed_backend_available(),
+requires_embedding_tests = pytest.mark.skipif(
+    os.environ.get("ONCALL_RUN_EMBEDDING_TESTS", "") != "1",
     reason=(
-        f"embedding backend for {EMBED_MODEL!r} not reachable; "
-        f"set AI_GATEWAY_API_KEY (gateway) or start Ollama at {OLLAMA_BASE_URL}"
+        "set ONCALL_RUN_EMBEDDING_TESTS=1 to run live embedding tests "
+        "(first run downloads the model from HuggingFace)"
     ),
 )
 
 
-class _OllamaEmbedder:
-    """Test-only EmbeddingClient that hits a local Ollama. Used to run the
-    integration tests against any embedding model Ollama has pulled, without
-    growing the production `oncall.embeddings` API surface."""
-
-    def __init__(self, model: str, base_url: str = OLLAMA_BASE_URL) -> None:
-        self._model = model
-        self._base = base_url
-
-    async def embed(self, texts: list[str]) -> list[list[float]]:
-        import httpx
-        async with httpx.AsyncClient(timeout=30.0) as http:
-            out: list[list[float]] = []
-            for t in texts:
-                r = await http.post(
-                    f"{self._base}/api/embed",
-                    json={"model": self._model, "input": t},
-                )
-                r.raise_for_status()
-                out.append(r.json()["embeddings"][0])
-            return out
-
-
 def _real_embedder():
-    # Imported lazily so the package import chain isn't needed unless the
-    # test actually runs. Pick backend by model name — ollama tags route to
-    # the local daemon, everything else goes through the Vercel gateway.
-    if _is_ollama_tag(EMBED_MODEL):
-        return _OllamaEmbedder(model=EMBED_MODEL)
-    from oncall.embeddings import GatewayEmbeddingClient
-    return GatewayEmbeddingClient(
-        base_url=GATEWAY_BASE_URL,
-        api_key=GATEWAY_KEY,
-        model=EMBED_MODEL,
-    )
+    # Imported lazily so the sentence-transformers / torch import chain
+    # isn't paid unless the test actually runs.
+    from oncall.embeddings import LocalEmbeddingClient
+    return LocalEmbeddingClient(model=EMBED_MODEL)
 
 
-@requires_gateway
+@requires_embedding_tests
 @pytest.mark.asyncio
 async def test_real_embeddings_have_expected_dim_and_unit_norm():
     """Spot-check the live model: it returns a single vector per input
@@ -351,7 +300,7 @@ async def test_real_embeddings_have_expected_dim_and_unit_norm():
     assert len(again[0]) == arr.size
 
 
-@requires_gateway
+@requires_embedding_tests
 @pytest.mark.asyncio
 async def test_real_embeddings_rank_semantically_related_first(db):
     """End-to-end: store a few unrelated facts via the real model, then

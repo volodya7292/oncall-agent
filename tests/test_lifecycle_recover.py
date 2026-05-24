@@ -1,9 +1,13 @@
 """Lifecycle.recover() — daemon-restart behavior.
 
 With the single-session executor model:
-  * RUNNING / AWAITING_APPROVAL tasks left by a prior daemon are marked
-    FAILED — we can't safely re-attach a mid-turn into the shared
-    claude session.
+  * RUNNING tasks with recorded model activity (tool_use / assistant.text /
+    approval.requested / result.final) are marked FAILED — we can't safely
+    re-attach a mid-turn into the shared claude session.
+  * RUNNING tasks with NO model activity yet (crash within ms of dispatch)
+    are re-queued as PENDING — nothing has leaked, retrying is safe.
+  * AWAITING_APPROVAL tasks always get FAILED — by definition they had a
+    tool call go out.
   * PENDING tasks (queued before the crash) re-enter the FIFO queue in
     submission order.
 
@@ -99,12 +103,16 @@ async def _wait_for(predicate, *, timeout: float = 1.0, interval: float = 0.005)
 
 
 @pytest.mark.asyncio
-async def test_recover_marks_stale_running_and_awaiting_as_failed(stack):
-    """RUNNING / AWAITING_APPROVAL from a prior daemon can't be safely
-    re-attached when every executor invocation shares one claude
-    session — recover marks them FAILED so the queue starts clean."""
+async def test_recover_marks_stale_running_with_activity_and_awaiting_as_failed(stack):
+    """RUNNING tasks with model activity, and AWAITING_APPROVAL tasks,
+    can't be safely re-attached when every executor invocation shares one
+    claude session — recover marks them FAILED so the queue starts clean."""
     db = stack["db"]
     t_running = await _insert_task(db, state=TaskState.RUNNING)
+    # Seed an event of a type `has_model_activity` recognizes so the
+    # RUNNING task falls into the FAILED branch (not the safe re-queue
+    # branch covered by the other test below).
+    await db.append_event(t_running.id, "assistant.text", {"text": "hi"})
     t_awaiting = await _insert_task(db, state=TaskState.AWAITING_APPROVAL)
 
     await stack["lc"].recover()
@@ -113,6 +121,25 @@ async def test_recover_marks_stale_running_and_awaiting_as_failed(stack):
     refreshed_awa = await db.get_task(t_awaiting.id)
     assert refreshed_run is not None and refreshed_run.state == TaskState.FAILED
     assert refreshed_awa is not None and refreshed_awa.state == TaskState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_recover_requeues_stale_running_without_model_activity(stack):
+    """A daemon restart within ms of dispatch can leave a task RUNNING in
+    the DB while claude never actually produced anything. There's nothing
+    to leak, so recover puts it back on the queue rather than failing it."""
+    db = stack["db"]
+    t = await _insert_task(db, state=TaskState.RUNNING, prompt="retry me")
+
+    await stack["lc"].recover()
+
+    refreshed = await db.get_task(t.id)
+    assert refreshed is not None and refreshed.state == TaskState.PENDING
+    # And it actually gets re-dispatched, not just left at PENDING.
+    await _wait_for(lambda: any(
+        c["task_id"] == t.id
+        for s in FakeSupervisor.instances for c in s.run_calls
+    ))
 
 
 @pytest.mark.asyncio

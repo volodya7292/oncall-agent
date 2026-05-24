@@ -663,11 +663,12 @@ async def test_search_messages_empty_query_returns_nothing(db):
 
 @pytest.mark.asyncio
 async def test_search_chats_token_and_match_handles_word_order(db):
-    """Multi-word queries should match in any order — 'artem sinkovskiy' must
-    match a dialog whose display name is 'Smith, Alex'."""
+    """Multi-word queries should match in any order — 'alex smith' must
+    match a dialog whose display name is 'Smith, Alex' (reversed order,
+    punctuation between tokens)."""
     client = FakeTelegramClient(dialogs=[
         {"id": 7, "name": "Smith, Alex", "username": None},
-        {"id": 8, "name": "Alex Volkov",     "username": None},  # only one token
+        {"id": 8, "name": "Alex Volkov", "username": None},  # only one token
     ])
     s = TelegramService(
         db=db, client=client,
@@ -675,7 +676,7 @@ async def test_search_chats_token_and_match_handles_word_order(db):
     )
     await s.start()
     try:
-        rows = await s.search_chats("artem sinkovskiy")
+        rows = await s.search_chats("alex smith")
     finally:
         await s.stop()
     ids = {r["chat_id"] for r in rows}
