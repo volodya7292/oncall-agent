@@ -252,10 +252,9 @@ async def test_retrieval_protects_row_from_eviction(db):
 
 
 # ---------------------------------------------------------------------------
-# Integration — real in-process sentence-transformers model. Skipped
-# unless ONCALL_RUN_EMBEDDING_TESTS=1 is set in the environment, because
-# the first run downloads ~140MB from HuggingFace and we don't want that
-# surprising people running the default `pytest` invocation. Confirms:
+# Integration — real local Ollama embeddings. Skipped unless
+# ONCALL_RUN_EMBEDDING_TESTS=1 is set in the environment, because they
+# require a running Ollama daemon with the model pulled. Confirms:
 #   (a) the model produces vectors with consistent dimensionality (sanity),
 #   (b) it scores semantically related text above unrelated text (the
 #       premise of using embeddings here),
@@ -264,24 +263,24 @@ async def test_retrieval_protects_row_from_eviction(db):
 
 
 EMBED_MODEL = os.environ.get(
-    "ONCALL_MEMORY_EMBED_MODEL", "nomic-ai/nomic-embed-text-v1.5",
+    "ONCALL_MEMORY_EMBED_MODEL", "nomic-embed-text:137m-v1.5-fp16",
 )
+OLLAMA_HOST = os.environ.get("ONCALL_OLLAMA_HOST", "http://localhost:11434")
 
 
 requires_embedding_tests = pytest.mark.skipif(
     os.environ.get("ONCALL_RUN_EMBEDDING_TESTS", "") != "1",
     reason=(
         "set ONCALL_RUN_EMBEDDING_TESTS=1 to run live embedding tests "
-        "(first run downloads the model from HuggingFace)"
+        "(requires a running Ollama daemon with the model pulled: "
+        "`ollama pull nomic-embed-text:137m-v1.5-fp16`)"
     ),
 )
 
 
 def _real_embedder():
-    # Imported lazily so the sentence-transformers / torch import chain
-    # isn't paid unless the test actually runs.
-    from oncall.embeddings import LocalEmbeddingClient
-    return LocalEmbeddingClient(model=EMBED_MODEL)
+    from oncall.embeddings import OllamaEmbeddingClient
+    return OllamaEmbeddingClient(host=OLLAMA_HOST, model=EMBED_MODEL)
 
 
 @requires_embedding_tests

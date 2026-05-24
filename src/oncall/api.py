@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -32,7 +33,7 @@ from .approval_client import HttpLongPollApprovalClient, is_kill_phrase
 from .broker import Broker
 from .config import get_paths, get_settings
 from .db import Database
-from .embeddings import LocalEmbeddingClient
+from .embeddings import OllamaEmbeddingClient
 from .events import EventBus
 from .lifecycle import Lifecycle
 from .local_claude import ClaudeCliRunner
@@ -271,15 +272,24 @@ def create_app() -> FastAPI:
         # Single instance: it's a fresh subprocess per call, no shared state.
         cli_runner = ClaudeCliRunner()
         # Operator construction requires (a) an LLM client and (b) an
-        # embedder. The embedder is an in-process sentence-transformers
-        # model; no daemon or network calls at runtime.
-        embedder: LocalEmbeddingClient | None = None
+        # embedder. Embedder backend is local Ollama — model stays
+        # resident across our restarts via keep_alive=4h in embeddings.py.
+        embedder: OllamaEmbeddingClient | None = None
         if llm is not None:
-            embedder = LocalEmbeddingClient(
+            embedder = OllamaEmbeddingClient(
+                host=settings.oncall_ollama_host,
                 model=settings.oncall_memory_embed_model,
             )
-            log.info("memory embedder: local / %s",
+            log.info("memory embedder: ollama / %s",
                      settings.oncall_memory_embed_model)
+            # Fire-and-forget warmup: triggers Ollama to load the model
+            # (no-op if it's already resident from keep_alive). Without
+            # this the first user message after `ollama serve` pays the
+            # one-time load latency. Failures are logged and non-fatal —
+            # the actual embed() call has its own error handling.
+            asyncio.create_task(
+                _warmup_embedder(embedder), name="embedder-warmup",
+            )
         if embedder is not None:
             memory = OperatorMemory(
                 db, embedder,
@@ -438,7 +448,7 @@ def create_app() -> FastAPI:
         # probe means "couldn't verify", not "definitely broken".
         if telegram_agent is not None:
             status = await _build_startup_status(
-                operator=operator,
+                settings=settings, operator=operator,
                 telegram_userbot=telegram is not None,
                 lifecycle=lifecycle,
                 stale_memories=stale_before,
@@ -902,8 +912,20 @@ async def _memory_dedup_loop(
                 raise
 
 
+async def _probe_ollama(host: str) -> str | None:
+    """Return the Ollama version string if reachable, None otherwise. Best-
+    effort, 1s timeout — used in the startup notification only."""
+    try:
+        async with httpx.AsyncClient(timeout=1.0) as c:
+            r = await c.get(f"{host.rstrip('/')}/api/version")
+            r.raise_for_status()
+            return r.json().get("version", "?")
+    except Exception:
+        return None
+
+
 async def _build_startup_status(
-    *, operator: Operator | None,
+    *, settings, operator: Operator | None,
     telegram_userbot: bool, lifecycle: Lifecycle,
     stale_memories: int = 0,
 ) -> str:
@@ -914,6 +936,11 @@ async def _build_startup_status(
     lines: list[str] = ["🔧 oncall up"]
     if operator is None:
         lines.append("⚠️ operator: NOT configured (no LLM key)")
+    if await _probe_ollama(settings.oncall_ollama_host) is None:
+        lines.append(
+            f"⚠️ ollama: unreachable at {settings.oncall_ollama_host} "
+            f"(memory embedder won't work)"
+        )
     if not telegram_userbot:
         lines.append("⚠️ telegram userbot: disabled (DM triage unavailable)")
     recovered = len(lifecycle.running)
@@ -924,6 +951,20 @@ async def _build_startup_status(
             f"↻ re-embedding {stale_memories} memory rows in the background"
         )
     return "\n".join(lines)
+
+
+async def _warmup_embedder(embedder: OllamaEmbeddingClient) -> None:
+    """Background task: ask Ollama to load the embed model now (one
+    throwaway embed). Without this the first user message after
+    `ollama serve` pays the cold-load. Non-fatal — embed() has its own
+    error handling, the operator just sees empty memory for that turn."""
+    started = time.monotonic()
+    try:
+        await embedder.warmup()
+    except Exception as e:
+        log.warning("embedder warmup failed: %s: %s", type(e).__name__, e)
+        return
+    log.info("embedder warmup complete in %.1fs", time.monotonic() - started)
 
 
 async def _rebuild_memory_then_notify(

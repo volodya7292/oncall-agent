@@ -151,12 +151,17 @@ class Settings(BaseSettings):
     # at retrieval time is `alpha * cosine + beta * token_overlap`, candidates
     # below `relevance_floor` are not injected.
     oncall_memory_capacity: int = 500
-    # In-process embedder via sentence-transformers. Loaded once at startup,
-    # cached in ~/.cache/huggingface/ — no daemon, no network calls at
-    # runtime. The same dedup threshold (0.88) is calibrated to this model
-    # family per the live integration tests; swapping models may require
-    # retuning ONCALL_MEMORY_DEDUP_SIM.
-    oncall_memory_embed_model: str = "nomic-ai/nomic-embed-text-v1.5"
+    # Local Ollama embedder. Picked over hosted gateways for ~30× lower
+    # latency (~12ms median vs ~1.8s) and no rate limits. With
+    # OLLAMA_KEEP_ALIVE=4h on the embed calls, the model stays resident in
+    # Ollama across our daemon restarts — first user message after
+    # `oncall service start` skips the cold load. Pull first:
+    #     ollama pull nomic-embed-text:137m-v1.5-fp16
+    # The 0.88 dedup threshold in tests is calibrated to this model;
+    # swapping it likely requires retuning ONCALL_MEMORY_DEDUP_SIM.
+    oncall_memory_embed_model: str = "nomic-embed-text:137m-v1.5-fp16"
+    # Where to find the Ollama daemon.
+    oncall_ollama_host: str = "http://localhost:11434"
     # Cheap conversational model for extracting facts from the user's turn.
     # Empty string disables auto-extraction (operator memory still works for
     # retrieval, just never grows). Defaults to the operator model.
@@ -168,17 +173,17 @@ class Settings(BaseSettings):
     # Operator backend: OpenAI-compatible HTTP via Vercel AI Gateway.
     # https://vercel.com/docs/ai-gateway/sdks-and-apis/python
     # Set ONCALL_OPERATOR_MODEL to a gateway model id like "openai/gpt-oss-20b".
-    # Default is gemini-3.1-flash-lite via AI Studio: ~0.45s TTFA in benches
-    # (vs ~2.8s on gemma-4-31b-it) and it natively supports ack-first
+    # Default is gemini-3.5-flash via AI Studio: ~0.6s TTFA on a bare "Hi"
+    # with thinking=minimal (vs ~0.59s on flash-lite — within noise, but
+    # 3.5-flash had a tighter distribution). Natively supports ack-first
     # (text + function_call in the same response).
-    oncall_operator_model: str = "gemini-3.1-flash-lite"
-    # Reasoning level. "low" buys ~100-160 reasoning tokens (~+0.4s TTFA on
-    # flash-lite) for noticeably better triage / memory / tool-routing
-    # decisions vs "minimal". Bench: minimal TTFA 0.43s, low TTFA 0.95s on
-    # the tool-ack-first path. Set to "minimal" to claw back the latency,
-    # or None to leave the dial unset (model default — usually "medium" or
-    # higher, which is slower than we want).
-    oncall_operator_reasoning_effort: str | None = "low"
+    oncall_operator_model: str = "gemini-3.5-flash"
+    # Reasoning level. "low" buys ~100-160 reasoning tokens for noticeably
+    # better triage / memory / tool-routing decisions vs "minimal", at a
+    # cost of a few hundred ms TTFA. Set to "minimal" to claw back the
+    # latency, or None to leave the dial unset (model default — usually
+    # "medium" or higher, which is slower than we want).
+    oncall_operator_reasoning_effort: str | None = "minimal"
     # Which API surface to use for the operator's LLM.
     #   "gemini" → native Google AI Studio API (google-genai SDK). Required
     #              for ack-first behavior on Google models (the Vercel gateway

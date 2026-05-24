@@ -40,11 +40,11 @@ When in doubt, lean toward fewer, denser tests. A 200-line test file that proves
 
 ## Memory testing
 
-`tests/test_operator_memory.py` includes 3 live-gateway integration tests against `alibaba/qwen3-embedding-8b`. They skip unless `AI_GATEWAY_API_KEY` is set in the environment. To run them locally:
+`tests/test_operator_memory.py` includes live integration tests against a local Ollama daemon running `nomic-embed-text:137m-v1.5-fp16`. They skip unless `ONCALL_RUN_EMBEDDING_TESTS=1` is set. To run them locally:
 
 ```sh
-set -a; source ~/.oncall/.env; set +a
-uv run pytest tests/test_operator_memory.py -v
+ollama pull nomic-embed-text:137m-v1.5-fp16   # one-time
+ONCALL_RUN_EMBEDDING_TESTS=1 uv run pytest tests/test_operator_memory.py -v
 ```
 
 The integration tests pin the dedup threshold (0.88) to the live model's behavior — if `ONCALL_MEMORY_DEDUP_SIM` is retuned or the embedding model changes, those tests will fail loudly with a hint to retune.

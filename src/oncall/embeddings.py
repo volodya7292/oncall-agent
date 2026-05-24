@@ -1,9 +1,9 @@
 """Embedding client + numeric helpers for operator memory.
 
-Uses an in-process sentence-transformers model (default
-`nomic-ai/nomic-embed-text-v1.5`). No daemon, no network calls at runtime
-— the model is downloaded once from HuggingFace into `~/.cache/huggingface/`
-on first use and loaded from disk thereafter.
+Uses a local Ollama daemon for embeddings (default model
+`nomic-embed-text:137m-v1.5-fp16`). We pass `keep_alive: "4h"` on every
+embed call so Ollama keeps the model resident across our daemon restarts
+— first user message after `oncall service start` skips the cold load.
 
 Storage format: float32 packed via numpy.tobytes — fixed bytes per row,
 fast unpack with np.frombuffer.
@@ -11,10 +11,9 @@ fast unpack with np.frombuffer.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
-from typing import Any, Protocol
+from typing import Protocol
 
 import numpy as np
 
@@ -22,57 +21,56 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 
+# How long Ollama should keep the embedding model loaded after a call.
+# 4h covers normal dev rebuild/restart cycles; longer = more idle RAM,
+# shorter = first embed after a coffee break pays the load again.
+OLLAMA_KEEP_ALIVE = "4h"
+
+
 class EmbeddingClient(Protocol):
     async def embed(self, texts: list[str]) -> list[list[float]]: ...
 
 
-class LocalEmbeddingClient:
-    """In-process sentence-transformers embedder.
+class OllamaEmbeddingClient:
+    """Local-Ollama embeddings via the /api/embed endpoint.
 
-    Lazy-loads the model on first `embed()` call so daemon startup isn't
-    blocked by the (~1–3s on CPU) load. Subsequent calls reuse the loaded
-    model; `encode` is wrapped in `asyncio.to_thread` so the event loop
-    stays responsive during inference.
-
-    `trust_remote_code=True` is required by some models (e.g.
-    `nomic-ai/nomic-embed-text-v1.5`) and is harmless for the rest.
+    Model stays resident in the Ollama process (separate from our daemon)
+    so our restarts don't pay cold-load latency, as long as a request
+    lands within `keep_alive` of the last one. Falls back gracefully if
+    Ollama is down — the operator just sees empty memory for that turn.
     """
 
-    def __init__(self, model: str) -> None:
-        self._model_name = model
-        self._model: Any | None = None
-        self._load_lock = asyncio.Lock()
-
-    def _load_model_sync(self) -> Any:
-        from sentence_transformers import SentenceTransformer
-        log.info("loading embedding model %r (this may download on first run)",
-                 self._model_name)
-        return SentenceTransformer(self._model_name, trust_remote_code=True)
-
-    async def _ensure_loaded(self) -> Any:
-        if self._model is not None:
-            return self._model
-        async with self._load_lock:
-            if self._model is None:
-                self._model = await asyncio.to_thread(self._load_model_sync)
-        return self._model
-
-    async def warmup(self) -> None:
-        """Eagerly load the model. Call once at startup if you want the
-        first user turn to skip the load cost."""
-        await self._ensure_loaded()
+    def __init__(self, host: str, *, model: str, timeout: float = 30.0) -> None:
+        import httpx
+        self._host = host.rstrip("/")
+        self._model = model
+        self._http = httpx.AsyncClient(timeout=timeout)
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        model = await self._ensure_loaded()
-        arr = await asyncio.to_thread(
-            model.encode, texts,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=False,
+        # /api/embed accepts `input` as either str or list[str]. We always
+        # send a list so the response shape is uniform.
+        r = await self._http.post(
+            f"{self._host}/api/embed",
+            json={
+                "model": self._model,
+                "input": texts,
+                "keep_alive": OLLAMA_KEEP_ALIVE,
+            },
         )
-        return arr.tolist()
+        r.raise_for_status()
+        body = r.json()
+        return [list(v) for v in body.get("embeddings", [])]
+
+    async def warmup(self) -> None:
+        """Trigger Ollama to load the model now (one throwaway embed). On
+        a freshly-started Ollama daemon this is the only way to force the
+        load before a real user request hits us."""
+        await self.embed(["warmup"])
+
+    async def aclose(self) -> None:
+        await self._http.aclose()
 
 
 # ---- storage helpers -------------------------------------------------------

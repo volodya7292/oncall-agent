@@ -44,11 +44,12 @@ GEMINI_API_KEY=
 AI_GATEWAY_BASE_URL=https://ai-gateway.vercel.sh/v1
 AI_GATEWAY_API_KEY=
 
-# Memory embedder runs in-process via sentence-transformers. The model is
-# downloaded once from HuggingFace into ~/.cache/huggingface/ on first
-# startup and loaded from disk thereafter — no daemon, no network at
-# runtime. Override to swap models (any sentence-transformers id works).
-ONCALL_MEMORY_EMBED_MODEL=nomic-ai/nomic-embed-text-v1.5
+# Memory embedder runs via a local Ollama daemon. Pull the model first:
+#   ollama pull nomic-embed-text:137m-v1.5-fp16
+# embed calls send keep_alive=4h so Ollama keeps the model resident
+# across `oncall service start` restarts.
+ONCALL_MEMORY_EMBED_MODEL=nomic-embed-text:137m-v1.5-fp16
+ONCALL_OLLAMA_HOST=http://localhost:11434
 
 # Executor (Claude CLI) uses whatever auth `claude` already has on this host —
 # keychain OAuth for subscription users, or ANTHROPIC_API_KEY in your shell env

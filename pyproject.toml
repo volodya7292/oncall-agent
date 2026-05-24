@@ -24,8 +24,6 @@ dependencies = [
     "opuslib>=3.0",      # Opus encode/decode for the OpenAI-compat STT/TTS endpoints
     "silero-vad>=6.2",   # Voice activity detection for utterance segmentation + barge-in
     "audioop-lts>=0.2; python_version >= '3.13'",  # stdlib audioop dropped in 3.13; we need ratecv for 48k→16k
-    "sentence-transformers>=5.5",  # In-process embeddings for operator memory; no daemon, no network at runtime
-    "einops>=0.8",       # Required by nomic-embed-text-v1.5's remote modeling code; sentence-transformers does not pull it in transitively
 ]
 
 [project.optional-dependencies]
