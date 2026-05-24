@@ -363,6 +363,24 @@ class TelegramAgentService:
             session=self._session_id, len=len(reply),
             tool_calls=len(result.tool_calls_made),
         ))
+        # If an owner voice call is active for this same session, the voice
+        # subscriber TTSes any `chat.reply` event with non-empty `voice_text`.
+        # We publish with `text=""` so the telegram-side chat.reply subscriber
+        # (which filters empty text) doesn't double-send what we already sent
+        # above. No call active → no voice subscriber → harmless no-op.
+        try:
+            await self._events.publish_global("chat.reply", {
+                "session_id": self._session_id,
+                "text": "",
+                "voice_text": reply,
+                "trigger": "agent.chat_turn",
+                "task_id": None,
+            })
+        except Exception:
+            log.exception(
+                "agent: publish chat.reply for voice-tts failed (session=%s)",
+                self._session_id,
+            )
 
     # ---- slash commands ----
 
