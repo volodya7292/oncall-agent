@@ -111,7 +111,12 @@ async def _summarize(llm: Any | None, model: str, text: str) -> str:
                 {"role": "user", "content": text},
             ],
             tools=[],
-            max_tokens=256,
+            max_tokens=512,
+            # Without this Gemini's default thinking budget eats most of
+            # `max_tokens` and the visible reply gets truncated mid-sentence —
+            # producing fragments like ", PointerEventData.InputButton>`".
+            # Summarization is mechanical compression; no thinking needed.
+            reasoning_effort="minimal",
         )
     except Exception:
         log.exception("result_delivery: summarize call crashed; truncating")

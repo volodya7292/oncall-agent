@@ -99,6 +99,7 @@ class LLMChat(Protocol):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         max_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -137,7 +138,13 @@ async def extract_candidates(
             {"role": "user", "content": body},
         ],
         tools=[],
-        max_tokens=512,
+        # Gemini's thinking tokens count against `max_tokens`. Without a
+        # bounded thinking_level the default budget swallows most of 512
+        # and the JSON response gets truncated mid-object. Extraction
+        # benefits from a little reasoning (pronoun resolution, dedup vs.
+        # ALREADY_SAVED), so "low" rather than "minimal".
+        max_tokens=1536,
+        reasoning_effort="low",
     )
     text = (resp.get("content") or "").strip()
     if not text:
