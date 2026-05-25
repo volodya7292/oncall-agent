@@ -333,9 +333,15 @@ class TelegramAgentService:
 
         if text.startswith("/"):
             handled = await self._handle_slash(text)
-            if handled:
-                return
-            # Unknown slash — fall through to operator (it can interpret).
+            if not handled:
+                cmd = text.split(None, 1)[0]
+                telegram_log.info("agent unknown slash " + fmt(
+                    session=self._session_id, cmd=cmd,
+                ))
+                await self._send(
+                    f"Unknown command: {cmd}. Send /help for the list."
+                )
+            return
 
         telegram_log.info("agent inbound " + fmt(
             session=self._session_id, len=len(text),
