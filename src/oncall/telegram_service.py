@@ -353,7 +353,7 @@ class TelegramService:
         return await self._db.get_inbox_message(inbox_id)
 
     async def mark_read(self, inbox_id: str) -> bool:
-        return await self._db.mark_inbox_read(inbox_id)
+        return await self._db.mark_inbox_read([inbox_id]) > 0
 
     async def mark_chat_read(self, chat_id: str) -> int:
         """Mark every unread inbox row in this chat as read. Returns the
@@ -832,11 +832,14 @@ class TelegramService:
         row (best-effort; may be None if the chat had no unread row
         when this was called — e.g. an out-of-band reply), and the
         latest inbound body for the audit notice."""
-        # Snapshot the latest unread row BEFORE we mark it read — that's
-        # the sender/body we'll cite in the audit notice. If there's no
-        # unread row at all (e.g. operator decided to reply on a chat
-        # that's already been triaged), fall back to chat-level lookup.
-        latest = await self._latest_unread_for_chat(chat_id)
+        # Snapshot the latest pending row BEFORE we record the reply —
+        # that's the sender/body we'll cite in the audit notice. Keyed
+        # off triaged-ness (NOT `read_at`): the inbox-drain pre-marks a
+        # turn's snapshot read before invoking the operator, so by the
+        # time `reply_to_chat` fires from within that turn, the rows are
+        # already read — only the triaged set reliably distinguishes
+        # "we've finished handling this row" from "still in flight".
+        latest = await self._latest_pending_for_chat(chat_id)
         sent = await self.send(chat_id, text)
         await self._db.record_chat_reply(chat_id, sent["message_id"])
         return {
@@ -847,17 +850,14 @@ class TelegramService:
             "inbound_body": (latest or {}).get("body"),
         }
 
-    async def _latest_unread_for_chat(
+    async def _latest_pending_for_chat(
         self, chat_id: str,
     ) -> dict[str, Any] | None:
-        """Most-recent unread inbox row in `chat_id`. Returns None if the
-        chat is fully read. Used to attribute a `reply_to_chat` call to a
-        specific inbound message for audit purposes."""
-        rows = await self._db.list_inbox(unread_only=True, limit=200)
-        for r in rows:
-            if r["chat_id"] == chat_id:
-                return r
-        return None
+        """Most-recent not-yet-triaged inbox row in `chat_id`. Returns
+        None if the chat is fully triaged. Used to attribute a
+        `reply_to_chat` call to a specific inbound message for audit
+        purposes. NOT keyed off `read_at` — see `reply_to_chat`."""
+        return await self._db.latest_pending_for_chat(chat_id)
 
 
 # ---------------------------------------------------------------------------

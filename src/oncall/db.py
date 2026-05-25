@@ -898,23 +898,31 @@ class Database:
     _PENDING_MSG_TOTAL_CHARS = 500
 
     async def list_pending_chats(self) -> list[dict[str, Any]]:
-        """One row per chat_id that has unread, not-yet-triaged inbox messages.
+        """One row per chat_id that has not-yet-triaged inbox messages.
 
-        Each row carries: sender (from the latest unread row),
-        `unread_count`, `first_unread_at` / `last_unread_at`, and a
-        bounded `messages` list — most-recent unread rows in
-        chronological order, each `{message_id, received_at, body}`,
-        with their bodies summing to ≤500 chars. Older messages in a
-        burst are dropped from `messages` (but still counted in
-        `unread_count`). Callers render notes from `messages` directly
-        so they can include per-message timestamps and ids."""
+        "Pending" is keyed off triaged-ness alone, not `read_at`. The
+        drain marks the snapshot read BEFORE invoking the operator
+        (so newly-arriving DMs during a turn remain `read_at IS NULL`
+        and are detectable as mid-flight arrivals), then marks
+        triaged only after the turn completes. A crashed turn leaves
+        rows read-but-not-triaged — still picked up here for retry,
+        either by the next dirty cycle or by boot recovery.
+
+        Each row carries: sender (from the latest pending row),
+        `unread_count`, `first_unread_at` / `last_unread_at`, `inbox_ids`
+        (every db-side row id contributing to this chat — the exact set
+        the drain must mark read/triaged), and a bounded `messages`
+        list of `{message_id, received_at, body}` whose bodies sum to
+        ≤500 chars (older messages in a burst are dropped from
+        `messages` but still counted in `unread_count` / `inbox_ids`).
+        Callers render notes from `messages` directly so they can
+        include per-message timestamps and ids."""
         rows = await (await self.conn.execute(
             """
             SELECT id, chat_id, message_id, sender_username,
                    sender_display_name, body, received_at
             FROM messenger_inbox
-            WHERE read_at IS NULL
-              AND id NOT IN (SELECT inbox_id FROM messenger_inbox_triaged)
+            WHERE id NOT IN (SELECT inbox_id FROM messenger_inbox_triaged)
             ORDER BY received_at ASC
             """
         )).fetchall()
@@ -953,12 +961,36 @@ class Database:
                 "unread_count": len(msgs),
                 "first_unread_at": msgs[0]["received_at"],
                 "last_unread_at": latest["received_at"],
+                "inbox_ids": [m["id"] for m in msgs],
                 "messages": messages,
             })
         # Most-recently-updated chats first — matches what the operator
         # would expect to see if asked "any DMs?".
         out.sort(key=lambda r: r["last_unread_at"], reverse=True)
         return out
+
+    async def latest_pending_for_chat(
+        self, chat_id: str,
+    ) -> dict[str, Any] | None:
+        """Most-recent not-yet-triaged inbox row in `chat_id`, or None
+        if the chat is fully triaged. Audit-attribution helper for the
+        `reply_to_chat` path — answers "which inbox row is the bot
+        replying to?". Not gated on `read_at` because the drain
+        pre-marks the snapshot read before the operator turn."""
+        row = await (await self.conn.execute(
+            """
+            SELECT id, platform, chat_id, message_id, sender_username,
+                   sender_display_name, body, is_important, received_at,
+                   read_at, replied_message_id
+            FROM messenger_inbox
+            WHERE chat_id = ?
+              AND id NOT IN (SELECT inbox_id FROM messenger_inbox_triaged)
+            ORDER BY received_at DESC
+            LIMIT 1
+            """,
+            (chat_id,),
+        )).fetchone()
+        return _row_to_inbox(row) if row else None
 
     async def mark_chat_triaged(self, chat_id: str) -> int:
         """Mark every unread, not-yet-triaged row for `chat_id` as triaged.
@@ -997,14 +1029,22 @@ class Database:
         self, chat_id: str, reply_message_id: str,
     ) -> None:
         """After the operator successfully replies to a chat, stamp the
-        latest unread row with `replied_message_id` (audit hook for "which
-        DM did this reply address?") and mark every unread row in that
-        chat read in one go. Idempotent — runs even if no rows match."""
+        latest not-yet-triaged row with `replied_message_id` (audit
+        hook for "which DM did this reply address?") and mark every
+        unread row in that chat read in one go. Idempotent — runs even
+        if no rows match.
+
+        The audit-stamp SELECT keys off triaged-ness, not `read_at`:
+        the inbox-drain pre-marks a turn's snapshot read before the
+        operator runs, so by the time this function fires from inside
+        that turn, the snapshot rows are already read. Only triaged-ness
+        distinguishes "the row the bot is replying to" from "already
+        handled."""
         now = iso(utcnow())
-        # The most recent unread row is the one we conceptually replied to.
         latest = await (await self.conn.execute(
             "SELECT id FROM messenger_inbox "
-            "WHERE chat_id = ? AND read_at IS NULL "
+            "WHERE chat_id = ? "
+            "  AND id NOT IN (SELECT inbox_id FROM messenger_inbox_triaged) "
             "ORDER BY received_at DESC LIMIT 1",
             (chat_id,),
         )).fetchone()
@@ -1204,13 +1244,24 @@ class Database:
         )).fetchone()
         return _row_to_inbox(row) if row else None
 
-    async def mark_inbox_read(self, inbox_id: str) -> bool:
+    async def mark_inbox_read(self, inbox_ids: list[str]) -> int:
+        """Stamp `read_at` on the listed rows that are still unread.
+        Returns the rowcount actually flipped. Used by the inbox-drain
+        to mark a flush's snapshot read BEFORE invoking the operator
+        so mid-flight arrivals (`read_at IS NULL`) are distinguishable
+        from the rows the operator is already seeing. Also exposed via
+        `telegram_service.mark_read` for the operator's single-row
+        `messenger.mark_read` tool."""
+        if not inbox_ids:
+            return 0
+        placeholders = ",".join("?" * len(inbox_ids))
         cur = await self.conn.execute(
-            "UPDATE messenger_inbox SET read_at = ? WHERE id = ? AND read_at IS NULL",
-            (iso(utcnow()), inbox_id),
+            f"UPDATE messenger_inbox SET read_at = ? "
+            f"WHERE id IN ({placeholders}) AND read_at IS NULL",
+            (iso(utcnow()), *inbox_ids),
         )
         await self.conn.commit()
-        return cur.rowcount > 0
+        return cur.rowcount
 
     async def record_inbox_reply(self, inbox_id: str, reply_message_id: str) -> None:
         await self.conn.execute(

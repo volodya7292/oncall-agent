@@ -85,7 +85,7 @@ def agent_session_id(owner_user_id: int) -> str:
 
 _SLASH_HELP = (
     "/start — greeting\n"
-    "/status — snapshot of running tasks, queue, approvals, unread DMs\n"
+    "/status — snapshot of running tasks, queue, approvals, pending DMs\n"
     "/context — export this session's chat history + latest summary as a markdown file\n"
     "/clear — wipe this chat session's history (memory is preserved)\n"
     "/compress — force-compress older messages into a summary now\n"
@@ -562,7 +562,12 @@ class TelegramAgentService:
         queued = await self._db.list_tasks_in_states(TaskState.PENDING)
         awaiting = await self._db.list_tasks_in_states(TaskState.AWAITING_APPROVAL)
         approvals = await self._db.list_pending_approvals()
-        unread = await self._db.list_inbox(unread_only=True, limit=200)
+        # "Pending" = not-yet-triaged: matches the drain's notion of work
+        # the bot still owes the user. `read_at` is just a recipient-side
+        # indicator and isn't a signal for our agentic logic — a triaged
+        # chat may still be unread, and a read chat may be mid-flight.
+        pending_chats = await self._db.list_pending_chats()
+        pending = sum(r["unread_count"] for r in pending_chats)
 
         running.sort(key=lambda t: t.created_at)
         queued.sort(key=lambda t: t.created_at)
@@ -573,7 +578,7 @@ class TelegramAgentService:
             f"Tasks: {len(running)} running, {len(queued)} queued, "
             f"{len(awaiting)} awaiting approval",
             f"Approvals pending: {len(approvals)}",
-            f"Unread DMs: {len(unread)}",
+            f"Pending DMs: {pending}",
         ]
 
         if running:
@@ -618,8 +623,8 @@ class TelegramAgentService:
             else:
                 lines.append("- last compression: none yet")
 
-        if not (running or queued or approvals or unread) and op is None:
-            return "All quiet. No tasks, no pending approvals, no unread DMs."
+        if not (running or queued or approvals or pending) and op is None:
+            return "All quiet. No tasks, no pending approvals, no pending DMs."
 
         return "\n".join(lines)
 

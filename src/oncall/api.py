@@ -647,6 +647,11 @@ async def _inbox_drain_loop(
     dirty_since: dict[str, float] = {}   # chat_id → first-dirty timestamp
     last_msg_at: dict[str, float] = {}   # chat_id → most-recent-DM timestamp
     last_flush_at: dict[str, float] = {}  # chat_id → most-recent-flush timestamp
+    # Chats that need an immediate re-flush because a DM arrived during
+    # their last operator turn. Bypasses _INBOX_IDLE_FLUSH_SECONDS so the
+    # user doesn't wait another full debounce for a reply that addresses
+    # what they just said.
+    force_immediate_flush: set[str] = set()
     sub_iter = events.subscribe_global(types={"messenger.received"}).__aiter__()
     loop = asyncio.get_event_loop()
 
@@ -677,6 +682,10 @@ async def _inbox_drain_loop(
     def _next_deadline() -> float | None:
         """Earliest moment at which some dirty chat becomes flushable.
         None means nothing's dirty — block on the next event indefinitely."""
+        if force_immediate_flush:
+            # A prior turn caught a mid-flight DM; flush again right now
+            # without burning another debounce.
+            return loop.time()
         if not dirty_since:
             return None
         return min(
@@ -694,17 +703,22 @@ async def _inbox_drain_loop(
             # recovery (n chats pre-loaded at boot) doesn't sit waiting for an
             # n+1th message.
             now = loop.time()
-            ready = [
+            ready_set = set(force_immediate_flush) | {
                 c for c in dirty_since
                 if now - last_msg_at[c] >= _INBOX_IDLE_FLUSH_SECONDS
                    or now - dirty_since[c] >= _INBOX_MAX_DELAY_SECONDS
-            ]
-            ready.sort(key=lambda c: last_flush_at.get(c, 0.0))
+            }
+            ready = sorted(ready_set, key=lambda c: last_flush_at.get(c, 0.0))
             for chat_id in ready:
+                force_immediate_flush.discard(chat_id)
                 dirty_since.pop(chat_id, None)
                 last_msg_at.pop(chat_id, None)
-                await _flush_chat(events, operator, db, target_session_id, chat_id, telegram=telegram)
+                needs_reflush = await _flush_chat(
+                    events, operator, db, target_session_id, chat_id, telegram=telegram,
+                )
                 last_flush_at[chat_id] = loop.time()
+                if needs_reflush:
+                    force_immediate_flush.add(chat_id)
 
             deadline = _next_deadline()
             timeout = max(0.0, deadline - loop.time()) if deadline is not None else None
@@ -755,11 +769,16 @@ async def _flush_chat(
     events: EventBus, operator: Operator, db: Database,
     target_session_id: str, chat_id: str,
     *, telegram: TelegramService | None = None,
-) -> None:
+) -> bool:
     """Fetch the chat's pending-summary, emit one auto-ping, then mark
-    every unread row in that chat as triaged. No-op if the chat has no
-    unread rows by the time we look (e.g. the user just read them on
-    their phone)."""
+    every snapshot row in that chat as triaged. No-op if the chat has
+    no pending rows by the time we look (e.g. the user just read them
+    on their phone).
+
+    Returns True when one or more new DMs landed in this chat AFTER we
+    captured the snapshot — those messages weren't seen by the operator
+    and the caller should re-flush immediately (skip the idle debounce).
+    Returns False when the snapshot was the whole story."""
     # Pull pending chats and pick out this one. We don't have a
     # per-chat fetch — fine because the list is tiny and we already
     # paid for `list_pending_chats` in the recovery path.
@@ -767,16 +786,18 @@ async def _flush_chat(
         rows = await db.list_pending_chats()
     except Exception:
         log.exception("inbox-drain: list_pending_chats failed for %s", chat_id)
-        return
+        return False
     summary = next((r for r in rows if r["chat_id"] == chat_id), None)
     if summary is None:
         # The chat went clean (user read it themselves, or there's a race
         # against a manual mark_chat_read). Nothing to do.
-        return
+        return False
+
+    snapshot_ids: list[str] = list(summary.get("inbox_ids") or [])
 
     # If the user has read these messages on their phone (Telegram-side),
-    # the DB's `read_at IS NULL` rows are stale. Skip the hand-off and
-    # mark them read locally so /status reflects reality. We only ack a
+    # the DB's pending rows are stale. Skip the hand-off and mark them
+    # read+triaged locally so /status reflects reality. We only ack a
     # known zero — None (API error, chat not in our dialogs) falls
     # through to normal triage so a flake doesn't silently drop work.
     if telegram is not None:
@@ -792,14 +813,14 @@ async def _flush_chat(
                 chat_id, summary.get("unread_count") or 0,
             )
             try:
-                await db.mark_chat_triaged(chat_id)
+                await db.mark_inbox_triaged(snapshot_ids)
             except Exception:
-                log.exception("inbox-drain: mark_chat_triaged failed for %s", chat_id)
+                log.exception("inbox-drain: mark_inbox_triaged failed for %s", chat_id)
             try:
-                await db.mark_chat_read(chat_id)
+                await db.mark_inbox_read(snapshot_ids)
             except Exception:
-                log.exception("inbox-drain: mark_chat_read failed for %s", chat_id)
-            return
+                log.exception("inbox-drain: mark_inbox_read failed for %s", chat_id)
+            return False
 
     sender_username = summary.get("sender_username") or "unknown"
     sender_display = summary.get("sender_display_name") or ""
@@ -835,6 +856,17 @@ async def _flush_chat(
     # enough to give the embedder semantic signal without bloating.
     retrieval_body = "\n".join(m.get("body") or "" for m in messages)
     retrieval_query = (sender_username + " " + retrieval_body).strip()[:1200] or None
+    # Mark the snapshot READ *before* the operator turn. Triaged is the
+    # fail-safe (only set on success); read is a metadata signal so any
+    # DM that arrives during the turn stays `read_at IS NULL` and is
+    # distinguishable as a mid-flight arrival post-turn. A crash between
+    # here and the triage call below leaves rows read-but-not-triaged —
+    # `list_pending_chats` (filters NOT IN triaged) still picks them up
+    # for retry on the next dirty cycle or next boot.
+    try:
+        await db.mark_inbox_read(snapshot_ids)
+    except Exception:
+        log.exception("inbox-drain: pre-turn mark_inbox_read failed for %s", chat_id)
     try:
         result = await operator.auto_ping(
             session_id=target_session_id,
@@ -844,31 +876,31 @@ async def _flush_chat(
         )
     except Exception:
         log.exception("inbox-drain: auto_ping failed for chat %s", chat_id)
-        return
-    # Mark the chat triaged so a restart doesn't re-fire on the same rows,
-    # AND mark every unread row as read so /status' "Unread DMs" count
-    # reflects reality. The drain has already decided this chat is handled
-    # (whether the operator replied or stayed silent) — leaving rows unread
-    # creates a confusing split between "triaged" (we acted on it) and
-    # "unread" (the user still sees a 1). Runs only after the operator
-    # turn fully completes (auto_ping returned above).
+        return False
+    # Triage the exact snapshot ids (not the whole chat) so any mid-flight
+    # arrivals stay un-triaged and get processed on the re-flush below.
     try:
-        await db.mark_chat_triaged(chat_id)
+        await db.mark_inbox_triaged(snapshot_ids)
     except Exception:
-        log.exception("inbox-drain: mark_chat_triaged failed for %s", chat_id)
+        log.exception("inbox-drain: mark_inbox_triaged failed for %s", chat_id)
+    if result.text:
+        await events.publish_global("chat.reply", {
+            "session_id": target_session_id,
+            "text": result.text,
+            "voice_text": to_voice_text(result.text),
+            "trigger": "inbox.chat",
+            "task_id": None,
+        })
+    # Detect mid-flight DMs: if this chat reappears in the pending set
+    # (rows that aren't in `snapshot_ids` — i.e. arrived during the turn),
+    # signal an immediate re-flush so the user gets a response that
+    # actually reads what they just sent.
     try:
-        await db.mark_chat_read(chat_id)
+        pending_now = await db.list_pending_chats()
     except Exception:
-        log.exception("inbox-drain: mark_chat_read failed for %s", chat_id)
-    if not result.text:
-        return
-    await events.publish_global("chat.reply", {
-        "session_id": target_session_id,
-        "text": result.text,
-        "voice_text": to_voice_text(result.text),
-        "trigger": "inbox.chat",
-        "task_id": None,
-    })
+        log.exception("inbox-drain: post-turn list_pending_chats failed for %s", chat_id)
+        return False
+    return any(r["chat_id"] == chat_id for r in pending_now)
 
 
 _MEMORY_DEDUP_INTERVAL_SECONDS = 300.0

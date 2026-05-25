@@ -364,6 +364,40 @@ async def test_list_pending_chats_groups_by_chat_with_messages(service, db):
     assert mids_111 == ["1", "2"]
     assert by_chat["222"]["unread_count"] == 1
     assert [m["body"] for m in by_chat["222"]["messages"]] == ["hey"]
+    # `inbox_ids` carries the db-side primary keys for every pending row
+    # in the chat — the drain uses this exact set for read/triage marking.
+    assert len(by_chat["111"]["inbox_ids"]) == 2
+    assert len(by_chat["222"]["inbox_ids"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_chats_keys_off_triage_not_read(service, db):
+    """Safety invariant: a row marked read but NOT yet triaged still
+    appears in `list_pending_chats`. The drain pre-marks the snapshot
+    read before invoking the operator; if the daemon crashes (or the
+    auto_ping raises) between pre-mark and triage, recovery — and the
+    next dirty cycle — must still retry those rows, otherwise the user
+    would silently lose a response."""
+    s, client = service
+    await client.handler(make_event(
+        sender_username="alex", body="will crash mid-turn",
+        chat_id=111, message_id=1,
+    ))
+    [row] = await db.list_inbox(unread_only=True)
+    # Simulate the pre-turn read-marking only — no triage (the turn
+    # never completed).
+    flipped = await db.mark_inbox_read([row["id"]])
+    assert flipped == 1
+    # Row is read, but NOT triaged → must still be pending.
+    rows = await s.list_pending_chats()
+    by_chat = {r["chat_id"]: r for r in rows}
+    assert "111" in by_chat
+    assert by_chat["111"]["inbox_ids"] == [row["id"]]
+    # Now triage it (as a successful turn would) — and only then does it
+    # leave the pending set.
+    await db.mark_inbox_triaged([row["id"]])
+    rows_after = await s.list_pending_chats()
+    assert all(r["chat_id"] != "111" for r in rows_after)
 
 
 @pytest.mark.asyncio
