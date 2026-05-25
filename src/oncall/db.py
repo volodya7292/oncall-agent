@@ -435,9 +435,10 @@ class Database:
             "UPDATE tasks SET consecutive_denials = consecutive_denials + 1, updated_at = ? WHERE id = ?",
             (iso(utcnow()), str(task_id)),
         )
-        row = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT consecutive_denials FROM tasks WHERE id = ?", (str(task_id),)
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         await self.conn.commit()
         return int(row["consecutive_denials"]) if row else 0
 
@@ -449,31 +450,35 @@ class Database:
         await self.conn.commit()
 
     async def get_task(self, task_id: UUID) -> Task | None:
-        row = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT * FROM tasks WHERE id = ?", (str(task_id),)
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         return _row_to_task(row) if row else None
 
     async def get_task_by_session(self, session_id: str) -> Task | None:
-        row = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT * FROM tasks WHERE session_id = ?", (session_id,)
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         return _row_to_task(row) if row else None
 
     async def list_tasks_in_states(self, *states: TaskState) -> list[Task]:
         if not states:
             return []
         placeholders = ",".join("?" * len(states))
-        rows = await (await self.conn.execute(
+        async with self.conn.execute(
             f"SELECT * FROM tasks WHERE state IN ({placeholders}) ORDER BY created_at",
             tuple(s.value for s in states),
-        )).fetchall()
+        ) as cur:
+            rows = await cur.fetchall()
         return [_row_to_task(r) for r in rows]
 
     async def list_tasks(self, *, limit: int = 50) -> list[Task]:
-        rows = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,)
-        )).fetchall()
+        ) as cur:
+            rows = await cur.fetchall()
         return [_row_to_task(r) for r in rows]
 
     # ---- task events ----
@@ -484,7 +489,7 @@ class Database:
         # for the same task can no longer interleave their SELECT/INSERT
         # and collide on the (task_id, seq) UNIQUE index. RETURNING
         # gives us the chosen seq back without a second round-trip.
-        cur = await self.conn.execute(
+        async with self.conn.execute(
             """INSERT INTO task_events (task_id, seq, type, payload, created_at)
                VALUES (
                    ?,
@@ -493,17 +498,18 @@ class Database:
                )
                RETURNING seq""",
             (str(task_id), str(task_id), type_, json.dumps(payload), iso(utcnow())),
-        )
-        row = await cur.fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         await self.conn.commit()
         return int(row["seq"])
 
     async def list_events(self, task_id: UUID, *, since_seq: int = 0) -> list[dict[str, Any]]:
-        rows = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT seq, type, payload, created_at FROM task_events "
             "WHERE task_id = ? AND seq > ? ORDER BY seq",
             (str(task_id), since_seq),
-        )).fetchall()
+        ) as cur:
+            rows = await cur.fetchall()
         return [
             {
                 "seq": int(r["seq"]),
@@ -529,12 +535,12 @@ class Database:
 
     async def has_model_activity(self, task_id: UUID) -> bool:
         placeholders = ",".join("?" * len(self._MODEL_ACTIVITY_EVENT_TYPES))
-        cur = await self.conn.execute(
+        async with self.conn.execute(
             f"SELECT 1 FROM task_events WHERE task_id = ? "
             f"AND type IN ({placeholders}) LIMIT 1",
             (str(task_id), *self._MODEL_ACTIVITY_EVENT_TYPES),
-        )
-        row = await cur.fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         return row is not None
 
     # ---- approvals ----
@@ -542,19 +548,21 @@ class Database:
     async def get_resolved_approval(
         self, session_id: str, tool_use_id: str
     ) -> tuple[ApprovalRequest, ApprovalResult] | None:
-        row = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT * FROM approvals WHERE session_id = ? AND tool_use_id = ?",
             (session_id, tool_use_id),
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         if row is None or row["state"] != "resolved":
             return None
         return _row_to_approval_pair(row)
 
     async def get_pending_approval(self, approval_id: UUID) -> ApprovalRequest | None:
-        row = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT * FROM approvals WHERE id = ? AND state = 'pending'",
             (str(approval_id),),
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         return _row_to_approval_request(row) if row else None
 
     async def get_pending_by_session_and_tool(
@@ -563,23 +571,26 @@ class Database:
         """Used by broker.decide on --resume: if a pending row already exists
         for this (session_id, tool_use_id), re-attach instead of inserting a
         duplicate (which would violate the UNIQUE index)."""
-        row = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT * FROM approvals "
             "WHERE session_id = ? AND tool_use_id = ? AND state = 'pending'",
             (session_id, tool_use_id),
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         return _row_to_approval_request(row) if row else None
 
     async def get_approval(self, approval_id: UUID) -> dict[str, Any] | None:
-        row = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT * FROM approvals WHERE id = ?", (str(approval_id),)
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         return dict(row) if row else None
 
     async def list_pending_approvals(self) -> list[ApprovalRequest]:
-        rows = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT * FROM approvals WHERE state = 'pending' ORDER BY requested_at"
-        )).fetchall()
+        ) as cur:
+            rows = await cur.fetchall()
         return [_row_to_approval_request(r) for r in rows]
 
     async def create_pending_approval(self, req: ApprovalRequest) -> None:
@@ -666,11 +677,12 @@ class Database:
         """Most recent `limit` chat_messages for this session, in oldest-first
         order. `since_id` (exclusive lower bound on message id) lets the caller
         load only the tail newer than a compression checkpoint."""
-        rows = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT id, role, content, created_at FROM chat_messages "
             "WHERE session_id = ? AND id > ? ORDER BY id DESC LIMIT ?",
             (session_id, since_id, limit),
-        )).fetchall()
+        ) as cur:
+            rows = await cur.fetchall()
         return [
             {"id": int(r["id"]), "role": r["role"], "content": r["content"],
              "created_at": r["created_at"]}
@@ -682,19 +694,21 @@ class Database:
         number of rows removed. Used by the bot's /clear command. Does
         NOT touch chat_summaries, chat_sessions, or operator_memories —
         callers compose these as needed."""
-        cur = await self.conn.execute(
+        async with self.conn.execute(
             "DELETE FROM chat_messages WHERE session_id = ?", (session_id,),
-        )
+        ) as cur:
+            rowcount = cur.rowcount
         await self.conn.commit()
-        return cur.rowcount
+        return rowcount
 
     async def delete_chat_summaries(self, session_id: str) -> int:
         """Wipe every compression checkpoint for this session."""
-        cur = await self.conn.execute(
+        async with self.conn.execute(
             "DELETE FROM chat_summaries WHERE session_id = ?", (session_id,),
-        )
+        ) as cur:
+            rowcount = cur.rowcount
         await self.conn.commit()
-        return cur.rowcount
+        return rowcount
 
     # ---- per-session memory injection tracking ----
 
@@ -704,11 +718,11 @@ class Database:
         by the operator to dedup memory injection across turns (so we
         only inject a memory the FIRST time it's relevant, not every
         turn it surfaces in retrieval)."""
-        cur = await self.conn.execute(
+        async with self.conn.execute(
             "SELECT memory_id FROM session_memory_shown WHERE session_id = ?",
             (session_id,),
-        )
-        rows = await cur.fetchall()
+        ) as cur:
+            rows = await cur.fetchall()
         return {int(r["memory_id"]) for r in rows}
 
     async def record_memory_shown(
@@ -732,12 +746,12 @@ class Database:
     async def get_handoff_cursor(self, chat_session_id: str) -> int:
         """Highest chat_messages.id already forwarded to the executor
         via hand_off for this operator session. 0 if nothing forwarded yet."""
-        cur = await self.conn.execute(
+        async with self.conn.execute(
             "SELECT last_forwarded_message_id FROM executor_handoff_cursor "
             "WHERE chat_session_id = ?",
             (chat_session_id,),
-        )
-        row = await cur.fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         return int(row["last_forwarded_message_id"]) if row else 0
 
     async def set_handoff_cursor(
@@ -760,12 +774,13 @@ class Database:
         """Wipe this session's memory-shown tracking. Called from /clear
         so a freshly-cleared session re-injects relevant memories from
         scratch. Returns rows removed."""
-        cur = await self.conn.execute(
+        async with self.conn.execute(
             "DELETE FROM session_memory_shown WHERE session_id = ?",
             (session_id,),
-        )
+        ) as cur:
+            rowcount = cur.rowcount
         await self.conn.commit()
-        return cur.rowcount
+        return rowcount
 
     # ---- chat compression checkpoints ----
 
@@ -773,22 +788,24 @@ class Database:
         self, *, session_id: str, summary: str,
         through_message_id: int, estimated_token_count: int,
     ) -> int:
-        cur = await self.conn.execute(
+        async with self.conn.execute(
             "INSERT INTO chat_summaries "
             "(session_id, summary, through_message_id, estimated_token_count, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
             (session_id, summary, through_message_id,
              estimated_token_count, iso(utcnow())),
-        )
+        ) as cur:
+            lastrowid = cur.lastrowid
         await self.conn.commit()
-        return cur.lastrowid or 0
+        return lastrowid or 0
 
     async def get_latest_chat_summary(self, session_id: str) -> dict[str, Any] | None:
-        row = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT id, summary, through_message_id, estimated_token_count, created_at "
             "FROM chat_summaries WHERE session_id = ? ORDER BY id DESC LIMIT 1",
             (session_id,),
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         if row is None:
             return None
         return {
@@ -809,9 +826,10 @@ class Database:
         await self.conn.commit()
 
     async def get_task_result_summary(self, task_id: UUID) -> str | None:
-        row = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT result_summary FROM tasks WHERE id = ?", (str(task_id),),
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         if row is None:
             return None
         return row["result_summary"]
@@ -873,7 +891,8 @@ class Database:
             "SELECT * FROM messenger_inbox " + where_sql
             + "ORDER BY received_at DESC LIMIT ?"
         )
-        rows = await (await self.conn.execute(sql, (limit,))).fetchall()
+        async with self.conn.execute(sql, (limit,)) as cur:
+            rows = await cur.fetchall()
         return [_row_to_inbox(r) for r in rows]
 
     async def mark_inbox_triaged(self, inbox_ids: list[str]) -> None:
@@ -917,7 +936,7 @@ class Database:
         `messages` but still counted in `unread_count` / `inbox_ids`).
         Callers render notes from `messages` directly so they can
         include per-message timestamps and ids."""
-        rows = await (await self.conn.execute(
+        async with self.conn.execute(
             """
             SELECT id, chat_id, message_id, sender_username,
                    sender_display_name, body, received_at
@@ -925,7 +944,8 @@ class Database:
             WHERE id NOT IN (SELECT inbox_id FROM messenger_inbox_triaged)
             ORDER BY received_at ASC
             """
-        )).fetchall()
+        ) as cur:
+            rows = await cur.fetchall()
         # Group by chat_id, preserving oldest-first ordering.
         grouped: dict[str, list[Any]] = {}
         for r in rows:
@@ -977,7 +997,7 @@ class Database:
         `reply_to_chat` path — answers "which inbox row is the bot
         replying to?". Not gated on `read_at` because the drain
         pre-marks the snapshot read before the operator turn."""
-        row = await (await self.conn.execute(
+        async with self.conn.execute(
             """
             SELECT id, platform, chat_id, message_id, sender_username,
                    sender_display_name, body, is_important, received_at,
@@ -989,7 +1009,8 @@ class Database:
             LIMIT 1
             """,
             (chat_id,),
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         return _row_to_inbox(row) if row else None
 
     async def mark_chat_triaged(self, chat_id: str) -> int:
@@ -998,14 +1019,15 @@ class Database:
         an inbox-drain auto-ping completes (whether the operator replied or
         stayed silent) so a restart's recovery doesn't re-burn LLM on the
         same chat."""
-        ids_rows = await (await self.conn.execute(
+        async with self.conn.execute(
             """
             SELECT id FROM messenger_inbox
             WHERE chat_id = ? AND read_at IS NULL
               AND id NOT IN (SELECT inbox_id FROM messenger_inbox_triaged)
             """,
             (chat_id,),
-        )).fetchall()
+        ) as cur:
+            ids_rows = await cur.fetchall()
         ids = [r["id"] for r in ids_rows]
         if not ids:
             return 0
@@ -1017,13 +1039,14 @@ class Database:
         the rowcount. Used by the operator's `mark_chat_read` tool and by
         `record_chat_reply` to clear an entire conversation's unread state
         after the operator replies to it."""
-        cur = await self.conn.execute(
+        async with self.conn.execute(
             "UPDATE messenger_inbox SET read_at = ? "
             "WHERE chat_id = ? AND read_at IS NULL",
             (iso(utcnow()), chat_id),
-        )
+        ) as cur:
+            rowcount = cur.rowcount
         await self.conn.commit()
-        return cur.rowcount
+        return rowcount
 
     async def record_chat_reply(
         self, chat_id: str, reply_message_id: str,
@@ -1041,13 +1064,14 @@ class Database:
         distinguishes "the row the bot is replying to" from "already
         handled."""
         now = iso(utcnow())
-        latest = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT id FROM messenger_inbox "
             "WHERE chat_id = ? "
             "  AND id NOT IN (SELECT inbox_id FROM messenger_inbox_triaged) "
             "ORDER BY received_at DESC LIMIT 1",
             (chat_id,),
-        )).fetchone()
+        ) as cur:
+            latest = await cur.fetchone()
         if latest is not None:
             await self.conn.execute(
                 "UPDATE messenger_inbox SET replied_message_id = ? "
@@ -1086,9 +1110,10 @@ class Database:
     async def get_pending_dispatch(
         self, dispatch_id: str,
     ) -> dict[str, Any] | None:
-        row = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT * FROM pending_dispatches WHERE id = ?", (dispatch_id,),
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         if row is None:
             return None
         return {
@@ -1109,45 +1134,50 @@ class Database:
         still pending and we resolved it; False if it was already resolved
         or doesn't exist (the caller MUST treat this as a no-op so a double-
         tap on Yes/No doesn't fire the task twice)."""
-        cur = await self.conn.execute(
+        async with self.conn.execute(
             "UPDATE pending_dispatches SET resolution = ?, resolved_at = ? "
             "WHERE id = ? AND resolution IS NULL",
             (resolution, iso(utcnow()), dispatch_id),
-        )
+        ) as cur:
+            rowcount = cur.rowcount or 0
         await self.conn.commit()
-        return (cur.rowcount or 0) > 0
+        return rowcount > 0
 
     # ---- dm allowlist (reply_to_dm hard guardrail) ----
 
     async def allow_dm(self, chat_id: str) -> bool:
         """Add `chat_id` to the autonomous-reply allowlist. Idempotent —
         returns True if a new row was created, False if it already existed."""
-        cur = await self.conn.execute(
+        async with self.conn.execute(
             "INSERT OR IGNORE INTO dm_allowlist (chat_id, added_at) VALUES (?, ?)",
             (chat_id, iso(utcnow())),
-        )
+        ) as cur:
+            rowcount = cur.rowcount or 0
         await self.conn.commit()
-        return (cur.rowcount or 0) > 0
+        return rowcount > 0
 
     async def deny_dm(self, chat_id: str) -> bool:
         """Remove `chat_id` from the allowlist. Returns True if a row was
         deleted, False if it wasn't on the list."""
-        cur = await self.conn.execute(
+        async with self.conn.execute(
             "DELETE FROM dm_allowlist WHERE chat_id = ?", (chat_id,),
-        )
+        ) as cur:
+            rowcount = cur.rowcount or 0
         await self.conn.commit()
-        return (cur.rowcount or 0) > 0
+        return rowcount > 0
 
     async def is_dm_allowed(self, chat_id: str) -> bool:
-        row = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT 1 FROM dm_allowlist WHERE chat_id = ?", (chat_id,),
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         return row is not None
 
     async def list_dm_allowed(self) -> list[dict[str, str]]:
-        rows = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT chat_id, added_at FROM dm_allowlist ORDER BY added_at",
-        )).fetchall()
+        ) as cur:
+            rows = await cur.fetchall()
         return [{"chat_id": r["chat_id"], "added_at": r["added_at"]} for r in rows]
 
     # ---- per-task Write-dir allowlist ----
@@ -1161,10 +1191,11 @@ class Database:
         await self.conn.commit()
 
     async def list_write_dirs(self, task_id: str) -> list[str]:
-        rows = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT dir FROM task_write_dir_allowlist WHERE task_id = ?",
             (task_id,),
-        )).fetchall()
+        ) as cur:
+            rows = await cur.fetchall()
         return [r["dir"] for r in rows]
 
     # ---- ask_user (executor → human via operator) ----
@@ -1180,33 +1211,37 @@ class Database:
         await self.conn.commit()
 
     async def get_ask_request(self, ask_id: str) -> dict[str, Any] | None:
-        row = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT * FROM ask_requests WHERE id = ?", (ask_id,),
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         return dict(row) if row else None
 
     async def has_presented_ask_for_chat(self, chat_session_id: str) -> bool:
-        row = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT 1 FROM ask_requests WHERE chat_session_id = ? "
             "AND state = 'presented' LIMIT 1",
             (chat_session_id,),
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         return row is not None
 
     async def get_presented_ask_for_chat(self, chat_session_id: str) -> dict[str, Any] | None:
-        row = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT * FROM ask_requests WHERE chat_session_id = ? "
             "AND state = 'presented' ORDER BY presented_at ASC LIMIT 1",
             (chat_session_id,),
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         return dict(row) if row else None
 
     async def next_pending_ask_for_chat(self, chat_session_id: str) -> dict[str, Any] | None:
-        row = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT * FROM ask_requests WHERE chat_session_id = ? "
             "AND state = 'pending' ORDER BY created_at ASC LIMIT 1",
             (chat_session_id,),
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         return dict(row) if row else None
 
     async def mark_ask_presented(self, ask_id: str) -> None:
@@ -1218,30 +1253,33 @@ class Database:
         await self.conn.commit()
 
     async def mark_ask_answered(self, ask_id: str, answer: str) -> bool:
-        cur = await self.conn.execute(
+        async with self.conn.execute(
             "UPDATE ask_requests SET state = 'answered', answer = ?, "
             "answered_at = ? WHERE id = ? AND state IN ('pending', 'presented')",
             (answer, iso(utcnow()), ask_id),
-        )
+        ) as cur:
+            rowcount = cur.rowcount or 0
         await self.conn.commit()
-        return (cur.rowcount or 0) > 0
+        return rowcount > 0
 
     async def cancel_stale_asks(self) -> int:
         """Mark every non-terminal ask as cancelled. Run on startup — the
         executor processes that owned the in-flight futures died with
         the previous daemon, so the rows are orphans."""
-        cur = await self.conn.execute(
+        async with self.conn.execute(
             "UPDATE ask_requests SET state = 'cancelled', answered_at = ? "
             "WHERE state IN ('pending', 'presented')",
             (iso(utcnow()),),
-        )
+        ) as cur:
+            rowcount = cur.rowcount or 0
         await self.conn.commit()
-        return cur.rowcount or 0
+        return rowcount
 
     async def get_inbox_message(self, inbox_id: str) -> dict[str, Any] | None:
-        row = await (await self.conn.execute(
+        async with self.conn.execute(
             "SELECT * FROM messenger_inbox WHERE id = ?", (inbox_id,),
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         return _row_to_inbox(row) if row else None
 
     async def mark_inbox_read(self, inbox_ids: list[str]) -> int:
@@ -1255,13 +1293,14 @@ class Database:
         if not inbox_ids:
             return 0
         placeholders = ",".join("?" * len(inbox_ids))
-        cur = await self.conn.execute(
+        async with self.conn.execute(
             f"UPDATE messenger_inbox SET read_at = ? "
             f"WHERE id IN ({placeholders}) AND read_at IS NULL",
             (iso(utcnow()), *inbox_ids),
-        )
+        ) as cur:
+            rowcount = cur.rowcount
         await self.conn.commit()
-        return cur.rowcount
+        return rowcount
 
     async def record_inbox_reply(self, inbox_id: str, reply_message_id: str) -> None:
         await self.conn.execute(

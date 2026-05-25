@@ -213,11 +213,12 @@ class OperatorMemory:
         `reply_to_dm` tool to verify that an `authority_memory_id` actually
         resolves to an existing row before sending an autonomous reply.
         Returns None if the id doesn't exist (or has been LRU-evicted)."""
-        row = await (await self._db.conn.execute(
+        async with self._db.conn.execute(
             "SELECT id, text, last_accessed_at FROM operator_memories "
             "WHERE id = ? AND model = ?",
             (memory_id, self._embed_model),
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         if row is None:
             return None
         return Memory(
@@ -234,12 +235,13 @@ class OperatorMemory:
         Used by the operator's `forget_memory` tool when the user explicitly
         asks to drop a memory. We filter on `model` so a stale-but-pending-
         rebuild row can't be deleted via a different model's id namespace."""
-        cur = await self._db.conn.execute(
+        async with self._db.conn.execute(
             "DELETE FROM operator_memories WHERE id = ? AND model = ?",
             (memory_id, self._embed_model),
-        )
+        ) as cur:
+            rowcount = cur.rowcount
         await self._db.conn.commit()
-        return cur.rowcount > 0
+        return rowcount > 0
 
     async def dedup_pass(
         self,
@@ -411,9 +413,10 @@ class OperatorMemory:
         }
 
     async def _load_skip_pairs(self) -> set[tuple[int, int]]:
-        rows = await (await self._db.conn.execute(
+        async with self._db.conn.execute(
             "SELECT id_a, id_b FROM memory_dedup_skip_pairs"
-        )).fetchall()
+        ) as cur:
+            rows = await cur.fetchall()
         return {(int(r["id_a"]), int(r["id_b"])) for r in rows}
 
     async def _record_skip_pairs(self, pairs: list[tuple[int, int]]) -> None:
@@ -486,10 +489,11 @@ class OperatorMemory:
         """Count of rows usable for retrieval — i.e., embedded with the
         currently-configured model. Rows pending a rebuild are excluded
         (`stale_count()` exposes that bucket separately)."""
-        row = await (await self._db.conn.execute(
+        async with self._db.conn.execute(
             "SELECT COUNT(*) AS n FROM operator_memories WHERE model = ?",
             (self._embed_model,),
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         return int(row["n"]) if row else 0
 
     # ---- internals ---------------------------------------------------------
@@ -498,11 +502,12 @@ class OperatorMemory:
         """Returns rows embedded with the CURRENT model only. Rows from older
         models are invisible to retrieval + dedup until rebuilt — that's the
         invariant `rebuild_stale_embeddings()` restores."""
-        rows = await (await self._db.conn.execute(
+        async with self._db.conn.execute(
             "SELECT id, text, embedding, last_accessed_at "
             "FROM operator_memories WHERE model = ? ORDER BY id",
             (self._embed_model,),
-        )).fetchall()
+        ) as cur:
+            rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
     async def _insert_row(
@@ -513,24 +518,26 @@ class OperatorMemory:
         source_turn: str | None,
     ) -> int:
         now = iso(utcnow())
-        cur = await self._db.conn.execute(
+        async with self._db.conn.execute(
             "INSERT INTO operator_memories "
             "(text, embedding, model, source_turn, created_at, last_accessed_at, access_count) "
             "VALUES (?, ?, ?, ?, ?, ?, 0)",
             (text, embedding.tobytes(), self._embed_model, source_turn, now, now),
-        )
+        ) as cur:
+            lastrowid = cur.lastrowid
         await self._db.conn.commit()
-        return cur.lastrowid or 0
+        return lastrowid or 0
 
     # ---- rebuild on model change ------------------------------------------
 
     async def stale_count(self) -> int:
         """Rows whose `model` doesn't match the configured embedder. These
         are skipped by retrieval until `rebuild_stale_embeddings()` runs."""
-        row = await (await self._db.conn.execute(
+        async with self._db.conn.execute(
             "SELECT COUNT(*) AS n FROM operator_memories WHERE model != ?",
             (self._embed_model,),
-        )).fetchone()
+        ) as cur:
+            row = await cur.fetchone()
         return int(row["n"]) if row else 0
 
     async def rebuild_stale_embeddings(self, *, batch: int = 32) -> dict[str, int]:
@@ -542,11 +549,12 @@ class OperatorMemory:
         rebuilt = 0
         failed = 0
         while True:
-            stale = await (await self._db.conn.execute(
+            async with self._db.conn.execute(
                 "SELECT id, text FROM operator_memories "
                 "WHERE model != ? ORDER BY id LIMIT ?",
                 (self._embed_model, batch),
-            )).fetchall()
+            ) as cur:
+                stale = await cur.fetchall()
             if not stale:
                 break
             texts = [r["text"] for r in stale]
