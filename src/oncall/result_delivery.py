@@ -65,7 +65,15 @@ async def deliver_executor_result(
     task_events = await db.list_events(task_id)
     raw = latest_executor_text(task_events)
     if not raw:
-        raw = f"SYSTEM: (no output — task ended in state={terminal_state})"
+        # Pure side-effect task (e.g. a single emoji reaction): the action
+        # itself is the user-visible signal. Don't fabricate a placeholder —
+        # publishing one spams the user and pollutes operator history with
+        # a fake assistant turn the operator will then "remember" saying.
+        log.info(
+            "result_delivery: task %s ended in state=%s with no assistant text; skipping publish",
+            task_id, terminal_state,
+        )
+        return
 
     if len(raw) <= MAX_USER_FACING_CHARS:
         final = raw
