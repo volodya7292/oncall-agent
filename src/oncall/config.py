@@ -131,7 +131,7 @@ class Settings(BaseSettings):
     # this consumes no compute. Default 24h fits the on-call case (you might
     # be asleep / on a flight); set lower if you'd rather have approvals
     # fail-deny sooner.
-    oncall_approval_timeout_seconds: int = 86400
+    oncall_approval_timeout_seconds: int = 1800
     # Context compression: when the operator's loaded chat history exceeds
     # this many tokens (estimated as chars/4), summarize older turns via the
     # local `claude` CLI and persist the summary. 64K leaves plenty of head
