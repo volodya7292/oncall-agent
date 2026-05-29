@@ -355,11 +355,17 @@ class Broker:
             return False, False
         matched = phrases_match(req.challenge_phrase, challenge_phrase_supplied)
         behavior = "allow" if (matched and decision == "allow") else "deny"
-        result_message = (
-            message
-            if matched
-            else "Challenge phrase mismatch — coerced to deny."
-        )
+        # Name the actual source of a deny so the executor can relay it
+        # truthfully instead of guessing a reason. An explicit user deny is
+        # NOT a phrase typo: conflating the two led the model to blame the DM
+        # allowlist for a send the user had simply refused.
+        if behavior == "allow":
+            result_message = message
+        elif decision == "deny":
+            result_message = message or "The user explicitly denied this action."
+        else:
+            # decision was "allow" but the supplied challenge phrase didn't match.
+            result_message = "Challenge phrase mismatch — coerced to deny."
         result = ApprovalResult(
             request_id=approval_id,
             behavior=behavior,  # type: ignore[arg-type]

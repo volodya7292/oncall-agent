@@ -228,6 +228,42 @@ async def test_phrase_mismatch_coerces_deny(db, events):
     assert result.behavior == "deny"
 
 
+@pytest.mark.asyncio
+async def test_explicit_user_deny_names_user_as_source(db, events):
+    """Regression: an explicit user deny (decision='deny', not a phrase typo)
+    was mislabeled 'Challenge phrase mismatch — coerced to deny'. The executor
+    then couldn't tell the user had refused and blamed the DM allowlist. The
+    deny reason returned to the executor must name the user as the source."""
+    task = await _make_task(db)
+    client = HttpLongPollApprovalClient()
+    broker = Broker(db, client, events)
+
+    async def respond_when_ready():
+        for _ in range(200):
+            pendings = await db.list_pending_approvals()
+            if pendings:
+                await broker.submit_response(
+                    approval_id=pendings[0].id,
+                    decision="deny",                  # user explicitly refuses
+                    challenge_phrase_supplied="no",   # a deny word, not the phrase
+                )
+                return
+            await asyncio.sleep(0.005)
+        raise AssertionError("approval never appeared")
+
+    decide = broker.decide(
+        session_id=task.session_id,
+        tool_use_id="tu_deny",
+        tool_name="Bash",
+        tool_input={"command": "echo hi >> /tmp/x.log"},
+    )
+    result, _ = await asyncio.gather(decide, respond_when_ready())
+    assert result.behavior == "deny"
+    msg = (result.message or "").lower()
+    assert "denied" in msg
+    assert "challenge phrase mismatch" not in msg
+
+
 # ---------------------------------------------------------------------------
 # Dedup on (session_id, tool_use_id) — simulates --resume after crash
 # ---------------------------------------------------------------------------
