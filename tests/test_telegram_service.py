@@ -33,7 +33,6 @@ class FakeTelegramClient:
         self,
         *,
         outgoing: dict[int, list[dict[str, Any]]] | None = None,
-        archived_chat_ids: set[int] | None = None,
         messages: dict[int, list[dict[str, Any]]] | None = None,
         dialogs: list[dict[str, Any]] | None = None,
         contact_search_users: list[dict[str, Any]] | None = None,
@@ -54,8 +53,6 @@ class FakeTelegramClient:
         # dialogs: full dialog list with name/username/etc, used by
         # search_chats tests.
         self._dialogs = dialogs or []
-        self.archived_chat_ids: set[int] = set(archived_chat_ids or set())
-        self.iter_dialogs_calls: int = 0
         # contact_search_users: rows the fake returns when the service issues
         # a contacts.SearchRequest via `client(request)`.
         self._contact_search_users = contact_search_users or []
@@ -134,37 +131,22 @@ class FakeTelegramClient:
 
         return _async_iter([_make(m) for m in msgs[:limit]])
 
-    def iter_dialogs(self, *, archived: bool | None = None, **kwargs):
-        self.iter_dialogs_calls += 1
-        if self._dialogs:
-            # Full dialog list provided — used by search_chats tests. Filter
-            # by archived if requested.
-            dlgs = []
-            for d in self._dialogs:
-                if archived is True and not d.get("archived"):
-                    continue
-                if archived is False and d.get("archived"):
-                    continue
-                dlgs.append(SimpleNamespace(
-                    id=d["id"], name=d.get("name", ""),
-                    entity=SimpleNamespace(username=d.get("username"), id=d["id"]),
-                    is_user=d.get("is_user", True),
-                    is_group=d.get("is_group", False),
-                    is_channel=d.get("is_channel", False),
-                    unread_count=d.get("unread_count", 0),
-                    archived=d.get("archived", False),
-                ))
-            return _async_iter(dlgs)
-        # Legacy archived-only path for the existing archived-cache tests.
-        if archived is True:
-            dialogs = [
-                SimpleNamespace(id=cid, archived=True) for cid in self.archived_chat_ids
-            ]
-        elif archived is False:
-            dialogs = []
-        else:
-            dialogs = [SimpleNamespace(id=cid, archived=True) for cid in self.archived_chat_ids]
-        return _async_iter(dialogs)
+    def iter_dialogs(self, **kwargs):
+        # The service enumerates all dialogs and no longer filters on archive
+        # state; each dialog just reports its own `archived` flag.
+        dlgs = [
+            SimpleNamespace(
+                id=d["id"], name=d.get("name", ""),
+                entity=SimpleNamespace(username=d.get("username"), id=d["id"]),
+                is_user=d.get("is_user", True),
+                is_group=d.get("is_group", False),
+                is_channel=d.get("is_channel", False),
+                unread_count=d.get("unread_count", 0),
+                archived=d.get("archived", False),
+            )
+            for d in self._dialogs
+        ]
+        return _async_iter(dlgs)
 
 
 def _async_iter(items):
@@ -453,71 +435,6 @@ async def test_mark_read_flag(service, db):
     assert await db.list_inbox(unread_only=True) == []
     # Idempotent: second mark_read on an already-read row returns False
     assert await s.mark_read(inbox_id) is False
-
-
-# ---- archived-chat filtering ----
-
-@pytest.mark.asyncio
-async def test_archived_chat_inbound_dropped(db):
-    """DMs from a Telegram-archived chat must not be written to the inbox."""
-    client = FakeTelegramClient(archived_chat_ids={777})
-    s = TelegramService(
-        db=db, client=client,
-        important_senders=set(), important_keywords=set(),
-    )
-    await s.start()
-    try:
-        await client.handler(make_event(sender_username="ghost", body="boo", chat_id=777))
-        await client.handler(make_event(sender_username="normal", body="hi", chat_id=12345))
-    finally:
-        await s.stop()
-    rows = await db.list_inbox(unread_only=True)
-    assert len(rows) == 1
-    assert rows[0]["chat_id"] == "12345"
-
-
-@pytest.mark.asyncio
-async def test_list_inbox_filters_archived_after_the_fact(db):
-    """A DM persisted before the chat was archived should disappear from
-    list_inbox once the archived cache picks up the new state."""
-    client = FakeTelegramClient()  # no archived chats yet
-    s = TelegramService(
-        db=db, client=client,
-        important_senders=set(), important_keywords=set(),
-        archived_cache_ttl=0.0,  # always refresh on access
-    )
-    await s.start()
-    try:
-        await client.handler(make_event(sender_username="a", body="msg-a", chat_id=111))
-        await client.handler(make_event(sender_username="b", body="msg-b", chat_id=222))
-        # Both visible.
-        assert {r["chat_id"] for r in await s.list_inbox()} == {"111", "222"}
-        # User archives chat 111 in Telegram afterwards.
-        client.archived_chat_ids.add(111)
-        visible = await s.list_inbox()
-        assert {r["chat_id"] for r in visible} == {"222"}
-    finally:
-        await s.stop()
-
-
-@pytest.mark.asyncio
-async def test_archived_cache_ttl_avoids_excessive_refresh(db):
-    """Within the TTL window we should NOT keep hitting iter_dialogs on every
-    list_inbox call — that'd burn Telegram API quota."""
-    client = FakeTelegramClient(archived_chat_ids={999})
-    s = TelegramService(
-        db=db, client=client,
-        important_senders=set(), important_keywords=set(),
-        archived_cache_ttl=60.0,
-    )
-    await s.start()  # primes the cache (one iter_dialogs call)
-    try:
-        for _ in range(5):
-            await s.list_inbox()
-        # 1 call on start + 0 on subsequent reads (TTL not expired).
-        assert client.iter_dialogs_calls == 1
-    finally:
-        await s.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -900,10 +817,11 @@ async def test_list_chats_dms_only_filter(db):
 
 
 @pytest.mark.asyncio
-async def test_list_chats_excludes_archived(db):
-    """Archived dialogs are filtered out automatically (matches search_chats /
-    read_inbox behavior). The cache is populated via the iter_dialogs(archived=True)
-    path under the hood."""
+async def test_list_chats_includes_archived(db):
+    """Archive state is no longer a filter — archived dialogs are surfaced like
+    any other, with their `archived` flag reported as-is. Guards against
+    re-introducing the old "hide archived" behavior, which silently dropped
+    DMs from a chat the user had merely archived (not blocked/muted)."""
     client = FakeTelegramClient(dialogs=[
         {"id": 1, "name": "Active",   "is_user": True, "archived": False},
         {"id": 2, "name": "Archived", "is_user": True, "archived": True},
@@ -918,7 +836,10 @@ async def test_list_chats_excludes_archived(db):
         rows = await s.list_chats()
     finally:
         await s.stop()
-    assert [r["chat_id"] for r in rows] == ["1", "3"]
+    assert [r["chat_id"] for r in rows] == ["1", "2", "3"]
+    assert {r["chat_id"]: r["archived"] for r in rows} == {
+        "1": False, "2": True, "3": False,
+    }
 
 
 @pytest.mark.asyncio

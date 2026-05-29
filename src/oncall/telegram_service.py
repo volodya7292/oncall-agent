@@ -35,7 +35,6 @@ from .audit import fmt, telegram_log
 from .db import Database
 
 
-ARCHIVED_CACHE_TTL_SECONDS = 1800.0  # 30 min — archive state changes rarely
 _ONE_SECOND = timedelta(seconds=1)
 
 # Allowed reactions for the executor's `op=react` tool. Telegram's free
@@ -76,7 +75,6 @@ class TelegramService:
         important_senders: set[str],
         important_keywords: set[str],
         on_new_message: NewMessageCallback | None = None,
-        archived_cache_ttl: float = ARCHIVED_CACHE_TTL_SECONDS,
         ignore_usernames: set[str] | None = None,
         ignore_user_ids: set[int] | None = None,
     ) -> None:
@@ -97,12 +95,6 @@ class TelegramService:
             s.lstrip("@").lower() for s in (ignore_usernames or set())
         }
         self._ignore_user_ids: set[int] = set(ignore_user_ids or set())
-        # Archived-chats cache: { chat_id_str }. Telegram users archive chats
-        # they want hidden from main view without muting/blocking; we treat
-        # archived chats as "do not surface" unless the user explicitly asks.
-        self._archived: set[str] = set()
-        self._archived_refreshed_at: float = 0.0
-        self._archived_cache_ttl = archived_cache_ttl
 
     @property
     def is_started(self) -> bool:
@@ -137,10 +129,8 @@ class TelegramService:
             event_filter = None  # tests pass a fake client that accepts None
         self._handler_ref = self._build_handler()
         self._client.add_event_handler(self._handler_ref, event_filter)
-        # Prime the archived cache so the very first inbound DM gets filtered.
-        await self._refresh_archived(force=True)
         self._started = True
-        log.info("telegram listener started (archived chats cached: %d)", len(self._archived))
+        log.info("telegram listener started")
 
     async def stop(self) -> None:
         if not self._started:
@@ -155,56 +145,6 @@ class TelegramService:
             log.exception("error disconnecting telegram client")
         self._started = False
         log.info("telegram listener stopped")
-
-    # ---- archived-chats cache ----
-
-    async def _refresh_archived(self, *, force: bool = False) -> None:
-        """Repopulate the archived-chat-id set from telethon. Best-effort —
-        on failure we keep the previous cache (better to over-surface than
-        to silently drop after an API blip)."""
-        if not force and (time.monotonic() - self._archived_refreshed_at) < self._archived_cache_ttl:
-            return
-        try:
-            fresh: set[str] = set()
-            async for dlg in self._client.iter_dialogs(archived=True):
-                cid = _dialog_chat_id(dlg)
-                if cid is not None:
-                    fresh.add(cid)
-            self._archived = fresh
-            self._archived_refreshed_at = time.monotonic()
-        except TypeError:
-            # Older telethon may not accept `archived` kwarg — fall back to
-            # iterating all dialogs and filtering on .archived.
-            try:
-                fresh = set()
-                async for dlg in self._client.iter_dialogs():
-                    if getattr(dlg, "archived", False):
-                        cid = _dialog_chat_id(dlg)
-                        if cid is not None:
-                            fresh.add(cid)
-                self._archived = fresh
-                self._archived_refreshed_at = time.monotonic()
-            except Exception:
-                log.exception("failed to refresh archived chats (fallback path)")
-        except Exception:
-            log.exception("failed to refresh archived chats")
-
-    async def _is_archived(self, chat_id: str, event: Any | None = None) -> bool:
-        await self._refresh_archived()
-        if chat_id in self._archived:
-            return True
-        # Cache miss: ask the event for its dialog. Cheap because telethon
-        # caches dialog state on the event object. Defensive: any failure
-        # → treat as non-archived (over-surface, never under-).
-        if event is not None and hasattr(event, "get_dialog"):
-            try:
-                dlg = await _maybe_await(event.get_dialog())
-                if dlg is not None and getattr(dlg, "archived", False):
-                    self._archived.add(chat_id)
-                    return True
-            except Exception:
-                pass
-        return False
 
     # ---- handler ----
 
@@ -287,14 +227,6 @@ class TelegramService:
         message_id = str(getattr(event.message, "id", ""))
         received_at = getattr(event.message, "date", None) or datetime.now(timezone.utc)
 
-        # Archived = user has deliberately hidden this chat. Don't surface.
-        if await self._is_archived(chat_id, event=event):
-            log.info(
-                "inbound skipped reason=archived chat=%s sender_id=%s username=%s",
-                chat_id, sender_id, username,
-            )
-            return
-
         important = self._triage(username, body)
         inbox_id = str(uuid4())
         inserted = await self._db.record_inbox(
@@ -332,22 +264,15 @@ class TelegramService:
     async def list_inbox(
         self, *, unread_only: bool = True, limit: int = 20,
     ) -> list[dict[str, Any]]:
-        # Pull more than `limit` from DB so the archived filter doesn't starve
-        # the result. 4× is a cheap heuristic; bump if archived ratio is high.
-        await self._refresh_archived()
-        rows = await self._db.list_inbox(unread_only=unread_only, limit=limit * 4)
-        filtered = [r for r in rows if r["chat_id"] not in self._archived]
-        return filtered[:limit]
+        rows = await self._db.list_inbox(unread_only=unread_only, limit=limit)
+        return rows
 
     async def list_pending_chats(self) -> list[dict[str, Any]]:
-        """One entry per chat with unread DMs. Archived chats are excluded
-        — they're the same things `list_inbox` filters out. Used by the
-        inbox-drain triage path and by the operator's `read_inbox` tool
-        in the new chat-centric flow (the operator sees the dirty chat
-        and then calls `read_chat` for full context if it wants it)."""
-        await self._refresh_archived()
-        rows = await self._db.list_pending_chats()
-        return [r for r in rows if r["chat_id"] not in self._archived]
+        """One entry per chat with unread DMs. Used by the inbox-drain triage
+        path and by the operator's `read_inbox` tool in the chat-centric flow
+        (the operator sees the dirty chat and then calls `read_chat` for full
+        context if it wants it)."""
+        return await self._db.list_pending_chats()
 
     async def get_message(self, inbox_id: str) -> dict[str, Any] | None:
         return await self._db.get_inbox_message(inbox_id)
@@ -487,15 +412,14 @@ class TelegramService:
         self, *, unread_only: bool = False, dms_only: bool = False, limit: int = 20,
     ) -> list[dict[str, Any]]:
         """Enumerate the user's recent Telegram dialogs (no name query).
-        Telethon returns dialogs in last-activity order. Archived chats are
-        filtered out (matches read_inbox / search_chats behaviour).
+        Telethon returns dialogs in last-activity order. Each dialog's
+        `archived` state is reported as-is — nothing is filtered on it.
         - `unread_only=True` keeps only dialogs with unread_count > 0.
         - `dms_only=True` keeps only private chats (1:1)."""
-        await self._refresh_archived()
         out: list[dict[str, Any]] = []
         async for dlg in self._client.iter_dialogs():
             cid = _dialog_chat_id(dlg)
-            if cid is None or cid in self._archived:
+            if cid is None:
                 continue
             is_user = bool(getattr(dlg, "is_user", False))
             unread = int(getattr(dlg, "unread_count", 0) or 0)
@@ -513,7 +437,7 @@ class TelegramService:
                 "is_group": bool(getattr(dlg, "is_group", False)),
                 "is_channel": bool(getattr(dlg, "is_channel", False)),
                 "unread_count": unread,
-                "archived": False,
+                "archived": bool(getattr(dlg, "archived", False)),
             })
             if len(out) >= limit:
                 break
@@ -579,7 +503,6 @@ class TelegramService:
                 return True
             return bool(tokens) and all(tok in nl for tok in tokens)
 
-        await self._refresh_archived()
         seen_ids: set[str] = set()
         out: list[dict[str, Any]] = []
         async for dlg in self._client.iter_dialogs():
@@ -600,7 +523,7 @@ class TelegramService:
                 "is_group": bool(getattr(dlg, "is_group", False)),
                 "is_channel": bool(getattr(dlg, "is_channel", False)),
                 "unread_count": int(getattr(dlg, "unread_count", 0) or 0),
-                "archived": cid in self._archived,
+                "archived": bool(getattr(dlg, "archived", False)),
                 "source": "dialog",
             })
             if len(out) >= limit:

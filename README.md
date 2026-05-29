@@ -87,7 +87,7 @@ State lives in `~/.oncall/state.db` (SQLite, WAL).
 - `src/oncall/executor/settings.json` carries a catastrophic-command deny list (first line of defense, evaluated before the classifier). This is the policy applied to the `claude` CLI subprocess we spawn as the executor — distinct from any `.claude/settings.json` a developer working on this repo might have.
 - Every tool call writes an `approvals` row, including auto-decided ones — full audit trail in SQLite.
 - Real-time `oncall.audit.*` log stream: `oncall api 2>&1 | grep oncall.audit` shows every broker decision, operator tool call, Telegram inbound/send.
-- Telegram archived chats are filtered from the inbox automatically.
+- Telegram inbound is surfaced regardless of the chat's archive state — archiving a chat no longer hides its DMs from the inbox.
 - `mark_inbox_read` is local-only — does NOT clear Telegram's unread badge and does NOT send a read receipt.
 
 ## Status
