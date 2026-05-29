@@ -24,14 +24,13 @@ from typing import Any, Protocol
 import numpy as np
 
 from .audit import fmt, operator_log
-from .db import Database, iso
+from .db import Database
 from .embeddings import (
     EmbeddingClient,
     cosine_matrix,
     hybrid_score,
     unpack,
 )
-from .models import utcnow
 
 
 log = logging.getLogger(__name__)
@@ -213,12 +212,7 @@ class OperatorMemory:
         `reply_to_dm` tool to verify that an `authority_memory_id` actually
         resolves to an existing row before sending an autonomous reply.
         Returns None if the id doesn't exist (or has been LRU-evicted)."""
-        async with self._db.conn.execute(
-            "SELECT id, text, last_accessed_at FROM operator_memories "
-            "WHERE id = ? AND model = ?",
-            (memory_id, self._embed_model),
-        ) as cur:
-            row = await cur.fetchone()
+        row = await self._db.memory_get(memory_id, self._embed_model)
         if row is None:
             return None
         return Memory(
@@ -235,13 +229,7 @@ class OperatorMemory:
         Used by the operator's `forget_memory` tool when the user explicitly
         asks to drop a memory. We filter on `model` so a stale-but-pending-
         rebuild row can't be deleted via a different model's id namespace."""
-        async with self._db.conn.execute(
-            "DELETE FROM operator_memories WHERE id = ? AND model = ?",
-            (memory_id, self._embed_model),
-        ) as cur:
-            rowcount = cur.rowcount
-        await self._db.conn.commit()
-        return rowcount > 0
+        return await self._db.memory_delete(memory_id, self._embed_model)
 
     async def dedup_pass(
         self,
@@ -413,20 +401,10 @@ class OperatorMemory:
         }
 
     async def _load_skip_pairs(self) -> set[tuple[int, int]]:
-        async with self._db.conn.execute(
-            "SELECT id_a, id_b FROM memory_dedup_skip_pairs"
-        ) as cur:
-            rows = await cur.fetchall()
-        return {(int(r["id_a"]), int(r["id_b"])) for r in rows}
+        return await self._db.memory_load_skip_pairs()
 
     async def _record_skip_pairs(self, pairs: list[tuple[int, int]]) -> None:
-        now = iso(utcnow())
-        await self._db.conn.executemany(
-            "INSERT OR IGNORE INTO memory_dedup_skip_pairs "
-            "(id_a, id_b, recorded_at) VALUES (?, ?, ?)",
-            [(a, b, now) for (a, b) in pairs],
-        )
-        await self._db.conn.commit()
+        await self._db.memory_record_skip_pairs(pairs)
 
     async def _dedup_decide(
         self,
@@ -489,12 +467,7 @@ class OperatorMemory:
         """Count of rows usable for retrieval — i.e., embedded with the
         currently-configured model. Rows pending a rebuild are excluded
         (`stale_count()` exposes that bucket separately)."""
-        async with self._db.conn.execute(
-            "SELECT COUNT(*) AS n FROM operator_memories WHERE model = ?",
-            (self._embed_model,),
-        ) as cur:
-            row = await cur.fetchone()
-        return int(row["n"]) if row else 0
+        return await self._db.memory_entries_count(self._embed_model)
 
     # ---- internals ---------------------------------------------------------
 
@@ -502,13 +475,7 @@ class OperatorMemory:
         """Returns rows embedded with the CURRENT model only. Rows from older
         models are invisible to retrieval + dedup until rebuilt — that's the
         invariant `rebuild_stale_embeddings()` restores."""
-        async with self._db.conn.execute(
-            "SELECT id, text, embedding, last_accessed_at "
-            "FROM operator_memories WHERE model = ? ORDER BY id",
-            (self._embed_model,),
-        ) as cur:
-            rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+        return await self._db.memory_all_rows(self._embed_model)
 
     async def _insert_row(
         self,
@@ -517,28 +484,19 @@ class OperatorMemory:
         embedding: np.ndarray,
         source_turn: str | None,
     ) -> int:
-        now = iso(utcnow())
-        async with self._db.conn.execute(
-            "INSERT INTO operator_memories "
-            "(text, embedding, model, source_turn, created_at, last_accessed_at, access_count) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0)",
-            (text, embedding.tobytes(), self._embed_model, source_turn, now, now),
-        ) as cur:
-            lastrowid = cur.lastrowid
-        await self._db.conn.commit()
-        return lastrowid or 0
+        return await self._db.memory_insert(
+            text=text,
+            embedding=embedding.tobytes(),
+            model=self._embed_model,
+            source_turn=source_turn,
+        )
 
     # ---- rebuild on model change ------------------------------------------
 
     async def stale_count(self) -> int:
         """Rows whose `model` doesn't match the configured embedder. These
         are skipped by retrieval until `rebuild_stale_embeddings()` runs."""
-        async with self._db.conn.execute(
-            "SELECT COUNT(*) AS n FROM operator_memories WHERE model != ?",
-            (self._embed_model,),
-        ) as cur:
-            row = await cur.fetchone()
-        return int(row["n"]) if row else 0
+        return await self._db.memory_stale_count(self._embed_model)
 
     async def rebuild_stale_embeddings(self, *, batch: int = 32) -> dict[str, int]:
         """Re-embed every row whose stored model differs from the configured
@@ -549,12 +507,9 @@ class OperatorMemory:
         rebuilt = 0
         failed = 0
         while True:
-            async with self._db.conn.execute(
-                "SELECT id, text FROM operator_memories "
-                "WHERE model != ? ORDER BY id LIMIT ?",
-                (self._embed_model, batch),
-            ) as cur:
-                stale = await cur.fetchall()
+            stale = await self._db.memory_select_stale_batch(
+                self._embed_model, batch,
+            )
             if not stale:
                 break
             texts = [r["text"] for r in stale]
@@ -566,14 +521,12 @@ class OperatorMemory:
                 # Don't loop forever on a persistent failure — bail and let
                 # the next startup retry.
                 break
-            for r, v in zip(stale, vecs):
-                vec = np.asarray(v, dtype=np.float32)
-                await self._db.conn.execute(
-                    "UPDATE operator_memories SET embedding = ?, model = ? WHERE id = ?",
-                    (vec.tobytes(), self._embed_model, int(r["id"])),
-                )
-                rebuilt += 1
-            await self._db.conn.commit()
+            updates = [
+                (int(r["id"]), np.asarray(v, dtype=np.float32).tobytes())
+                for r, v in zip(stale, vecs)
+            ]
+            await self._db.memory_update_embeddings(updates, self._embed_model)
+            rebuilt += len(updates)
         operator_log.info(
             "memory_rebuild " + fmt(
                 rebuilt=rebuilt, failed=failed, model=self._embed_model,
@@ -582,28 +535,7 @@ class OperatorMemory:
         return {"rebuilt": rebuilt, "failed": failed}
 
     async def _bump_access(self, *row_ids: int) -> None:
-        if not row_ids:
-            return
-        now = iso(utcnow())
-        placeholders = ",".join("?" * len(row_ids))
-        await self._db.conn.execute(
-            f"UPDATE operator_memories "
-            f"SET last_accessed_at = ?, access_count = access_count + 1 "
-            f"WHERE id IN ({placeholders})",
-            (now, *row_ids),
-        )
-        await self._db.conn.commit()
+        await self._db.memory_bump_access(list(row_ids))
 
     async def _maybe_evict(self) -> None:
-        n = await self.entries_count()
-        if n <= self._capacity:
-            return
-        overflow = n - self._capacity
-        await self._db.conn.execute(
-            "DELETE FROM operator_memories WHERE id IN ("
-            "  SELECT id FROM operator_memories "
-            "  ORDER BY last_accessed_at ASC, id ASC LIMIT ?"
-            ")",
-            (overflow,),
-        )
-        await self._db.conn.commit()
+        await self._db.memory_evict_over_capacity(self._capacity, self._embed_model)

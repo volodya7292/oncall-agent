@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 from datetime import datetime
 from pathlib import Path
@@ -264,10 +266,31 @@ def parse_iso(s: str | None) -> datetime | None:
     return datetime.fromisoformat(s) if s else None
 
 
+def _locked(method):
+    """Run a coroutine method while holding the instance's connection lock."""
+    @functools.wraps(method)
+    async def wrapper(self, *args, **kwargs):
+        async with self._lock:
+            return await method(self, *args, **kwargs)
+    return wrapper
+
+
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self._conn: aiosqlite.Connection | None = None
+        # Serializes ALL access to the single shared connection. aiosqlite
+        # runs one worker thread and serializes *individual* ops, but NOT the
+        # multi-step sequences our methods are (execute -> fetch -> commit).
+        # Two tasks sharing the connection could interleave: e.g. a concurrent
+        # commit() landing between append_event's `INSERT ... RETURNING` and
+        # its fetchone() hit the still-active write statement and raised
+        # `cannot commit transaction - SQL statements in progress`. Holding
+        # this lock for each method's whole connection sequence (see
+        # `_serialize_connection_access` below) makes every method atomic on
+        # the connection. NB: never hold it across non-DB awaits (LLM/embed) —
+        # methods here only touch sqlite, so it's held for microseconds.
+        self._lock = asyncio.Lock()
 
     async def connect(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1031,7 +1054,16 @@ class Database:
         ids = [r["id"] for r in ids_rows]
         if not ids:
             return 0
-        await self.mark_inbox_triaged(ids)
+        # Inlined rather than calling self.mark_inbox_triaged(): both methods
+        # acquire the per-connection lock, and asyncio.Lock is not reentrant,
+        # so delegating would self-deadlock.
+        now = iso(utcnow())
+        await self.conn.executemany(
+            "INSERT OR IGNORE INTO messenger_inbox_triaged "
+            "(inbox_id, triaged_at) VALUES (?, ?)",
+            [(i, now) for i in ids],
+        )
+        await self.conn.commit()
         return len(ids)
 
     async def mark_chat_read(self, chat_id: str) -> int:
@@ -1336,6 +1368,145 @@ class Database:
         )
         await self.conn.commit()
 
+    # ---- operator memory (semantic store) ----
+    # The SQL for operator_memory lives here so every connection touch goes
+    # through the per-connection lock. operator_memory.py owns the embedding /
+    # scoring logic and passes embeddings as raw bytes; this layer is pure SQL.
+
+    async def memory_get(self, memory_id: int, model: str) -> aiosqlite.Row | None:
+        async with self.conn.execute(
+            "SELECT id, text, last_accessed_at FROM operator_memories "
+            "WHERE id = ? AND model = ?",
+            (memory_id, model),
+        ) as cur:
+            return await cur.fetchone()
+
+    async def memory_delete(self, memory_id: int, model: str) -> bool:
+        async with self.conn.execute(
+            "DELETE FROM operator_memories WHERE id = ? AND model = ?",
+            (memory_id, model),
+        ) as cur:
+            rowcount = cur.rowcount
+        await self.conn.commit()
+        return rowcount > 0
+
+    async def memory_all_rows(self, model: str) -> list[dict[str, Any]]:
+        async with self.conn.execute(
+            "SELECT id, text, embedding, last_accessed_at "
+            "FROM operator_memories WHERE model = ? ORDER BY id",
+            (model,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def memory_insert(
+        self, *, text: str, embedding: bytes, model: str, source_turn: str | None,
+    ) -> int:
+        now = iso(utcnow())
+        async with self.conn.execute(
+            "INSERT INTO operator_memories "
+            "(text, embedding, model, source_turn, created_at, last_accessed_at, access_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0)",
+            (text, embedding, model, source_turn, now, now),
+        ) as cur:
+            lastrowid = cur.lastrowid
+        await self.conn.commit()
+        return lastrowid or 0
+
+    async def memory_entries_count(self, model: str) -> int:
+        async with self.conn.execute(
+            "SELECT COUNT(*) AS n FROM operator_memories WHERE model = ?",
+            (model,),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row["n"]) if row else 0
+
+    async def memory_stale_count(self, model: str) -> int:
+        async with self.conn.execute(
+            "SELECT COUNT(*) AS n FROM operator_memories WHERE model != ?",
+            (model,),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row["n"]) if row else 0
+
+    async def memory_select_stale_batch(
+        self, model: str, limit: int,
+    ) -> list[dict[str, Any]]:
+        async with self.conn.execute(
+            "SELECT id, text FROM operator_memories "
+            "WHERE model != ? ORDER BY id LIMIT ?",
+            (model, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def memory_update_embeddings(
+        self, rows: list[tuple[int, bytes]], model: str,
+    ) -> None:
+        """Re-point a batch of rows at `model` with freshly-computed
+        embeddings, in one transaction. `rows` is [(id, embedding_bytes), ...]."""
+        if not rows:
+            return
+        await self.conn.executemany(
+            "UPDATE operator_memories SET embedding = ?, model = ? WHERE id = ?",
+            [(emb, model, rid) for (rid, emb) in rows],
+        )
+        await self.conn.commit()
+
+    async def memory_bump_access(self, row_ids: list[int]) -> None:
+        if not row_ids:
+            return
+        now = iso(utcnow())
+        placeholders = ",".join("?" * len(row_ids))
+        await self.conn.execute(
+            f"UPDATE operator_memories "
+            f"SET last_accessed_at = ?, access_count = access_count + 1 "
+            f"WHERE id IN ({placeholders})",
+            (now, *row_ids),
+        )
+        await self.conn.commit()
+
+    async def memory_evict_over_capacity(self, capacity: int, model: str) -> int:
+        """If the model's row count exceeds `capacity`, hard-delete the oldest
+        (by last_accessed_at) overflow rows. Count + delete in one locked
+        transaction. Returns how many rows were evicted."""
+        async with self.conn.execute(
+            "SELECT COUNT(*) AS n FROM operator_memories WHERE model = ?",
+            (model,),
+        ) as cur:
+            row = await cur.fetchone()
+        n = int(row["n"]) if row else 0
+        if n <= capacity:
+            return 0
+        overflow = n - capacity
+        await self.conn.execute(
+            "DELETE FROM operator_memories WHERE id IN ("
+            "  SELECT id FROM operator_memories "
+            "  ORDER BY last_accessed_at ASC, id ASC LIMIT ?"
+            ")",
+            (overflow,),
+        )
+        await self.conn.commit()
+        return overflow
+
+    async def memory_load_skip_pairs(self) -> set[tuple[int, int]]:
+        async with self.conn.execute(
+            "SELECT id_a, id_b FROM memory_dedup_skip_pairs"
+        ) as cur:
+            rows = await cur.fetchall()
+        return {(int(r["id_a"]), int(r["id_b"])) for r in rows}
+
+    async def memory_record_skip_pairs(self, pairs: list[tuple[int, int]]) -> None:
+        if not pairs:
+            return
+        now = iso(utcnow())
+        await self.conn.executemany(
+            "INSERT OR IGNORE INTO memory_dedup_skip_pairs "
+            "(id_a, id_b, recorded_at) VALUES (?, ?, ?)",
+            [(a, b, now) for (a, b) in pairs],
+        )
+        await self.conn.commit()
+
 
 # ---- row converters ----
 
@@ -1401,3 +1572,26 @@ def _row_to_approval_pair(row: aiosqlite.Row) -> tuple[ApprovalRequest, Approval
         responded_at=datetime.fromisoformat(row["responded_at"]) if row["responded_at"] else utcnow(),
     )
     return req, result
+
+
+def _serialize_connection_access(cls: type) -> None:
+    """Wrap every public coroutine method of `cls` so it runs under
+    `self._lock` (see `Database.__init__`). Done in one place so a method can
+    never *forget* to take the lock — that completeness is itself the safety
+    property: all shared-connection access is serialized.
+
+    Excluded: `connect`/`close` (lifecycle; run outside the concurrent phase)
+    and any `_`-prefixed helper/migration (migrations run once at startup
+    before tasks exist, and internal helpers are called from already-locked
+    public methods, so locking them would self-deadlock — asyncio.Lock is not
+    reentrant). Public methods must therefore not call each other.
+    """
+    skip = {"connect", "close"}
+    for name, attr in list(vars(cls).items()):
+        if name.startswith("_") or name in skip:
+            continue
+        if asyncio.iscoroutinefunction(attr):
+            setattr(cls, name, _locked(attr))
+
+
+_serialize_connection_access(Database)
