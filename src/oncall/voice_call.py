@@ -826,8 +826,14 @@ class CallService:
             return (
                 "voice call from the owner just started. greet them briefly "
                 "(one sentence, conversational, no markdown). your reply will "
-                "be spoken aloud by TTS. this note is procedural — do not save "
-                "anything to memory based on it."
+                "be spoken aloud by TTS. audio may be garbled or partly "
+                "inaudible, so before you act on anything consequential "
+                "(sending a message, placing a call, deleting or changing "
+                "something), read back what you understood in one line and "
+                "wait for the owner to confirm before you hand off — don't "
+                "act on a guess. skip the read-back for chitchat and simple "
+                "answers. this note is procedural — do not save anything to "
+                "memory based on it."
             )
         return (
             f"you have just placed an outbound voice call from the "
