@@ -32,6 +32,7 @@ import audioop
 import ctypes
 import ctypes.util
 import logging
+import re
 import struct
 import sys
 import time
@@ -96,16 +97,42 @@ FRAME_MS = 10
 SAMPLES_PER_FRAME = PCM_RATE * FRAME_MS // 1000  # 480
 BYTES_PER_FRAME = SAMPLES_PER_FRAME * 2          # 960
 
-# Silero VAD wants 16 kHz mono PCM in 30 ms (512-sample) chunks.
+# Silero VAD wants 16 kHz mono PCM in 32 ms (512-sample) chunks.
 VAD_RATE = 16_000
 VAD_CHUNK_SAMPLES = 512
 VAD_CHUNK_BYTES = VAD_CHUNK_SAMPLES * 2
 
-# Speech-start / speech-end hysteresis.
-VAD_START_PROB = 0.6
-VAD_END_PROB = 0.35
-VAD_SILENCE_END_MS = 500   # silence after speech that ends an utterance
-VAD_BARGE_IN_MS = 150      # voice during TTS that cancels playback
+# Turn-taking thresholds, tuned to pipecat's Silero VAD defaults.
+#
+# pipecat gates VAD speech-start behind `start_secs` (0.2 s) of sustained
+# voice, and triggers barge-in off that SAME speech-start event (its default
+# VADUserTurnStartStrategy) — there is no separate, looser barge-in path:
+# interrupting the bot needs the same ~200 ms of real speech as starting a
+# turn does. We mirror that with one `VAD_START_MS` gate driving both
+# utterance-start and barge-in, which also makes a cough / one-syllable
+# backchannel / brief TTS echo (all < 200 ms) too short to cut the bot off.
+# We keep a probability hysteresis band (enter at START_PROB, stay in at the
+# lower END_PROB) instead of pipecat's single confidence + stop-frame count;
+# the long end-silence below already debounces the tail.
+VAD_START_PROB = 0.6        # prob to begin counting toward speech-start
+VAD_END_PROB = 0.35         # prob floor to stay "in speech" once started
+VAD_START_MS = 200          # sustained voice before speech-start / barge-in
+                            #   (pipecat VADParams.start_secs = 0.2 s; with
+                            #   32 ms chunks this fires on the 7th chunk)
+# Silence that ends a turn. pipecat's timeout fallback waits
+# user_speech_timeout (0.6 s) AFTER its VAD stop_secs (0.2 s) — an effective
+# ~0.8 s of real silence — and conversation-analysis corpora put intra-turn
+# hesitation pauses commonly in the 0.5–0.8 s range, so much under that clips
+# people mid-thought. 700 ms sits at the top of that band while staying snappy
+# for a terse on-call assistant. (Raise toward 800 for full pipecat parity /
+# fewer cut-offs; lower toward 500 for snappier replies.)
+VAD_SILENCE_END_MS = 700
+# Utterances shorter than this (post-endpoint, pre-STT) are treated as noise.
+VAD_MIN_UTT_MS = 200
+# Silero VAD is a recurrent net carrying hidden state across calls; pipecat
+# resets it every 5 s so accumulated drift / noise can't skew detection. We do
+# the same between utterances (see _inbound_loop), plus once at call attach.
+VAD_STATE_RESET_S = 5.0
 
 # HTTP timeouts. TTS can return seconds of audio; STT can do long files.
 HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=60.0)
@@ -115,10 +142,16 @@ HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=60.0)
 # can block our outbound loop for tens of seconds. 1.0 s is generous —
 # anything longer means the call is effectively stuck.
 SEND_FRAME_TIMEOUT_S = 1.0
-# Inactivity watchdog on `_speak()`'s outer loop: if neither a frame
-# arrives nor barge-in fires for this many seconds, abandon the current
-# TTS so queued items (esp. approval prompts) can play.
-SPEAK_IDLE_TIMEOUT_S = 3.0
+
+# Outbound-queue priorities (lower = spoken first). Approvals are
+# safety-critical and jump ahead of queued chitchat; a user barge-in drops
+# pending chitchat but never an approval. See _enqueue_text / _drain_chitchat.
+_PRI_APPROVAL = 0
+_PRI_CHAT = 1
+
+# Sentinel returned by _await_synth when barge-in wins the race against a
+# chunk's TTS synthesis.
+_BARGE = object()
 
 
 @dataclass
@@ -132,7 +165,10 @@ class _ActiveCall:
     is_owner: bool                         # drives memory isolation + system note variant
     callee_label: str                      # human-readable; "owner", "Alice", "id=12345"
     reason: str                            # operator's stated purpose; "" for inbound
-    outbound_text_queue: asyncio.Queue[str]
+    # Priority queue of (priority, seq, text). Approvals (_PRI_APPROVAL) are
+    # spoken before queued chitchat (_PRI_CHAT); seq keeps FIFO within a
+    # priority and keeps tuples comparable without ever comparing the text.
+    outbound_queue: "asyncio.PriorityQueue[tuple[int, int, str]]"
     inbound_frames: asyncio.Queue[bytes]
     barge_in: asyncio.Event
     # Which PyTgCalls instance owns this call. Inbound calls use the
@@ -150,6 +186,17 @@ class _ActiveCall:
     tasks: list[asyncio.Task] = field(default_factory=list)
     is_speaking: bool = False              # outbound is currently emitting TTS audio
     in_flight_tts: asyncio.Task | None = None
+    # Monotonic counter feeding the outbound priority-queue tuples.
+    outbound_seq: int = 0
+    # Set the instant a user (not an approval) barge-in fires, so the
+    # outbound loop knows to drop stale chitchat and remember the cut-off.
+    barge_in_by_user: bool = False
+    # The bot's previous spoken reply was cut off by the user mid-delivery;
+    # surfaced to the operator on the next turn so it knows they may not have
+    # heard all of it. interrupted_remainder is the still-unspoken text, used
+    # to resume if the "interruption" turns out to be a cough (empty STT).
+    was_interrupted: bool = False
+    interrupted_remainder: str | None = None
     # approval_id (str) → challenge phrase. Mirrors telegram_agent's pending
     # dict — populated when broker fires approval.requested for our session,
     # consumed when the user's STT'd utterance matches an affirm/deny phrase.
@@ -425,7 +472,7 @@ class CallService:
             is_owner=is_owner,
             callee_label=callee_label,
             reason=reason,
-            outbound_text_queue=asyncio.Queue(),
+            outbound_queue=asyncio.PriorityQueue(),
             inbound_frames=asyncio.Queue(maxsize=4096),
             barge_in=asyncio.Event(),
             placed_at=now,
@@ -435,6 +482,13 @@ class CallService:
         )
         self._active = active
         self._resample_state = None  # reset audioop ratecv state for new call
+        # Clear any Silero VAD hidden state left over from a previous call so
+        # its first chunks aren't judged against stale context.
+        if self._vad is not None:
+            try:
+                self._vad.reset_states()
+            except Exception:
+                log.warning("voice: VAD reset_states at attach failed", exc_info=True)
 
         active.tasks = [
             asyncio.create_task(self._inbound_loop(active), name="voice-inbound"),
@@ -738,6 +792,7 @@ class CallService:
         silent_ms = 0
         voiced_ms = 0
         last_log_t = 0.0
+        last_vad_reset = time.monotonic()
 
         try:
             while True:
@@ -782,13 +837,20 @@ class CallService:
                     else:
                         if prob >= VAD_START_PROB:
                             voiced_ms += chunk_ms
-                            if voiced_ms >= 90:  # 3 consecutive ~32 ms chunks
+                            if voiced_ms >= VAD_START_MS:
                                 speaking = True
                                 log.info("voice: utterance start")
-                                # Barge-in: if outbound is currently speaking,
-                                # cancel it so the user can talk.
+                                # Barge-in fires off the same speech-start gate
+                                # (pipecat's VADUserTurnStartStrategy): once the
+                                # user has produced VAD_START_MS of real voice,
+                                # that's enough signal they mean to talk over
+                                # the bot, so cancel outbound TTS.
                                 if active.is_speaking:
                                     log.info("voice: barge-in detected")
+                                    # Flag the source as the user (not an
+                                    # approval) so the outbound loop drops
+                                    # stale chitchat and records the cut-off.
+                                    active.barge_in_by_user = True
                                     active.barge_in.set()
                         else:
                             voiced_ms = 0
@@ -797,6 +859,16 @@ class CallService:
                             if len(utt_buf) > BYTES_PER_FRAME * 50:
                                 del utt_buf[:-BYTES_PER_FRAME * 50]
                     now = time.monotonic()
+                    # Reset the recurrent VAD's hidden state during silence so
+                    # drift can't accumulate across a long call (pipecat resets
+                    # every VAD_STATE_RESET_S). Only when idle — never mid-
+                    # utterance, where we want state continuity.
+                    if not speaking and now - last_vad_reset >= VAD_STATE_RESET_S:
+                        last_vad_reset = now
+                        try:
+                            self._vad.reset_states()
+                        except Exception:
+                            log.warning("voice: periodic VAD reset failed", exc_info=True)
                     if now - last_log_t > 5:
                         last_log_t = now
                         log.debug(
@@ -929,55 +1001,28 @@ class CallService:
     async def _play_pcm(
         self, active: _ActiveCall, pcm: bytes, *, label: str = "pcm",
     ) -> None:
-        """Send pre-rendered PCM out as 10 ms frames. Sets is_speaking,
-        respects barge_in, bumps last_activity_at. Shared between the
-        prewarm path and any other future direct-playback needs."""
+        """Send pre-rendered PCM out as 10 ms frames. Sets is_speaking, respects
+        barge_in. Used by the prewarm path, which bypasses the outbound queue."""
         active.barge_in.clear()
         active.is_speaking = True
-        active.last_activity_at = time.monotonic()
-        sent = 0
         try:
-            for i in range(0, len(pcm), BYTES_PER_FRAME):
-                if active.barge_in.is_set():
-                    log.info(
-                        "voice: %s barge-in after %d frames (%.0fms)",
-                        label, sent, sent * FRAME_MS,
-                    )
-                    return
-                if self._active is not active:
-                    return
-                chunk = pcm[i:i + BYTES_PER_FRAME]
-                if len(chunk) < BYTES_PER_FRAME:
-                    chunk += b"\x00" * (BYTES_PER_FRAME - len(chunk))
-                try:
-                    await asyncio.wait_for(
-                        active.call_py.send_frame(
-                            active.chat_id, self._Device.MICROPHONE, chunk,
-                        ),
-                        timeout=SEND_FRAME_TIMEOUT_S,
-                    )
-                    sent += 1
-                except asyncio.TimeoutError:
-                    log.warning(
-                        "voice: %s send_frame timed out at frame %d", label, sent,
-                    )
-                    return
-                except Exception:
-                    log.exception(
-                        "voice: %s send_frame failed at frame %d", label, sent,
-                    )
-                    return
-                await asyncio.sleep(FRAME_MS / 1000)
-            log.info(
-                "voice: %s playback complete (%d frames, %.0fms)",
-                label, sent, sent * FRAME_MS,
-            )
+            await self._emit_pcm_frames(active, pcm, label=label)
         finally:
             active.is_speaking = False
 
     async def _handle_utterance(self, active: _ActiveCall, pcm_bytes: bytes) -> None:
-        if len(pcm_bytes) < PCM_RATE * 2 * 0.2:  # <200ms ≈ noise
-            log.info("voice: dropping <200ms utterance")
+        # Snapshot + consume the cut-off state this utterance pairs with. The
+        # outbound loop set these when the user barged in; whether it was a
+        # real interruption or a cough is decided by what STT returns below.
+        remainder = active.interrupted_remainder
+        was_interrupted = active.was_interrupted
+        active.interrupted_remainder = None
+        active.was_interrupted = False
+
+        if len(pcm_bytes) < PCM_RATE * 2 * VAD_MIN_UTT_MS / 1000:  # noise floor
+            log.info("voice: dropping <%dms utterance", VAD_MIN_UTT_MS)
+            if remainder:
+                await self._resume_after_false_barge_in(active, remainder)
             return
         # Real speech resets the idle watchdog. (Frame-level audio doesn't
         # — Telegram sends frames continuously even when nobody speaks.)
@@ -986,10 +1031,24 @@ class CallService:
             text = await self._stt(pcm_bytes)
         except Exception:
             log.exception("voice: STT failed; dropping utterance")
+            # Don't strand the bot mid-sentence on a transient STT error —
+            # resume what it was saying rather than leaving dead air.
+            if remainder:
+                await self._resume_after_false_barge_in(active, remainder)
             return
         text = (text or "").strip()
         if not text:
-            log.info("voice: STT returned empty text")
+            # The user "barged in" but said nothing intelligible (a cough, a
+            # door, far-field noise). Treat it as a false interruption and
+            # pick the bot's reply back up instead of swallowing it. This is
+            # the slice of pipecat's min-words gate we can do without streaming
+            # STT: we can't count words *before* deciding to interrupt, but we
+            # can undo the interruption once STT comes back empty.
+            if remainder:
+                log.info("voice: barge-in transcribed to nothing; resuming")
+                await self._resume_after_false_barge_in(active, remainder)
+            else:
+                log.info("voice: STT returned empty text")
             return
         log.info("voice: STT -> %r", text[:120])
         # If an approval is pending and the user said yes/no, resolve via
@@ -997,9 +1056,21 @@ class CallService:
         # would react to the affirm/deny as if it were a new user request).
         if await self._try_resolve_approval(active, text):
             return
+        user_text = text
+        if was_interrupted:
+            # Tell the operator its prior reply was cut off in delivery — it
+            # can see the full text in chat history but not that the user
+            # only heard part of it aloud. Procedural, parenthetical phrasing
+            # so the memory extractor finds no user-preference to keep.
+            user_text = (
+                "(call note: the user spoke over you before you finished "
+                "saying your previous reply aloud, so they may not have heard "
+                "all of it — take that into account, and don't just repeat it "
+                "verbatim.)\n\n" + text
+            )
         try:
             result = await self._operator.chat_turn(
-                session_id=active.session_id, user_text=text,
+                session_id=active.session_id, user_text=user_text,
             )
         except Exception:
             log.exception("voice: operator.chat_turn failed")
@@ -1009,9 +1080,22 @@ class CallService:
         if ack:
             await self._enqueue_text(active, ack)
 
-    async def _enqueue_text(self, active: _ActiveCall, text: str) -> None:
+    async def _resume_after_false_barge_in(
+        self, active: _ActiveCall, remainder: str,
+    ) -> None:
+        """Re-queue the still-unspoken tail of a reply the user cut off but
+        then said nothing real, so the bot finishes its thought."""
+        if self._active is not active:
+            return
+        await self._enqueue_text(active, remainder)
+
+    async def _enqueue_text(
+        self, active: _ActiveCall, text: str, *, priority: int = _PRI_CHAT,
+    ) -> None:
+        seq = active.outbound_seq
+        active.outbound_seq += 1
         try:
-            active.outbound_text_queue.put_nowait(text)
+            active.outbound_queue.put_nowait((priority, seq, text))
         except asyncio.QueueFull:
             log.warning("voice: outbound queue full; dropping text")
 
@@ -1020,12 +1104,14 @@ class CallService:
     async def _outbound_loop(self, active: _ActiveCall) -> None:
         try:
             while True:
-                text = await active.outbound_text_queue.get()
+                _pri, _seq, text = await active.outbound_queue.get()
                 active.barge_in.clear()
+                active.barge_in_by_user = False
                 active.is_speaking = True
                 active.last_activity_at = time.monotonic()
+                remainder: str | None = None
                 try:
-                    await self._speak(active, text)
+                    remainder = await self._speak(active, text)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -1033,109 +1119,165 @@ class CallService:
                 finally:
                     active.is_speaking = False
                     active.in_flight_tts = None
+                if active.barge_in_by_user:
+                    # The user talked over us. Drop any stale chitchat still
+                    # queued behind this reply (but keep approvals), and hand
+                    # the cut-off state to the next utterance so it can resume
+                    # on a false alarm / tell the operator on a real one.
+                    active.barge_in_by_user = False
+                    self._drain_chitchat(active)
+                    active.was_interrupted = True
+                    active.interrupted_remainder = remainder
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("voice outbound loop crashed")
             raise
 
-    async def _speak(self, active: _ActiveCall, text: str) -> None:
-        """POST text to TTS, decode the Opus response, push PCM out as 10 ms
-        frames. Cancelled mid-stream by barge-in."""
-        log.info("voice: TTS speaking %d chars: %r", len(text), text[:80])
-        frame_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=200)
-        producer = asyncio.create_task(
-            self._tts_producer(text, frame_queue),
-            name="voice-tts-producer",
+    def _drain_chitchat(self, active: _ActiveCall) -> None:
+        dropped = _drain_chitchat_items(active.outbound_queue)
+        if dropped:
+            log.info("voice: dropped %d queued line(s) after user barge-in", dropped)
+
+    async def _speak(self, active: _ActiveCall, text: str) -> str | None:
+        """Synthesize `text` and play it as 10 ms frames, interruptible by
+        barge-in. TTS is pipelined sentence-by-sentence: the next chunk is
+        synthesized while the current one plays, so time-to-first-audio is one
+        short sentence's latency instead of the whole reply's. Returns the
+        still-unspoken remainder if a *user* barge-in cut it off (so the caller
+        can resume or hand it to the operator), else None."""
+        chunks = _split_for_tts(text)
+        if not chunks:
+            return None
+        log.info(
+            "voice: TTS speaking %d chars in %d chunk(s): %r",
+            len(text), len(chunks), text[:80],
         )
-        active.in_flight_tts = producer
-        sent_frames = 0
+        # Kick off the first chunk's synthesis; thereafter prefetch chunk i+1
+        # while chunk i plays.
+        synth_next = asyncio.create_task(
+            self._tts_to_pcm(chunks[0]), name="voice-tts-synth",
+        )
+        active.in_flight_tts = synth_next
         try:
-            while True:
-                get_task = asyncio.create_task(frame_queue.get())
-                barge_task = asyncio.create_task(active.barge_in.wait())
-                # Only enforce the idle watchdog AFTER playback has started.
-                # Before the first frame, we're waiting on the producer's
-                # TTS HTTP call (already bounded by HTTP_TIMEOUT=60s); a
-                # long TTS HTTP is normal for long text, not a bug.
-                wait_timeout = SPEAK_IDLE_TIMEOUT_S if sent_frames > 0 else None
-                done, pending = await asyncio.wait(
-                    {get_task, barge_task}, return_when=asyncio.FIRST_COMPLETED,
-                    timeout=wait_timeout,
+            for i, chunk in enumerate(chunks):
+                synth_cur = synth_next
+                if i + 1 < len(chunks):
+                    synth_next = asyncio.create_task(
+                        self._tts_to_pcm(chunks[i + 1]), name="voice-tts-synth",
+                    )
+                    active.in_flight_tts = synth_next
+                else:
+                    synth_next = None
+                pcm = await self._await_synth(active, synth_cur)
+                if pcm is _BARGE:
+                    return self._remainder(active, chunks, i)
+                if pcm is None:  # this chunk's synth failed; skip it
+                    continue
+                status = await self._emit_pcm_frames(
+                    active, pcm, label=f"tts[{i + 1}/{len(chunks)}]",
                 )
-                for t in pending:
-                    t.cancel()
-                if not done:
-                    log.warning(
-                        "voice: TTS speak idle watchdog tripped after %.1fs "
-                        "(sent %d frames); abandoning current utterance so "
-                        "queued items can play",
-                        SPEAK_IDLE_TIMEOUT_S, sent_frames,
-                    )
-                    producer.cancel()
-                    return
-                if barge_task in done:
-                    log.info("voice: barge-in after %d frames (%.0fms)",
-                             sent_frames, sent_frames * FRAME_MS)
-                    producer.cancel()
-                    return
-                frame = get_task.result()
-                if frame is None:
-                    log.info("voice: TTS playback complete, sent %d frames (%.0fms)",
-                             sent_frames, sent_frames * FRAME_MS)
-                    return
-                try:
-                    await asyncio.wait_for(
-                        active.call_py.send_frame(  # type: ignore[union-attr]
-                            active.chat_id, self._Device.MICROPHONE, frame,
-                        ),
-                        timeout=SEND_FRAME_TIMEOUT_S,
-                    )
-                    sent_frames += 1
-                except asyncio.TimeoutError:
-                    log.warning(
-                        "voice: send_frame timed out after %.1fs at frame %d; "
-                        "abandoning current utterance (ntgcalls back-pressure?)",
-                        SEND_FRAME_TIMEOUT_S, sent_frames,
-                    )
-                    producer.cancel()
-                    return
-                except Exception:
-                    log.exception("voice: send_frame failed at frame %d", sent_frames)
-                    producer.cancel()
-                    return
-                await asyncio.sleep(FRAME_MS / 1000)
+                if status == "barge":
+                    return self._remainder(active, chunks, i)
+                if status == "abort":
+                    return None
+            log.info("voice: TTS reply complete (%d chunk(s))", len(chunks))
+            return None
         finally:
-            if not producer.done():
-                producer.cancel()
+            if synth_next is not None and not synth_next.done():
+                synth_next.cancel()
                 try:
-                    await producer
+                    await synth_next
                 except (asyncio.CancelledError, Exception):
                     pass
 
-    async def _tts_producer(self, text: str, out: asyncio.Queue) -> None:
-        """POST TTS, decode Opus stream, push 10 ms PCM frames into `out`,
-        terminate with None."""
+    def _remainder(
+        self, active: _ActiveCall, chunks: list[str], i: int,
+    ) -> str | None:
+        """Unspoken tail (the interrupted chunk and everything after), but only
+        for a user barge-in — an approval interruption returns None so we don't
+        try to resume stale chitchat after the approval."""
+        if not active.barge_in_by_user:
+            return None
+        rest = [c for c in chunks[i:] if c]
+        return " ".join(rest) if rest else None
+
+    async def _await_synth(self, active: _ActiveCall, synth_task: asyncio.Task):
+        """Wait for one chunk's PCM, racing barge-in. Returns the PCM bytes,
+        None on synth failure, or the _BARGE sentinel if interrupted first."""
+        barge = asyncio.create_task(active.barge_in.wait())
         try:
-            opus_bytes = await self._tts_http(text)
-            log.info("voice: TTS HTTP returned %d opus bytes", len(opus_bytes))
-            pcm = self._opus_decode(opus_bytes)
-            log.info("voice: opus decoded to %d PCM bytes (%.0fms @ 48k mono)",
-                     len(pcm), len(pcm) / 2 / PCM_RATE * 1000)
-            for i in range(0, len(pcm), BYTES_PER_FRAME):
-                chunk = pcm[i:i + BYTES_PER_FRAME]
-                if len(chunk) < BYTES_PER_FRAME:
-                    chunk += b"\x00" * (BYTES_PER_FRAME - len(chunk))
-                await out.put(chunk)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("voice: TTS producer crashed")
-        finally:
+            done, _pending = await asyncio.wait(
+                {synth_task, barge}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if barge in done:
+                # Drain the synth task's result/exception if it also finished,
+                # so we don't leak an unretrieved-exception warning.
+                if synth_task.done() and not synth_task.cancelled():
+                    exc = synth_task.exception()
+                    if exc is not None:
+                        log.debug("voice: synth discarded after barge-in: %r", exc)
+                return _BARGE
             try:
-                out.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
+                return synth_task.result()
+            except Exception:
+                log.exception("voice: chunk TTS synth failed")
+                return None
+        finally:
+            if not synth_task.done():
+                synth_task.cancel()
+            if not barge.done():
+                barge.cancel()
+
+    async def _tts_to_pcm(self, text: str) -> bytes:
+        """Synthesize one text chunk to PCM16 @ 48 kHz."""
+        opus_bytes = await self._tts_http(text)
+        pcm = self._opus_decode(opus_bytes)
+        log.debug(
+            "voice: chunk synth %d chars -> %d opus -> %.0fms PCM",
+            len(text), len(opus_bytes), len(pcm) / 2 / PCM_RATE * 1000,
+        )
+        return pcm
+
+    async def _emit_pcm_frames(
+        self, active: _ActiveCall, pcm: bytes, *, label: str,
+    ) -> str:
+        """Send a PCM buffer out as 10 ms frames, polling barge-in each frame.
+        Returns 'done', 'barge' (interrupted), or 'abort' (send error / call
+        gone). Does NOT touch is_speaking / barge_in — the caller owns those."""
+        active.last_activity_at = time.monotonic()
+        sent = 0
+        for off in range(0, len(pcm), BYTES_PER_FRAME):
+            if active.barge_in.is_set():
+                log.info(
+                    "voice: %s barge-in after %d frames (%.0fms)",
+                    label, sent, sent * FRAME_MS,
+                )
+                return "barge"
+            if self._active is not active:
+                return "abort"
+            chunk = pcm[off:off + BYTES_PER_FRAME]
+            if len(chunk) < BYTES_PER_FRAME:
+                chunk += b"\x00" * (BYTES_PER_FRAME - len(chunk))
+            try:
+                await asyncio.wait_for(
+                    active.call_py.send_frame(  # type: ignore[union-attr]
+                        active.chat_id, self._Device.MICROPHONE, chunk,
+                    ),
+                    timeout=SEND_FRAME_TIMEOUT_S,
+                )
+                sent += 1
+            except asyncio.TimeoutError:
+                log.warning(
+                    "voice: %s send_frame timed out at frame %d "
+                    "(ntgcalls back-pressure?)", label, sent,
+                )
+                return "abort"
+            except Exception:
+                log.exception("voice: %s send_frame failed at frame %d", label, sent)
+                return "abort"
+            await asyncio.sleep(FRAME_MS / 1000)
+        return "done"
 
     # ---- chat.reply subscriber ----
 
@@ -1200,11 +1342,13 @@ class CallService:
                 prompt = await self._build_voice_approval_prompt(
                     canonical=canonical, blast=blast, phrase=phrase,
                 )
-                await self._enqueue_text(active, prompt)
-                # Approvals trump in-flight chitchat. Set barge_in so any
-                # current TTS cancels and the approval plays next. (The
-                # outbound loop clears barge_in at the start of each _speak,
-                # so the approval prompt itself plays normally.)
+                await self._enqueue_text(active, prompt, priority=_PRI_APPROVAL)
+                # Approvals trump in-flight chitchat. The _PRI_APPROVAL enqueue
+                # puts the prompt ahead of any queued chitchat; set barge_in so
+                # the *current* TTS also cancels and the approval plays next.
+                # We do NOT set barge_in_by_user here, so the outbound loop
+                # won't drain the queue or treat this as a user cut-off — the
+                # approval prompt itself plays normally.
                 if active.is_speaking:
                     active.barge_in.set()
                 _audit.info(
@@ -1542,6 +1686,61 @@ class CallService:
 
 
 # ---- module helpers ----
+
+# Sentence boundary: end punctuation (Latin or CJK/„…") followed by whitespace.
+# Requiring the trailing space avoids splitting decimals ("3.5") or abbrevs
+# that aren't sentence ends ("v.1").
+_SENT_BOUNDARY = re.compile(r"(?<=[.!?…。！？])\s+")
+
+
+def _split_for_tts(text: str, *, min_chars: int = 40) -> list[str]:
+    """Split a reply into sentence-ish chunks for pipelined TTS. Splits on
+    hard newlines and sentence-ending punctuation, then greedily merges
+    fragments shorter than min_chars so we don't fire a TTS round-trip per
+    "Ok." — the goal is a short *first* chunk for fast time-to-first-audio,
+    not maximal fragmentation. Always splits on a boundary, never mid-word, so
+    prosody stays natural. Returns [] for empty input."""
+    text = text.strip()
+    if not text:
+        return []
+    frags: list[str] = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        frags.extend(f.strip() for f in _SENT_BOUNDARY.split(line) if f.strip())
+    chunks: list[str] = []
+    buf = ""
+    for frag in frags:
+        buf = f"{buf} {frag}".strip() if buf else frag
+        if len(buf) >= min_chars:
+            chunks.append(buf)
+            buf = ""
+    if buf:
+        chunks.append(buf)
+    return chunks or [text]
+
+
+def _drain_chitchat_items(queue: "asyncio.PriorityQueue") -> int:
+    """Remove queued chitchat (_PRI_CHAT) from an outbound priority queue,
+    leaving safety-critical approvals (_PRI_APPROVAL) in place. Returns the
+    number of chitchat items dropped. Used on a user barge-in so the bot
+    doesn't resume talking over the user with now-stale lines."""
+    kept: list[tuple[int, int, str]] = []
+    dropped = 0
+    while not queue.empty():
+        try:
+            item = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        if item[0] == _PRI_APPROVAL:
+            kept.append(item)
+        else:
+            dropped += 1
+    for it in kept:
+        queue.put_nowait(it)
+    return dropped
+
 
 def _normalize_pcm(pcm: bytes, *, target_peak: float = 0.7) -> bytes:
     """Peak-normalize PCM16 mono so the loudest sample hits target_peak * INT16_MAX.
