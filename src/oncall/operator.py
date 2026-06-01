@@ -17,7 +17,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from uuid import UUID, uuid4
 
 from .audit import fmt, operator_log
@@ -617,6 +617,15 @@ class Operator:
         # Keyed by session_id; the session lock guarantees one in-flight
         # turn at a time per key, so writes here don't race.
         self._turn_saves: dict[str, list[str]] = {}
+        # Returns True if the given session is currently on a live voice call.
+        # Injected by the CallService at startup (None when voice is disabled →
+        # always "not on a call"). Drives the per-turn <call-status> line so the
+        # operator knows, this turn, whether its reply will be spoken aloud.
+        self._on_call_provider: Callable[[str], bool] | None = None
+
+    def set_on_call_provider(self, provider: Callable[[str], bool]) -> None:
+        """Register the CallService's live-call check. See _on_call_provider."""
+        self._on_call_provider = provider
 
     def _lock_for(self, session_id: str) -> asyncio.Lock:
         lock = self._session_locks.get(session_id)
@@ -965,6 +974,20 @@ class Operator:
         else:
             status_block = "<acting-status>idle</acting-status>"
         messages.append({"role": "user", "content": status_block})
+
+        # Call-status: same transient per-turn shape as acting-status. Tells the
+        # operator whether THIS reply will be spoken aloud on a live voice call,
+        # so it knows when voice-only expression tags are appropriate — and,
+        # crucially, that a text turn after a call has ended is NOT on a call
+        # (the owner's voice and text share one session, so a stale call-start
+        # note can linger in history). Not persisted — recomputed each turn.
+        on_call = bool(self._on_call_provider and self._on_call_provider(session_id))
+        call_block = (
+            "<call-status>on a voice call — your reply is spoken aloud</call-status>"
+            if on_call
+            else "<call-status>not on a call</call-status>"
+        )
+        messages.append({"role": "user", "content": call_block})
 
         tool_calls_made: list[dict[str, Any]] = []
         for _round in range(self._max_tool_rounds):
@@ -1616,7 +1639,7 @@ class Operator:
                 continue
             if content.startswith("[memory note:") or content.startswith(AUTO_PING_PREFIX):
                 continue
-            if content.startswith("<acting-status>"):
+            if content.startswith("<acting-status>") or content.startswith("<call-status>"):
                 continue
             if content == user_text:
                 # The latest user turn — printed as "user (now)" below.

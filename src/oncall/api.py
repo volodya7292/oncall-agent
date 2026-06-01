@@ -1137,6 +1137,7 @@ async def _maybe_start_voice_call(
             language=settings.operator_language,
             llm=llm,
             llm_model=settings.oncall_operator_model,
+            ambient_bed=settings.voice_ambient_bed,
         )
         await service.start()
         return service

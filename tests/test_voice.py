@@ -9,11 +9,41 @@ from __future__ import annotations
 
 import pytest
 
-from oncall.voice import to_voice_text
+from oncall.voice import strip_expression_tag_backticks, to_voice_text
 
 
 def test_empty_string():
     assert to_voice_text("") == ""
+
+
+# ---- strip_expression_tag_backticks ----
+# The operator (despite the prompt) keeps wrapping expression tags in markdown
+# backticks; the conversational voice path doesn't run to_voice_text, so this
+# guards the TTS chokepoint directly.
+
+def test_strip_backticks_both_sides():
+    assert strip_expression_tag_backticks("`[laughter]` ok") == "[laughter] ok"
+
+
+def test_strip_backticks_one_sided():
+    assert strip_expression_tag_backticks("ok [sigh]`") == "ok [sigh]"
+    assert strip_expression_tag_backticks("`[surprise-ah] wow") == "[surprise-ah] wow"
+
+
+def test_strip_multiple_tags_in_one_reply():
+    got = strip_expression_tag_backticks("сміюся `[laughter]`, зітхаю `[sigh]`")
+    assert got == "сміюся [laughter], зітхаю [sigh]"
+
+
+def test_bare_tags_untouched():
+    s = "[laughter] still works [dissatisfaction-hnn]"
+    assert strip_expression_tag_backticks(s) == s
+
+
+def test_unrelated_backticks_preserved():
+    # An inline-code span that isn't an expression tag must survive intact.
+    s = "run `ls -la` then [confirmation-en]"
+    assert strip_expression_tag_backticks(s) == "run `ls -la` then [confirmation-en]"
 
 
 def test_plain_text_unchanged():

@@ -14,6 +14,28 @@ from __future__ import annotations
 import re
 
 
+# Paralinguistic expression tags the TTS engine renders as sound (laughter,
+# sighs, interjections). The operator is told to write them bare, but it keeps
+# wrapping them in markdown backticks (`[laughter]`), which the engine then
+# fails to recognize — so we strip backticks hugging a known tag before synth.
+_EXPRESSION_TAG = (
+    r"laughter|sigh|confirmation-en"
+    r"|question-(?:en|ah|oh|ei|yi)"
+    r"|surprise-(?:ah|oh|wa|yo)"
+    r"|dissatisfaction-hnn"
+)
+_TAG_BACKTICK_RE = re.compile(r"`+(\[(?:" + _EXPRESSION_TAG + r")\])`*|(\[(?:" + _EXPRESSION_TAG + r")\])`+")
+
+
+def strip_expression_tag_backticks(text: str) -> str:
+    """Remove markdown backticks immediately wrapping an expression tag, so
+    `[laughter]` (or [laughter]`) becomes a bare [laughter] the TTS engine can
+    render. Leaves bare tags and unrelated backticks untouched."""
+    if "`" not in text:
+        return text
+    return _TAG_BACKTICK_RE.sub(lambda m: m.group(1) or m.group(2), text)
+
+
 # Triple-backtick fenced code blocks (multi-line). Collapsed to a short marker.
 _FENCED_CODE_RE = re.compile(r"```[\s\S]*?```")
 # Inline code: `foo` — keep the contents, drop the backticks.

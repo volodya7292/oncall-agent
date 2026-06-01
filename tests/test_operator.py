@@ -329,14 +329,37 @@ async def test_hand_off_with_empty_user_text_returns_error_to_model(stack):
 
 @pytest.mark.asyncio
 async def test_acting_status_injected_as_idle_when_no_work(stack):
-    """No previous hand_off → acting-status block reads idle."""
+    """No previous hand_off → acting-status block reads idle. With no
+    CallService wired (set_on_call_provider never called) the per-turn
+    call-status reads "not on a call"."""
     llm = ScriptedLLM(script=["hi"])
     operator = _make_operator(stack, llm)
     await operator.chat_turn(session_id="s1", user_text="hello")
 
-    last_msg = llm.calls_made[0]["messages"][-1]
-    assert last_msg["role"] == "user"
-    assert "<acting-status>idle</acting-status>" in last_msg["content"]
+    contents = [
+        m["content"] for m in llm.calls_made[0]["messages"]
+        if m["role"] == "user" and isinstance(m["content"], str)
+    ]
+    assert "<acting-status>idle</acting-status>" in contents
+    assert "<call-status>not on a call</call-status>" in contents
+
+
+async def test_call_status_reflects_active_call(stack):
+    """When the CallService reports the session is live, the per-turn
+    call-status flips to "on a voice call" — this is the signal the operator
+    gates voice-only expression tags on, and it's recomputed each turn (a
+    different session stays "not on a call")."""
+    llm = ScriptedLLM(script=["hi"])
+    operator = _make_operator(stack, llm)
+    operator.set_on_call_provider(lambda sid: sid == "live")
+
+    await operator.chat_turn(session_id="live", user_text="hey")
+    on = [m["content"] for m in llm.calls_made[0]["messages"] if m["role"] == "user"]
+    assert "<call-status>on a voice call — your reply is spoken aloud</call-status>" in on
+
+    await operator.chat_turn(session_id="other", user_text="hey")
+    off = [m["content"] for m in llm.calls_made[1]["messages"] if m["role"] == "user"]
+    assert "<call-status>not on a call</call-status>" in off
 
 
 # ---------------------------------------------------------------------------

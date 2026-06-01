@@ -268,6 +268,11 @@ class Settings(BaseSettings):
     voice_tts_api_key: str = ""
     voice_stt_base_url: str = ""           # e.g. https://example.com/v1
     voice_stt_api_key: str = ""
+    # Continuous low-level "office" ambience mixed under the call (keyboard
+    # foley + a brown-noise floor). Doubles as comfort noise: it keeps the
+    # WebRTC channel from going fully silent, which otherwise makes Telegram
+    # clip the edges of utterances. Kill-switch for a live call going wrong.
+    voice_ambient_bed: bool = True
 
     # Language the operator should respond in, and the STT language hint
     # during voice calls. ISO-639-1 (e.g. "uk", "en", "ru"). Empty = no
@@ -310,6 +315,8 @@ class Paths:
         self.settings_json = _PACKAGE_DIR / "executor" / "settings.json"
         self.executor_prompt = _PACKAGE_DIR / "prompts" / "executor_system.md"
         self.operator_prompt = _PACKAGE_DIR / "prompts" / "operator_system.md"
+        # Looped office-ambience bed mixed under voice calls (see Settings).
+        self.ambient_bed = _PACKAGE_DIR / "assets" / "office_bed.ogg"
 
 
 @lru_cache(maxsize=1)

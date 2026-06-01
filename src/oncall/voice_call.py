@@ -81,9 +81,11 @@ from uuid import UUID, uuid4
 
 from .approval_client import is_deny_phrase, phrases_match
 from .broker import Broker
+from .config import Paths
 from .events import EventBus
 from .operator import Operator
 from .telegram_agent import agent_session_id
+from .voice import strip_expression_tag_backticks
 
 log = logging.getLogger(__name__)
 
@@ -188,6 +190,10 @@ class _ActiveCall:
     in_flight_tts: asyncio.Task | None = None
     # Monotonic counter feeding the outbound priority-queue tuples.
     outbound_seq: int = 0
+    # Byte offset into the looped ambience bed PCM. Advanced continuously by
+    # whichever path is sending (the idle bed loop when quiet, _emit_pcm_frames
+    # when speaking), so the bed stays phase-continuous across the boundary.
+    bed_cursor: int = 0
     # Set the instant a user (not an approval) barge-in fires, so the
     # outbound loop knows to drop stale chitchat and remember the cut-off.
     barge_in_by_user: bool = False
@@ -229,6 +235,7 @@ class CallService:
         language: str = "",
         llm: Any = None,                   # operator's LLMClient for paraphrase
         llm_model: str = "",
+        ambient_bed: bool = True,          # mix the looped office bed under calls
     ) -> None:
         self._client = client
         # Owner's primary userbot client — used to PLACE outbound calls
@@ -270,10 +277,99 @@ class CallService:
         # this the event loop only holds a weak reference and Python GC
         # destroys the coroutine mid-flight (see asyncio.create_task docs).
         self._brief_tasks: set[asyncio.Task] = set()
+        # Looped office-ambience PCM (int16/48k/mono), decoded once in start().
+        # None when disabled or the asset fails to load → calls run bed-free.
+        self._ambient_bed_enabled = ambient_bed
+        self._bed_pcm: bytes | None = None
+        # Let the operator see, per turn, whether a session is on a live call.
+        self._operator.set_on_call_provider(self.is_on_call)
 
     @property
     def is_started(self) -> bool:
         return self._started
+
+    def is_on_call(self, session_id: str) -> bool:
+        """True if `session_id` is the session of the currently-active call.
+        Drives the operator's per-turn <call-status>. One call is active at a
+        time, so this is a single identity check against `_active`."""
+        active = self._active
+        return active is not None and active.session_id == session_id
+
+    # ---- ambient bed ----
+
+    def _load_ambient_bed(self) -> None:
+        """Decode the looped office-ambience asset to PCM16/48k/mono once, so
+        the per-frame mix path is a cheap slice. Any failure (disabled, missing
+        asset, decode error) just leaves the bed off — calls run unaffected."""
+        if not self._ambient_bed_enabled:
+            log.info("voice: ambient bed disabled")
+            return
+        path = Paths().ambient_bed
+        try:
+            pcm = self._opus_decode(path.read_bytes())
+        except Exception:
+            log.warning("voice: ambient bed asset unavailable (%s); running bed-free", path)
+            return
+        # Frame-align the length so wrap never splits a sample.
+        usable = (len(pcm) // BYTES_PER_FRAME) * BYTES_PER_FRAME
+        if usable <= 0:
+            log.warning("voice: ambient bed decoded empty; running bed-free")
+            return
+        self._bed_pcm = pcm[:usable]
+        log.info("voice: ambient bed loaded (%.1fs loop)", usable / 2 / PCM_RATE)
+
+    def _next_bed_frame(self, active: _ActiveCall) -> bytes:
+        """One BYTES_PER_FRAME slice of the bed, advancing (and wrapping) the
+        per-call cursor. The asset is frame-aligned, so a wrap stitches the
+        loop tail to the head — already crossfaded smooth in the asset."""
+        pcm = self._bed_pcm
+        assert pcm is not None
+        n = len(pcm)
+        start = active.bed_cursor % n
+        end = start + BYTES_PER_FRAME
+        if end <= n:
+            frame = pcm[start:end]
+        else:  # wrap across the (crossfaded) loop seam
+            frame = pcm[start:] + pcm[: end - n]
+        active.bed_cursor = end % n
+        return frame
+
+    async def _bed_loop(self, active: _ActiveCall) -> None:
+        """Fill the silence between utterances with the ambience bed so the
+        WebRTC channel never goes fully quiet (which makes Telegram clip
+        utterance edges). Sends ONLY while not speaking — _emit_pcm_frames mixes
+        the bed under speech itself — so the two never feed frames at once.
+        Deliberately does NOT touch last_activity_at: the idle watchdog must
+        still see the call as idle and time it out."""
+        if self._bed_pcm is None:
+            return
+        try:
+            while active.connected_at is None:
+                if self._active is not active:
+                    return
+                await asyncio.sleep(0.05)
+            while True:
+                if self._active is not active:
+                    return
+                if not active.is_speaking:
+                    frame = self._next_bed_frame(active)
+                    try:
+                        await asyncio.wait_for(
+                            active.call_py.send_frame(  # type: ignore[union-attr]
+                                active.chat_id, self._Device.MICROPHONE, frame,
+                            ),
+                            timeout=SEND_FRAME_TIMEOUT_S,
+                        )
+                    except asyncio.TimeoutError:
+                        log.warning("voice: bed send_frame timed out (back-pressure?)")
+                    except Exception:
+                        log.exception("voice: bed send_frame failed")
+                await asyncio.sleep(FRAME_MS / 1000)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("voice bed loop crashed")
+            raise
 
     @property
     def session_id(self) -> str:
@@ -310,6 +406,7 @@ class CallService:
         self._AudioParameters = AudioParameters
 
         self._vad = load_silero_vad()
+        self._load_ambient_bed()
 
         # --- Agent client: receives INBOUND owner calls. ---
         self._call_py = PyTgCalls(self._client)
@@ -506,6 +603,7 @@ class CallService:
             asyncio.create_task(
                 self._call_watchdog(active), name="voice-watchdog",
             ),
+            asyncio.create_task(self._bed_loop(active), name="voice-bed"),
         ]
         for t in active.tasks:
             t.add_done_callback(self._on_call_task_done)
@@ -1140,67 +1238,64 @@ class CallService:
             log.info("voice: dropped %d queued line(s) after user barge-in", dropped)
 
     async def _speak(self, active: _ActiveCall, text: str) -> str | None:
-        """Synthesize `text` and play it as 10 ms frames, interruptible by
-        barge-in. TTS is pipelined sentence-by-sentence: the next chunk is
-        synthesized while the current one plays, so time-to-first-audio is one
-        short sentence's latency instead of the whole reply's. Returns the
+        """Synthesize the *entire* reply in ONE TTS request and play it as a
+        single continuous PCM stream, interruptible by barge-in. Returns the
         still-unspoken remainder if a *user* barge-in cut it off (so the caller
-        can resume or hand it to the operator), else None."""
+        can resume or hand it to the operator), else None.
+
+        We used to synthesize sentence-by-sentence (pipelined) for faster
+        time-to-first-audio. But the provider wraps every request in ~200ms of
+        leading/trailing silence, so streaming chunks back-to-back injected
+        ~360ms of dead air at every sentence boundary, and the live jitter
+        buffer underran on each resume — sentences came out audibly torn apart.
+        One request = one seamless stream. We pay the whole reply's synth
+        latency up front; the prewarm path keeps the first line snappy."""
+        text = text.strip()
+        if not text:
+            return None
+        log.info(
+            "voice: TTS speaking %d chars (single request): %r", len(text), text[:80],
+        )
+        synth = asyncio.create_task(self._tts_to_pcm(text), name="voice-tts-synth")
+        active.in_flight_tts = synth
+        pcm = await self._await_synth(active, synth)
+        if pcm is _BARGE:
+            # Barged in during synthesis — nothing was heard, so the whole
+            # reply is still unspoken.
+            return text if active.barge_in_by_user else None
+        if pcm is None:  # synth failed (already logged in _await_synth)
+            return None
+        status, frames_sent = await self._emit_pcm_frames(active, pcm, label="tts")
+        if status == "barge":
+            return self._remainder(active, text, frames_sent, len(pcm))
+        log.info("voice: TTS reply complete (%d frames)", frames_sent)
+        return None
+
+    def _remainder(
+        self, active: _ActiveCall, text: str, frames_sent: int, total_bytes: int,
+    ) -> str | None:
+        """Estimate the still-unspoken tail after a *user* barge-in. An approval
+        interruption returns None so we don't resume stale chitchat after the
+        approval.
+
+        With single-request synth there are no per-sentence boundaries to index,
+        so we map the fraction of PCM that actually played to a character offset
+        and snap *back* to the start of the sentence we were cut off in — the
+        partially-heard sentence is repeated whole, never resumed mid-word."""
+        if not active.barge_in_by_user or total_bytes <= 0:
+            return None
         chunks = _split_for_tts(text)
         if not chunks:
             return None
-        log.info(
-            "voice: TTS speaking %d chars in %d chunk(s): %r",
-            len(text), len(chunks), text[:80],
-        )
-        # Kick off the first chunk's synthesis; thereafter prefetch chunk i+1
-        # while chunk i plays.
-        synth_next = asyncio.create_task(
-            self._tts_to_pcm(chunks[0]), name="voice-tts-synth",
-        )
-        active.in_flight_tts = synth_next
-        try:
-            for i, chunk in enumerate(chunks):
-                synth_cur = synth_next
-                if i + 1 < len(chunks):
-                    synth_next = asyncio.create_task(
-                        self._tts_to_pcm(chunks[i + 1]), name="voice-tts-synth",
-                    )
-                    active.in_flight_tts = synth_next
-                else:
-                    synth_next = None
-                pcm = await self._await_synth(active, synth_cur)
-                if pcm is _BARGE:
-                    return self._remainder(active, chunks, i)
-                if pcm is None:  # this chunk's synth failed; skip it
-                    continue
-                status = await self._emit_pcm_frames(
-                    active, pcm, label=f"tts[{i + 1}/{len(chunks)}]",
-                )
-                if status == "barge":
-                    return self._remainder(active, chunks, i)
-                if status == "abort":
-                    return None
-            log.info("voice: TTS reply complete (%d chunk(s))", len(chunks))
-            return None
-        finally:
-            if synth_next is not None and not synth_next.done():
-                synth_next.cancel()
-                try:
-                    await synth_next
-                except (asyncio.CancelledError, Exception):
-                    pass
-
-    def _remainder(
-        self, active: _ActiveCall, chunks: list[str], i: int,
-    ) -> str | None:
-        """Unspoken tail (the interrupted chunk and everything after), but only
-        for a user barge-in — an approval interruption returns None so we don't
-        try to resume stale chitchat after the approval."""
-        if not active.barge_in_by_user:
-            return None
-        rest = [c for c in chunks[i:] if c]
-        return " ".join(rest) if rest else None
+        played_frac = min(1.0, (frames_sent * BYTES_PER_FRAME) / total_bytes)
+        total_chars = sum(len(c) for c in chunks)
+        cut = played_frac * total_chars
+        pos = 0
+        for i, c in enumerate(chunks):
+            pos += len(c)
+            if cut < pos:  # playback stopped within sentence i
+                return " ".join(chunks[i:])
+        return None  # effectively all of it played
 
     async def _await_synth(self, active: _ActiveCall, synth_task: asyncio.Task):
         """Wait for one chunk's PCM, racing barge-in. Returns the PCM bytes,
@@ -1241,10 +1336,12 @@ class CallService:
 
     async def _emit_pcm_frames(
         self, active: _ActiveCall, pcm: bytes, *, label: str,
-    ) -> str:
+    ) -> tuple[str, int]:
         """Send a PCM buffer out as 10 ms frames, polling barge-in each frame.
-        Returns 'done', 'barge' (interrupted), or 'abort' (send error / call
-        gone). Does NOT touch is_speaking / barge_in — the caller owns those."""
+        Returns (status, frames_sent) where status is 'done', 'barge'
+        (interrupted), or 'abort' (send error / call gone). frames_sent lets the
+        caller map a barge-in back to a playback position. Does NOT touch
+        is_speaking / barge_in — the caller owns those."""
         active.last_activity_at = time.monotonic()
         sent = 0
         for off in range(0, len(pcm), BYTES_PER_FRAME):
@@ -1253,12 +1350,17 @@ class CallService:
                     "voice: %s barge-in after %d frames (%.0fms)",
                     label, sent, sent * FRAME_MS,
                 )
-                return "barge"
+                return "barge", sent
             if self._active is not active:
-                return "abort"
+                return "abort", sent
             chunk = pcm[off:off + BYTES_PER_FRAME]
             if len(chunk) < BYTES_PER_FRAME:
                 chunk += b"\x00" * (BYTES_PER_FRAME - len(chunk))
+            # Mix the ambience bed under the speech (saturating add). Advancing
+            # the same cursor the idle bed loop uses keeps the bed phase-
+            # continuous across the speak/idle boundary.
+            if self._bed_pcm is not None:
+                chunk = audioop.add(chunk, self._next_bed_frame(active), 2)
             try:
                 await asyncio.wait_for(
                     active.call_py.send_frame(  # type: ignore[union-attr]
@@ -1272,12 +1374,12 @@ class CallService:
                     "voice: %s send_frame timed out at frame %d "
                     "(ntgcalls back-pressure?)", label, sent,
                 )
-                return "abort"
+                return "abort", sent
             except Exception:
                 log.exception("voice: %s send_frame failed at frame %d", label, sent)
-                return "abort"
+                return "abort", sent
             await asyncio.sleep(FRAME_MS / 1000)
-        return "done"
+        return "done", sent
 
     # ---- chat.reply subscriber ----
 
@@ -1488,14 +1590,6 @@ class CallService:
         # Normalize each utterance so STT has actual signal to work with.
         pcm_bytes = _normalize_pcm(pcm_bytes, target_peak=0.7)
         ogg = _pcm_to_ogg_opus(pcm_bytes, sample_rate=PCM_RATE, channels=PCM_CHANNELS)
-        # Debug dump — lets us listen to what we actually send to STT, and
-        # inspect the raw PCM bytes to verify the layout coming from py-tgcalls.
-        try:
-            ts = int(time.time())
-            Path(f"/tmp/oncall_stt_{ts}.ogg").write_bytes(ogg)
-            Path(f"/tmp/oncall_stt_{ts}.pcm").write_bytes(pcm_bytes)
-        except Exception:
-            log.exception("debug stt dump failed")
         url = f"{self._stt_base_url}/v1/audio/transcriptions"
         data = {"model": "whisper-1"}
         if self._language:
@@ -1512,6 +1606,10 @@ class CallService:
         return payload.get("text", "") if isinstance(payload, dict) else ""
 
     async def _tts_http(self, text: str) -> bytes:
+        # Strip backticks the operator keeps wrapping expression tags in — every
+        # spoken byte flows through here, so this is the one chokepoint that
+        # covers conversational, prewarm, and pub/sub voice paths alike.
+        text = strip_expression_tag_backticks(text)
         url = f"{self._tts_base_url}/v1/audio/speech"
         body = {
             "model": "tts-1",
