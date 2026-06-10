@@ -87,7 +87,7 @@ _SLASH_HELP = (
     "/start — greeting\n"
     "/status — snapshot of running tasks, queue, approvals, pending DMs\n"
     "/context — export this session's chat history + latest summary as a markdown file\n"
-    "/clear — wipe this chat session's history (memory is preserved)\n"
+    "/clear — wipe this chat's history and reset the executor session (memory is preserved)\n"
     "/compress — force-compress older messages into a summary now\n"
     "/allowdm <chat_id> — allowlist a chat for autonomous DM replies (empty by default)\n"
     "/denydm <chat_id> — remove a chat from the DM allowlist\n"
@@ -464,9 +464,18 @@ class TelegramAgentService:
             return True
         if cmd == "/clear":
             out = await self._operator.clear_session(self._session_id)
+            if out.get("executor_session_reset"):
+                exec_note = " Executor session reset."
+            elif out.get("executor_reset_reason") == "busy":
+                exec_note = (
+                    " Executor session kept — a task is in flight; "
+                    "re-run /clear once it's idle to reset it."
+                )
+            else:
+                exec_note = ""
             await self._send(
                 f"Context cleared ({out['messages_deleted']} messages, "
-                f"{out['summaries_deleted']} summaries)."
+                f"{out['summaries_deleted']} summaries).{exec_note}"
             )
             telegram_log.info("agent clear " + fmt(
                 session=self._session_id, **out,

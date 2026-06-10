@@ -107,6 +107,24 @@ class Lifecycle:
             "current_task_id": str(self._current_task_id) if self._current_task_id else None,
         }
 
+    def reset_executor_session(self) -> dict[str, object]:
+        """Forget the shared `claude --resume` session so the next executor
+        run starts a fresh conversation. Refused while a task is running or
+        queued — yanking the session id out from under work-in-flight would
+        leave a queued follow-up unable to resume the context it expected.
+        Callers should report `reset=False` with `reason` to the user.
+
+        Idle case: deletes the session files and returns reset=True (forgot=
+        whether there was actually a session to forget)."""
+        busy = self._current_task_id is not None
+        depth = self._queue.qsize() if self._queue is not None else 0
+        if busy or depth:
+            return {"reset": False, "reason": "busy", "queue_depth": depth}
+        from .config import reset_executor_session as _reset_files
+        forgot = _reset_files()
+        log.info("executor session reset (forgot=%s)", forgot)
+        return {"reset": True, "forgot": forgot}
+
     async def recover(self) -> None:
         """On boot, re-enqueue any tasks left in {pending}, decide what to
         do with stale RUNNING/AWAITING_APPROVAL tasks (re-queue if they

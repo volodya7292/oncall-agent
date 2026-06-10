@@ -74,7 +74,16 @@ def settings(tmp_path):
 
 
 @pytest.fixture
-async def stack(settings):
+async def stack(settings, tmp_path, monkeypatch):
+    # Redirect the executor-session marker files (normally under ~/.oncall)
+    # into tmp_path so clear_session()'s executor reset can't touch — or
+    # delete — the developer's real session during a test run.
+    from oncall import config as _config
+    monkeypatch.setattr(_config, "EXECUTOR_SESSION_ID_FILE", tmp_path / "executor_session_id")
+    monkeypatch.setattr(
+        _config, "EXECUTOR_SESSION_INITIALIZED_FILE",
+        tmp_path / "executor_session_initialized",
+    )
     db = Database(settings.oncall_db_path)
     await db.connect()
     events = EventBus(db)
@@ -267,6 +276,43 @@ async def test_clear_session_on_empty_session_is_noop(stack):
     out = await operator.clear_session("never-existed")
     assert out["messages_deleted"] == 0
     assert out["summaries_deleted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_clear_session_resets_executor_when_idle(stack):
+    """/clear must also forget the shared executor session when no task is in
+    flight — the session-id file is deleted so the next spawn starts fresh."""
+    from oncall import config
+    # Simulate a previously-initialized executor session on disk.
+    config.get_global_executor_session_id()
+    config.mark_executor_session_initialized()
+    assert config.EXECUTOR_SESSION_ID_FILE.exists()
+
+    operator = _make_operator(stack, FakeRunner())
+    out = await operator.clear_session("s1")
+
+    assert out["executor_session_reset"] is True
+    assert not config.EXECUTOR_SESSION_ID_FILE.exists()
+    assert not config.EXECUTOR_SESSION_INITIALIZED_FILE.exists()
+
+
+@pytest.mark.asyncio
+async def test_clear_session_keeps_executor_when_busy(stack):
+    """A task in flight must NOT have its session yanked out from under it —
+    the reset is refused with reason 'busy' and the files stay put."""
+    from uuid import uuid4
+    from oncall import config
+    config.get_global_executor_session_id()
+    config.mark_executor_session_initialized()
+    # Mark the lifecycle worker as mid-task.
+    stack["lifecycle"]._current_task_id = uuid4()
+
+    operator = _make_operator(stack, FakeRunner())
+    out = await operator.clear_session("s1")
+
+    assert out["executor_session_reset"] is False
+    assert out["executor_reset_reason"] == "busy"
+    assert config.EXECUTOR_SESSION_ID_FILE.exists()
 
 
 # ---------------------------------------------------------------------------

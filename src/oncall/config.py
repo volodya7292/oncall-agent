@@ -51,9 +51,9 @@ def write_telegram_agent_user_id(user_id: int) -> None:
 
 # A single long-lived claude session is reused across every executor
 # invocation, so `claude --resume` accumulates context turn-to-turn.
-# Persisted once on first read; never rotated. The "initialized" marker
-# is created after the first successful spawn — subsequent spawns then
-# use `--resume` instead of `--session-id`.
+# Persisted once on first read; rotated only by reset_executor_session().
+# The "initialized" marker is created after the first successful spawn —
+# subsequent spawns then use `--resume` instead of `--session-id`.
 EXECUTOR_SESSION_ID_FILE = USER_CONFIG_DIR / "executor_session_id"
 EXECUTOR_SESSION_INITIALIZED_FILE = USER_CONFIG_DIR / "executor_session_initialized"
 
@@ -86,6 +86,28 @@ def _reset_session_initialized_marker() -> None:
         EXECUTOR_SESSION_INITIALIZED_FILE.unlink()
     except FileNotFoundError:
         pass
+
+
+def reset_executor_session() -> bool:
+    """Forget the global executor session so the next executor spawn starts
+    a brand-new `claude` conversation instead of `--resume`-ing the old one.
+
+    Deletes both the session-id file (so a fresh uuid is minted on next read)
+    and the initialized marker (so the next spawn uses --session-id, not
+    --resume). The id is read fresh at each spawn, so this is safe to call
+    while a task is running — the in-flight process keeps its already-captured
+    id; only the *next* spawn is affected.
+
+    Returns True if either file existed (i.e. there was a session to forget),
+    False if it was already pristine.
+    """
+    existed = EXECUTOR_SESSION_ID_FILE.exists() or EXECUTOR_SESSION_INITIALIZED_FILE.exists()
+    for f in (EXECUTOR_SESSION_ID_FILE, EXECUTOR_SESSION_INITIALIZED_FILE):
+        try:
+            f.unlink()
+        except FileNotFoundError:
+            pass
+    return existed
 
 
 def read_owner_name() -> str:

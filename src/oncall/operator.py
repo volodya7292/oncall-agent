@@ -1335,10 +1335,16 @@ class Operator:
 
     # ---- session reset / on-demand compression ----
 
-    async def clear_session(self, session_id: str) -> dict[str, int]:
+    async def clear_session(self, session_id: str) -> dict[str, object]:
         """Wipe a chat session's rolling history and any compression
-        checkpoints. The operator-memory store is NOT touched — it's
-        cross-session and out of scope for /clear.
+        checkpoints, AND forget the shared executor `claude` session so the
+        next hand_off starts a fresh conversation. The operator-memory store
+        is NOT touched — it's cross-session and out of scope for /clear.
+
+        The executor session is global (shared across chats), so its reset is
+        best-effort and refused while a task is in-flight (see
+        Lifecycle.reset_executor_session); `executor_session_reset` /
+        `executor_reset_reason` report the outcome.
 
         Held under the session lock so an in-flight chat_turn / auto_ping
         finishes first; otherwise the user could `/clear` mid-reply and
@@ -1350,14 +1356,18 @@ class Operator:
             # empty, so memories that were shown previously have to
             # be re-injected when they next become relevant.
             shown = await self._db.clear_session_memory_shown(session_id)
+        exec_reset = self._lifecycle.reset_executor_session()
         operator_log.info("session_clear " + fmt(
             chat=session_id, messages=messages, summaries=summaries,
-            memory_shown_cleared=shown,
+            memory_shown_cleared=shown, executor_reset=exec_reset.get("reset"),
+            executor_reset_reason=exec_reset.get("reason"),
         ))
         return {
             "messages_deleted": messages,
             "summaries_deleted": summaries,
             "memory_shown_cleared": shown,
+            "executor_session_reset": bool(exec_reset.get("reset")),
+            "executor_reset_reason": exec_reset.get("reason"),
         }
 
     async def export_context(self, session_id: str) -> str:
