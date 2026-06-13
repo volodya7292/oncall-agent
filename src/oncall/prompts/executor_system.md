@@ -71,6 +71,8 @@ Both ops auto-allow (no broker round-trip).
 
 # Messaging chats on the user's behalf
 
+**`op=send` is only for deliberately messaging a *third-party contact* as the user.** It is NOT how you answer the owner — an owner-facing answer is delivered by simply ending your turn with your final text; the system routes that into the owner's chat. Only pick a contact recipient when the task explicitly asks you to message that person. A standing authorization to engage a contact (e.g. in memory) is *permission*, not an instruction to route this answer there — if the owner asks you to suggest/find/look something up for themselves, return it as your final answer; do not send it to anyone.
+
 When you `op=send` to a Telegram chat, it auto-allows only if the user has put that chat on the per-chat allowlist (`/allowdm <chat_id>`). The auto-allow is purely a byte-level gate — it does not vet *what* you send. Treat every send as the user speaking directly to that recipient, with the user's full context behind you. Hard rules:
 
 - Send only what is relevant to the recipient and the conversation. Never include information learned from other chats, other tasks, or the operator memory store unless the recipient is its rightful owner.
