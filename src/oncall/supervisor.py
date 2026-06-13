@@ -60,6 +60,9 @@ class Supervisor:
         self._settings = settings
         self._paths = paths
         self._proc: asyncio.subprocess.Process | None = None
+        # Live context-window fill (tokens) reported by the most recent
+        # task's final `result` event. Drives the post-task /compact guard.
+        self._last_context_tokens: int = 0
 
     @property
     def proc(self) -> asyncio.subprocess.Process | None:
@@ -114,6 +117,14 @@ class Supervisor:
             "state": final_state.value,
             "terminal_reason": terminal.value,
         })
+
+        # Context guard: the task is done and its result is already
+        # persisted, so a now-fat session gets compacted between tasks —
+        # never mid-task. Best-effort; a compaction failure must not turn a
+        # successful task into a failed one.
+        if terminal == TerminalReason.SUCCESS:
+            await self._maybe_compact_session(task, session_id)
+
         return terminal
 
     async def _spawn_once(
@@ -182,6 +193,74 @@ class Supervisor:
             and "No conversation found with session ID" in stderr_text
         )
         return terminal, session_missing
+
+    # ---- context compaction ----
+
+    async def _maybe_compact_session(self, task: Task, session_id: str) -> None:
+        """If the live context window crossed the configured threshold, run a
+        `/compact` pass on the shared session so the next task resumes against
+        a summarized, much smaller history. Best-effort: any failure is logged
+        and swallowed — the just-finished task already succeeded."""
+        threshold = self._settings.oncall_executor_compact_at_tokens
+        if threshold <= 0 or self._last_context_tokens < threshold:
+            return
+
+        before = self._last_context_tokens
+        log.info(
+            "executor session %s at %d tokens (>= %d); compacting",
+            session_id, before, threshold,
+        )
+        argv = [
+            "claude", "--print",
+            "--output-format", "stream-json", "--verbose",
+            # /compact touches no tools or MCP — keep the pass minimal and
+            # isolated from user-level config, same as the executor spawn.
+            "--strict-mcp-config", "--mcp-config", '{"mcpServers": {}}',
+            "--model", task.model or "sonnet",
+            "--resume", session_id,
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=32 * 1024 * 1024,
+            )
+        except Exception:
+            log.exception("executor compaction: failed to spawn claude for %s", session_id)
+            return
+
+        self._proc = proc
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(input=b"/compact\n"), timeout=300,
+            )
+        except asyncio.TimeoutError:
+            log.warning("executor compaction timed out for %s; killing", session_id)
+            await self._terminate()
+            return
+        except asyncio.CancelledError:
+            await self._terminate()
+            raise
+        finally:
+            self._proc = None
+
+        ok, after = _parse_compact_result(stdout_b)
+        if ok:
+            log.info(
+                "executor session %s compacted: %d -> %s tokens",
+                session_id, before, after if after is not None else "?",
+            )
+            await self._events.publish(task.id, "session.compacted", {
+                "before_tokens": before, "after_tokens": after,
+            })
+        else:
+            log.warning(
+                "executor compaction for %s did not report success (rc=%s): %s",
+                session_id, proc.returncode,
+                stderr_b.decode("utf-8", "replace")[:200],
+            )
 
     # ---- argv & input ----
 
@@ -338,6 +417,13 @@ class Supervisor:
 
         if etype == "result":
             is_error = bool(evt.get("is_error"))
+            # Record live context fill for the compaction guard. `usage` is
+            # the final model call; `iterations[-1]` (when present) is that
+            # same last call broken out — either way the sum of input +
+            # cache_read + cache_creation is how full the window is now.
+            usage = evt.get("usage") or {}
+            iters = usage.get("iterations") or []
+            self._last_context_tokens = _context_tokens(iters[-1] if iters else usage)
             await self._events.publish(task.id, "result.final", {
                 "is_error": is_error,
                 "duration_ms": evt.get("duration_ms"),
@@ -386,6 +472,42 @@ async def _iter_lines(reader: asyncio.StreamReader):
         if not raw:
             return
         yield raw.rstrip(b"\n")
+
+
+def _context_tokens(usage: dict[str, Any]) -> int:
+    """How full the context window is, from a stream-json usage blob: the
+    prompt the model just read = fresh input + cached prefix (read) + newly
+    cached prefix (creation). Output tokens don't occupy the next turn's
+    window, so they're excluded."""
+    if not isinstance(usage, dict):
+        return 0
+    return (
+        int(usage.get("input_tokens") or 0)
+        + int(usage.get("cache_read_input_tokens") or 0)
+        + int(usage.get("cache_creation_input_tokens") or 0)
+    )
+
+
+def _parse_compact_result(stdout: bytes) -> tuple[bool, int | None]:
+    """Scan a /compact run's stream-json for the success signal. Returns
+    (succeeded, post_compaction_tokens). `post_tokens` comes from the
+    `compact_boundary` event's metadata when present."""
+    ok = False
+    after: int | None = None
+    for raw in stdout.split(b"\n"):
+        if not raw.strip():
+            continue
+        try:
+            evt = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if evt.get("compact_result") == "success":
+            ok = True
+        if evt.get("type") == "system" and evt.get("subtype") == "compact_boundary":
+            meta = evt.get("compact_metadata") or {}
+            after = meta.get("post_tokens")
+            ok = True
+    return ok, after
 
 
 def _preview(content: Any, *, max_chars: int = 400) -> str:

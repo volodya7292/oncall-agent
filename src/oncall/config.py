@@ -164,6 +164,13 @@ class Settings(BaseSettings):
     # result summary). Passed to `claude --model`. "sonnet" is the alias
     # that resolves to the latest Sonnet on the user's subscription.
     oncall_compression_model: str = "sonnet"
+    # Executor context guard. The single long-lived `claude` session
+    # accumulates context across every hand_off (see supervisor). When a
+    # task finishes with the live context window at or above this many
+    # tokens, the supervisor runs a `/compact` pass on the session before
+    # the next task resumes — keeping it well clear of the model's ceiling
+    # (e.g. Sonnet-1M) where quality and cost degrade. Set 0 to disable.
+    oncall_executor_compact_at_tokens: int = 200000
     oncall_db_path: Path = Field(default_factory=lambda: Path("~/.oncall/state.db").expanduser())
     oncall_prod_hosts: str = ""
 
