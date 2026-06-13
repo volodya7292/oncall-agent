@@ -88,7 +88,7 @@ _SLASH_HELP = (
     "/status — snapshot of running tasks, queue, approvals, pending DMs\n"
     "/context — export this session's chat history + latest summary as a markdown file\n"
     "/clear — wipe this chat's history and reset the executor session (memory is preserved)\n"
-    "/compress — force-compress older messages into a summary now\n"
+    "/compact — force-compact older messages into a summary now\n"
     "/allowdm <chat_id> — allowlist a chat for autonomous DM replies (empty by default)\n"
     "/denydm <chat_id> — remove a chat from the DM allowlist\n"
     "/dmlist — show allowlisted chats\n"
@@ -135,7 +135,7 @@ class TelegramAgentService:
         self._approval_task: asyncio.Task | None = None
         self._approval_resolved_task: asyncio.Task | None = None
         self._dispatch_approval_task: asyncio.Task | None = None
-        # Mutual-exclusion flag for /compress, /context — single-threaded
+        # Mutual-exclusion flag for /compact, /context — single-threaded
         # asyncio makes a plain attribute sufficient.
         self._heavy_op_in_flight: str | None = None
         # Cached at startup via get_me() so /help / logs can reference us.
@@ -481,19 +481,19 @@ class TelegramAgentService:
                 session=self._session_id, **out,
             ))
             return True
-        if cmd == "/compress":
-            if not await self._claim_heavy_op("/compress"):
+        if cmd == "/compact":
+            if not await self._claim_heavy_op("/compact"):
                 return True
             try:
                 out = await self._operator.compress_now(self._session_id)
                 if out.get("compressed"):
                     await self._send(
-                        f"Compressed {out['older_rows']} messages into "
+                        f"Compacted {out['older_rows']} messages into "
                         f"~{out['summary_tokens']} tokens of summary."
                     )
                 else:
-                    await self._send(f"Nothing to compress: {out.get('reason')}.")
-                telegram_log.info("agent compress " + fmt(
+                    await self._send(f"Nothing to compact: {out.get('reason')}.")
+                telegram_log.info("agent compact " + fmt(
                     session=self._session_id, **out,
                 ))
             finally:

@@ -152,7 +152,7 @@ CREATE TABLE IF NOT EXISTS memory_dedup_skip_pairs (
 -- dedup memory injection across turns so the system prompt + chat
 -- history prefix stays stable (KV cache hits) and the model doesn't
 -- re-read the same memory text every turn. Reset on /clear; survives
--- /compress (compressed history may have lost the verbatim memory text,
+-- /compact (compacted history may have lost the verbatim memory text,
 -- but the model has been shown the fact at least once).
 CREATE TABLE IF NOT EXISTS session_memory_shown (
     session_id TEXT NOT NULL,
