@@ -323,6 +323,44 @@ async def test_hand_off_with_empty_user_text_returns_error_to_model(stack):
     assert "error" in payload
 
 
+@pytest.mark.asyncio
+async def test_hand_off_injects_memory_context_into_executor_prompt(stack):
+    """Regression: every hand_off must prepend a `# Memory context` block of
+    relevant operator memories to the executor prompt.
+
+    The executor session is wiped by /clear (commit 92e363c) and compacted at
+    200K tokens, so durable behavioural rules — e.g. a per-recipient reply
+    prefix — can't live only in the session's accumulated history. Before this
+    fix the hand_off path forwarded dialogue + hint + user text but NO memory
+    (only the dispatch_task path injected it), so resetting the long-lived
+    executor session silently dropped such rules. The executor_system prompt
+    promises this block exists; this test pins that the promise holds."""
+    enqueued: list[dict[str, Any]] = []
+    original = stack["lifecycle"].enqueue_executor
+
+    async def spy(**kwargs):
+        enqueued.append(kwargs)
+        return await original(**kwargs)
+
+    stack["lifecycle"].enqueue_executor = spy  # type: ignore[method-assign]
+
+    rule = "When replying to others, prefix with 'сори, это агент'."
+    stack["memory"].set_retrieval("reply to Sergey", [
+        Memory(id=42, text=rule, score=0.7, cosine=0.7, last_accessed_at="x"),
+    ])
+
+    llm = ScriptedLLM(script=[[("hand_off", {})], "On it."])
+    operator = _make_operator(stack, llm)
+    await operator.chat_turn(session_id="s1", user_text="reply to Sergey")
+
+    forwarded = enqueued[0]["prompt"]
+    assert "# Memory context" in forwarded
+    assert rule in forwarded
+    # The user's verbatim message still rides at the tail under `# Task`.
+    assert "# Task" in forwarded
+    assert forwarded.rstrip().endswith("reply to Sergey")
+
+
 # ---------------------------------------------------------------------------
 # Acting-status injection
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ import asyncio
 from oncall.voice_call import (
     _PRI_APPROVAL,
     _PRI_CHAT,
+    _PRI_HANDOFF,
     _drain_chitchat_items,
     _split_for_tts,
 )
@@ -126,3 +127,30 @@ def test_drain_preserves_multiple_approvals_in_order():
     )
     assert dropped == 1
     assert survivors == ["approval one", "approval two"]
+
+
+def test_drain_keeps_handoff_result_drops_chitchat():
+    # A hand_off result is the answer to something the user asked for; a user
+    # barge-in over stale chitchat must NOT throw it away.
+    dropped, survivors = _drain(
+        [
+            (_PRI_CHAT, 0, "chit A"),
+            (_PRI_HANDOFF, 1, "HANDOFF RESULT"),
+            (_PRI_CHAT, 2, "chit B"),
+        ]
+    )
+    assert dropped == 2
+    assert survivors == ["HANDOFF RESULT"]
+
+
+def test_handoff_result_sorts_ahead_of_chitchat_behind_approval():
+    # Queue ordering: approval first (safety), then hand_off result (the
+    # answer), then ordinary chitchat — regardless of enqueue order.
+    async def run():
+        q: asyncio.PriorityQueue = asyncio.PriorityQueue()
+        q.put_nowait((_PRI_CHAT, 0, "chit"))
+        q.put_nowait((_PRI_HANDOFF, 1, "result"))
+        q.put_nowait((_PRI_APPROVAL, 2, "approval"))
+        return [(await q.get())[2] for _ in range(3)]
+
+    assert asyncio.run(run()) == ["approval", "result", "chit"]

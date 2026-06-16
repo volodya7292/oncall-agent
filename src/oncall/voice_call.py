@@ -83,6 +83,7 @@ from .approval_client import is_deny_phrase, phrases_match
 from .broker import Broker
 from .config import Paths
 from .events import EventBus
+from .models import TaskState
 from .operator import Operator
 from .telegram_agent import agent_session_id
 from .voice import strip_expression_tag_backticks
@@ -146,10 +147,18 @@ HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=60.0)
 SEND_FRAME_TIMEOUT_S = 1.0
 
 # Outbound-queue priorities (lower = spoken first). Approvals are
-# safety-critical and jump ahead of queued chitchat; a user barge-in drops
-# pending chitchat but never an approval. See _enqueue_text / _drain_chitchat.
+# safety-critical and jump ahead of everything; hand-off (executor) results
+# are the answer to something the user explicitly asked for, so they jump
+# ahead of ordinary chitchat too. A user barge-in drops pending chitchat but
+# never an approval or a hand-off result. See _enqueue_text / _drain_chitchat.
 _PRI_APPROVAL = 0
-_PRI_CHAT = 1
+_PRI_HANDOFF = 1
+_PRI_CHAT = 2
+
+# chat.reply triggers whose payloads should interrupt whatever the bot is
+# currently saying and play next — they carry the result of work the user
+# asked for, which is stale the moment it's delayed behind small talk.
+_INTERRUPTING_TRIGGERS = frozenset({"executor.done"})
 
 # Sentinel returned by _await_synth when barge-in wins the race against a
 # chunk's TTS synthesis.
@@ -185,6 +194,15 @@ class _ActiveCall:
     placed_at: float = 0.0
     connected_at: float | None = None
     last_activity_at: float = 0.0
+    # Drives the proactive-nudge clock: the monotonic time of the last
+    # conversational TURN boundary — bumped by real user speech AND by the bot
+    # finishing a spoken reply (so "12s of silence" is measured from whoever
+    # spoke last, not from the user alone; otherwise a long-delayed hand-off
+    # answer would land and immediately trip an "are you there?" nudge).
+    # nudges_since_user caps how many times we re-engage before a real USER
+    # turn arrives (only user speech resets it), so we never babble forever.
+    last_turn_at: float = 0.0
+    nudges_since_user: int = 0
     tasks: list[asyncio.Task] = field(default_factory=list)
     is_speaking: bool = False              # outbound is currently emitting TTS audio
     in_flight_tts: asyncio.Task | None = None
@@ -215,6 +233,14 @@ RING_TIMEOUT_S = 40.0       # outbound call dropped if not picked up by then
 IDLE_TIMEOUT_S = 90.0       # any call torn down after this much silence
 MAX_CALL_DURATION_S = 600.0  # hard cap on any single call (10 min)
 WATCHDOG_TICK_S = 5.0       # how often _call_watchdog re-checks
+# Proactive re-engagement: if the user goes quiet (no real speech) for this
+# long while the bot also has nothing queued to say, the operator is pinged so
+# it can check in / move things forward instead of sitting in dead air. Spaced
+# out as the silence grows and capped at MAX_NUDGES so a genuinely-done call
+# still falls through to IDLE_TIMEOUT_S teardown rather than being nudged
+# forever. NUDGE_AFTER_S must be < IDLE_TIMEOUT_S or teardown wins first.
+NUDGE_AFTER_S = 12.0
+MAX_NUDGES = 2
 
 
 class CallService:
@@ -575,6 +601,7 @@ class CallService:
             placed_at=now,
             connected_at=None if awaiting_pickup else now,
             last_activity_at=now,
+            last_turn_at=now,
             call_py=call_py,
         )
         self._active = active
@@ -650,6 +677,38 @@ class CallService:
                 # agent actively producing audio.
                 if active.is_speaking:
                     continue
+                # Proactive re-engagement before the hard idle teardown: if the
+                # line has gone quiet since the last spoken turn and we have
+                # nothing already queued/being synthesized to say, ping the
+                # operator so it can check in or carry the conversation forward.
+                # Capped at MAX_NUDGES per user turn so a call that's genuinely
+                # over still falls through to IDLE_TIMEOUT_S teardown.
+                quiet_for = now - active.last_turn_at
+                can_nudge = (
+                    active.outbound_queue.empty()
+                    and active.in_flight_tts is None
+                    # An outstanding approval is waiting on the user to speak a
+                    # challenge phrase — re-engaging mid-confirmation is noise.
+                    and not active.pending_approvals
+                    and active.nudges_since_user < MAX_NUDGES
+                    and quiet_for >= NUDGE_AFTER_S
+                )
+                # The hand-off check hits the DB, so only run it once the cheap
+                # gates already say we'd nudge. While a hand-off is in flight we
+                # stay silent: the user asked for something, we acked it, and
+                # the answer barges in the moment it lands — "still working on
+                # it" chatter in the gap is just noise.
+                if can_nudge and not await self._handoff_in_flight(active):
+                    # Increment before spawning so the next tick doesn't re-fire
+                    # while this turn is still running.
+                    active.nudges_since_user += 1
+                    log.info(
+                        "voice: quiet %.0fs in call with %s; proactive nudge #%d",
+                        quiet_for, active.callee_label, active.nudges_since_user,
+                    )
+                    asyncio.create_task(
+                        self._proactive_nudge(active), name="voice-nudge",
+                    )
                 idle = now - active.last_activity_at
                 if idle >= IDLE_TIMEOUT_S:
                     log.info(
@@ -859,6 +918,7 @@ class CallService:
         if active.connected_at is None:
             active.connected_at = time.monotonic()
             active.last_activity_at = active.connected_at
+            active.last_turn_at = active.connected_at
             log.info(
                 "voice: outbound call to %s connected after %.1fs",
                 active.callee_label, active.connected_at - active.placed_at,
@@ -1039,6 +1099,68 @@ class CallService:
         if text and self._active is active:
             await self._enqueue_text(active, text)
 
+    async def _proactive_nudge(self, active: _ActiveCall) -> None:
+        """The user has gone quiet mid-call. Ping the operator so it can
+        re-engage — check in, prompt for the next step, or wrap up — instead
+        of leaving dead air until the idle watchdog tears the call down.
+
+        Runs as its own task (the watchdog must keep ticking). The operator is
+        free to return nothing if there's genuinely nothing to say; we only
+        speak a non-empty reply. auto_ping serializes on the per-session lock,
+        so this can't race a real user turn into a double-reply."""
+        if self._active is not active:
+            return
+        note = self._nudge_note()
+        try:
+            result = await self._operator.auto_ping(
+                session_id=active.session_id, note=note,
+            )
+        except Exception:
+            log.exception("voice: proactive nudge auto_ping failed")
+            return
+        if self._active is not active:
+            return
+        text = (result.text or "").strip()
+        if text:
+            await self._enqueue_text(active, text)
+
+    async def _handoff_in_flight(self, active: _ActiveCall) -> bool:
+        """True if a hand_off dispatched from this call's session is still
+        pending / running / awaiting approval. Used to suppress proactive
+        nudges while we owe the user an answer that will arrive on its own.
+
+        On any DB error we return False (allow the nudge) — losing a nudge is
+        worse UX than a rare redundant one, and the error is logged."""
+        try:
+            tasks = await self._operator._db.list_tasks_in_states(
+                TaskState.PENDING, TaskState.RUNNING, TaskState.AWAITING_APPROVAL,
+            )
+        except Exception:
+            log.warning(
+                "voice: handoff-in-flight check failed; allowing nudge",
+                exc_info=True,
+            )
+            return False
+        return any(
+            t.dispatched_by_chat_session == active.session_id for t in tasks
+        )
+
+    def _nudge_note(self) -> str:
+        """Procedural system note for a proactive re-engagement turn. Tells the
+        operator the line has gone quiet and to either move the conversation
+        forward or stay silent — never to invent new work just to fill air."""
+        return (
+            "the user has gone quiet on the voice call for a few seconds and "
+            "nobody is speaking. if you're waiting on them, gently check in or "
+            "nudge the conversation forward (re-ask your open question, offer "
+            "the next step, or confirm whether they're still there). keep it to "
+            "one short spoken sentence. if there is genuinely nothing useful to "
+            "say, reply with nothing at all rather than filling the air — do "
+            "NOT start new work or place new calls just to break the silence. "
+            "your reply will be spoken aloud by TTS. this note is procedural — "
+            "do not save anything to memory based on it."
+        )
+
     async def _prewarm_and_play_first(self, active: _ActiveCall) -> None:
         """Outbound path: kick off the operator turn AND TTS synthesis
         immediately (during the ring), then wait POST_PICKUP_DELAY_S
@@ -1123,8 +1245,12 @@ class CallService:
                 await self._resume_after_false_barge_in(active, remainder)
             return
         # Real speech resets the idle watchdog. (Frame-level audio doesn't
-        # — Telegram sends frames continuously even when nobody speaks.)
+        # — Telegram sends frames continuously even when nobody speaks.) It
+        # also opens a fresh nudge window and clears the accrued nudge budget:
+        # the user is back, so we're allowed to re-engage again later.
         active.last_activity_at = time.monotonic()
+        active.last_turn_at = active.last_activity_at
+        active.nudges_since_user = 0
         try:
             text = await self._stt(pcm_bytes)
         except Exception:
@@ -1217,6 +1343,9 @@ class CallService:
                 finally:
                     active.is_speaking = False
                     active.in_flight_tts = None
+                    # The bot just took a turn — restart the nudge clock so we
+                    # wait a fresh interval for the user before re-engaging.
+                    active.last_turn_at = time.monotonic()
                 if active.barge_in_by_user:
                     # The user talked over us. Drop any stale chitchat still
                     # queued behind this reply (but keep approvals), and hand
@@ -1400,7 +1529,18 @@ class CallService:
                 text = (payload.get("voice_text") or payload.get("text") or "").strip()
                 if not text or text.startswith("SYSTEM:"):
                     continue
-                await self._enqueue_text(active, text)
+                # A hand_off result is the answer to something the user asked
+                # for out loud — it must not wait behind whatever small talk is
+                # currently playing. Enqueue it ahead of chitchat and cut off
+                # the in-flight reply so it plays now. We do NOT set
+                # barge_in_by_user, so the outbound loop won't treat this as a
+                # user cut-off (no queue drain, no "you interrupted me" note).
+                if payload.get("trigger") in _INTERRUPTING_TRIGGERS:
+                    await self._enqueue_text(active, text, priority=_PRI_HANDOFF)
+                    if active.is_speaking:
+                        active.barge_in.set()
+                else:
+                    await self._enqueue_text(active, text)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1821,9 +1961,10 @@ def _split_for_tts(text: str, *, min_chars: int = 40) -> list[str]:
 
 def _drain_chitchat_items(queue: "asyncio.PriorityQueue") -> int:
     """Remove queued chitchat (_PRI_CHAT) from an outbound priority queue,
-    leaving safety-critical approvals (_PRI_APPROVAL) in place. Returns the
-    number of chitchat items dropped. Used on a user barge-in so the bot
-    doesn't resume talking over the user with now-stale lines."""
+    leaving safety-critical approvals (_PRI_APPROVAL) and hand-off results
+    (_PRI_HANDOFF) in place. Returns the number of chitchat items dropped.
+    Used on a user barge-in so the bot doesn't resume talking over the user
+    with now-stale lines — but the answer to what they asked for survives."""
     kept: list[tuple[int, int, str]] = []
     dropped = 0
     while not queue.empty():
@@ -1831,7 +1972,7 @@ def _drain_chitchat_items(queue: "asyncio.PriorityQueue") -> int:
             item = queue.get_nowait()
         except asyncio.QueueEmpty:
             break
-        if item[0] == _PRI_APPROVAL:
+        if item[0] in (_PRI_APPROVAL, _PRI_HANDOFF):
             kept.append(item)
         else:
             dropped += 1

@@ -1707,6 +1707,20 @@ class Operator:
             forwarded, new_cursor = await self._compose_handoff_prompt(
                 chat_session_id=chat_session_id, user_text=text, hint=hint,
             )
+            # Inject memory context fresh on EVERY hand_off. The executor
+            # session is reset by /clear and compacted at 200K tokens, so we
+            # can't rely on it having internalised durable rules (e.g. a
+            # per-recipient reply prefix) — they must ride in on each task.
+            # This is also the `# Memory context` block the executor system
+            # prompt promises; without it that promise is false for hand_off.
+            try:
+                hits = await self._memory.retrieve(text, limit=10)
+            except Exception:
+                log.exception(
+                    "hand_off: memory retrieve failed for chat %s", chat_session_id,
+                )
+                hits = []
+            forwarded = _inject_memory_context(forwarded, hits)
             try:
                 outcome = await self._lifecycle.enqueue_executor(
                     prompt=forwarded, chat_session_id=chat_session_id,
