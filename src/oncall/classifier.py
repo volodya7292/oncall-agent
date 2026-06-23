@@ -135,6 +135,8 @@ def classify(tool_name: str, tool_input: dict[str, Any]) -> Verdict:
             canonical=f"{tool_name}({target!r})",
             blast_radius=f"Read-only web access via {tool_name}.",
         )
+    if tool_name == "mcp__oncall__laptop":
+        return _classify_laptop(tool_input)
     if tool_name == "mcp__oncall__messenger_inbox":
         return _classify_messenger(tool_input)
     if tool_name == "mcp__oncall__memory":
@@ -821,6 +823,46 @@ def enrich_canonical_with_chat_label(
         rf"\b{re.escape(chat_id)}\b",
         f"{label} ({chat_id})",
         canonical,
+    )
+
+
+def _classify_laptop(tool_input: dict[str, Any]) -> Verdict:
+    """Laptop proxy tool (cloud-primary mode). The job runs on the user's
+    laptop, but the blast radius is identical to running it locally — so we
+    reuse the exact same rules:
+
+      * op=bash       → full Bash analysis (readonly / mutating / catastrophic).
+                        Catastrophic still auto-denies, AND the worker keeps a
+                        deny-list backstop, so two layers protect the laptop.
+      * op=read_file/glob/grep → read-only.
+      * op=write_file → mutating (mirrors the native Write tool).
+    """
+    op = str(tool_input.get("op", ""))
+    if op == "bash":
+        # Delegate to the Bash classifier, then re-label the canonical so the
+        # approval card makes clear this runs on the laptop, not the server.
+        v = _classify_bash(str(tool_input.get("command", "")))
+        return v.model_copy(update={"canonical": f"laptop$ {v.canonical}"})
+    if op in ("read_file", "glob", "grep"):
+        target = str(tool_input.get("path") or tool_input.get("pattern") or "")
+        return Verdict(
+            kind=ClassifierVerdict.READONLY,
+            canonical=f"laptop.{op}({target})",
+            blast_radius=f"Read-only laptop {op}.",
+        )
+    if op == "write_file":
+        target = str(tool_input.get("path", ""))
+        return Verdict(
+            kind=ClassifierVerdict.MUTATING,
+            canonical=f"laptop.write_file({target})" if target else "laptop.write_file",
+            blast_radius=f"Writes to file '{target}' on the user's laptop." if target
+                         else "Writes a file on the user's laptop.",
+        )
+    return Verdict(
+        kind=ClassifierVerdict.MUTATING,
+        canonical=f"laptop.{op}",
+        blast_radius=f"Unknown laptop op '{op}'.",
+        reason="unknown_op",
     )
 
 

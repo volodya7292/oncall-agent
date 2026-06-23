@@ -35,6 +35,7 @@ from .config import get_paths, get_settings
 from .db import Database
 from .embeddings import OllamaEmbeddingClient
 from .events import EventBus
+from .laptop_bridge import LaptopBridge
 from .lifecycle import Lifecycle
 from .local_claude import ClaudeCliRunner
 from .operator import GatewayLLMClient, GenAILLMClient, Operator
@@ -148,6 +149,21 @@ class MessengerOpBody(BaseModel):
     session_id: str | None = None
 
 
+class LaptopDispatchBody(BaseModel):
+    # Calling executor's session id (forwarded by the MCP proxy). Logged for
+    # audit; the action was already gated by the broker before this call.
+    session_id: str | None = None
+    op: str
+    input: dict[str, Any] = {}
+
+
+class LaptopResultBody(BaseModel):
+    # The worker's result for a claimed job. Opaque shape per op
+    # (e.g. {stdout, stderr, exit_code} for bash) — forwarded verbatim to
+    # the blocked executor dispatch.
+    result: dict[str, Any]
+
+
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
@@ -166,6 +182,16 @@ def verify_loopback(request: Request, x_oncall_token: str = Header(default="")) 
         raise HTTPException(status.HTTP_403_FORBIDDEN, f"loopback-only endpoint (got {host})")
 
 
+def verify_laptop_token(x_oncall_laptop_token: str = Header(default="")) -> None:
+    """Auth for the PUBLIC laptop long-poll routes (/laptop/*). Uses a
+    dedicated secret (oncall_laptop_token), NOT oncall_token, so the laptop
+    worker never holds the credential that guards the admin/loopback surface.
+    An unset secret fail-closes (rejects everything)."""
+    expected = get_settings().oncall_laptop_token
+    if not expected or x_oncall_laptop_token != expected:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid X-Oncall-Laptop-Token")
+
+
 # ---------------------------------------------------------------------------
 # App factory + lifespan
 # ---------------------------------------------------------------------------
@@ -177,6 +203,14 @@ def create_app() -> FastAPI:
     db = Database(settings.oncall_db_path)
     events = EventBus(db)
     approval_client = HttpLongPollApprovalClient()
+    # Server-side rendezvous for laptop-worker jobs (cloud-primary mode).
+    # Harmless in legacy all-local mode: no worker ever polls it, and the
+    # public /laptop/* routes fail closed without oncall_laptop_token.
+    laptop_bridge = LaptopBridge(
+        presence_window_s=settings.oncall_laptop_presence_window_seconds,
+        poll_timeout_s=settings.oncall_laptop_poll_timeout_seconds,
+        job_timeout_s=settings.oncall_laptop_job_timeout_seconds,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -347,8 +381,13 @@ def create_app() -> FastAPI:
         app.state.events = events
         app.state.approval_client = approval_client
         app.state.broker = broker
+        app.state.laptop_bridge = laptop_bridge
         app.state.lifecycle = lifecycle
         app.state.operator = operator
+        # Cloud-primary mode: let the operator see laptop presence each turn so
+        # it can decline local-data requests up front when the laptop's offline.
+        if operator is not None and settings.is_server_role:
+            operator.set_laptop_status_provider(laptop_bridge.is_online)
         app.state.memory = memory
         app.state.telegram = telegram
         app.state.telegram_agent = telegram_agent
@@ -1356,6 +1395,36 @@ def _register_routes(app: FastAPI) -> None:
             tool_input=body.tool_input,
         )
         return result.to_cli_payload()
+
+    # ---- Laptop bridge (cloud-primary mode) ----
+    # /internal/laptop/dispatch is loopback-only (called by the MCP proxy
+    # AFTER the broker has gated the action). /laptop/* are PUBLIC routes the
+    # laptop worker reaches over outbound HTTPS, guarded by the dedicated
+    # laptop token. They are the only externally-reachable surface.
+
+    @app.post("/internal/laptop/dispatch", dependencies=[Depends(verify_loopback)])
+    async def laptop_dispatch(body: LaptopDispatchBody, request: Request) -> dict[str, Any]:
+        bridge: LaptopBridge = request.app.state.laptop_bridge
+        return await bridge.dispatch(body.op, body.input)
+
+    @app.get("/laptop/jobs", dependencies=[Depends(verify_laptop_token)])
+    async def laptop_jobs(request: Request) -> dict[str, Any]:
+        """Long-poll for the next local job. Returns {"job": {...}} or
+        {"job": null} when the wait elapses with nothing queued (the worker
+        immediately re-polls). Every call refreshes laptop presence."""
+        bridge: LaptopBridge = request.app.state.laptop_bridge
+        job = await bridge.next_job()
+        return {"job": job}
+
+    @app.post("/laptop/jobs/{job_id}/result", dependencies=[Depends(verify_laptop_token)])
+    async def laptop_job_result(
+        job_id: str, body: LaptopResultBody, request: Request,
+    ) -> dict[str, Any]:
+        bridge: LaptopBridge = request.app.state.laptop_bridge
+        accepted = bridge.submit_result(job_id, body.result)
+        # accepted=False means the job already timed out / is unknown — not an
+        # error the worker can fix, so 200 with a flag rather than 4xx.
+        return {"accepted": accepted}
 
     @app.post("/internal/messenger", dependencies=[Depends(verify_loopback)])
     async def messenger_op(body: MessengerOpBody, request: Request) -> dict[str, Any]:

@@ -279,6 +279,9 @@ class Supervisor:
                         "ONCALL_PORT": str(self._settings.oncall_port),
                         "ONCALL_TOKEN": self._settings.oncall_token,
                         "ONCALL_SESSION_ID": task.session_id,
+                        # Gates whether the MCP server advertises the `laptop`
+                        # proxy tool (cloud-primary mode only).
+                        "ONCALL_ROLE": self._settings.oncall_role,
                     },
                 }
             }
@@ -306,6 +309,17 @@ class Supervisor:
             # the moment the subprocess exited, so the next spawn would
             # fail with "No conversation found".
         ]
+        # Cloud-primary mode: this process runs on a VPS with no useful local
+        # filesystem. Deny the executor's native local tools so it can't
+        # silently operate on the server box — all local work must go through
+        # the `mcp__oncall__laptop` proxy, which runs on the user's laptop.
+        # WebFetch/WebSearch (allowlisted in settings.json) and the MCP tools
+        # stay available.
+        if self._settings.is_server_role:
+            argv += [
+                "--disallowedTools",
+                "Bash,Read,Edit,Write,MultiEdit,NotebookEdit,Glob,Grep",
+            ]
         argv += ["--model", task.model or "sonnet"]
         if task.max_turns:
             # claude uses --max-turns or similar — we keep it generic; if not
@@ -329,6 +343,23 @@ class Supervisor:
         text = self._paths.executor_prompt.read_text(encoding="utf-8")
         now = format_local_now(self._settings.operator_timezone)
         text = text.replace("{{current_date}}", now)
+        if self._settings.is_server_role:
+            text += (
+                "\n\n# Execution environment (cloud)\n\n"
+                "You are running on a cloud server, NOT the user's machine. You "
+                "have NO local filesystem, shell, or access to the user's files "
+                "of your own — your native Bash/Read/Edit/Write/Glob/Grep tools "
+                "are disabled here.\n\n"
+                "- For web research and reasoning, use WebSearch / WebFetch "
+                "directly.\n"
+                "- For ANYTHING on the user's machine (their files, repos, local "
+                "commands), use the `mcp__oncall__laptop` tool. It executes on "
+                "the user's laptop and ONLY works while the laptop is online.\n"
+                "- If a laptop call returns `{\"error\":\"laptop_offline\"}` or "
+                "`{\"error\":\"laptop_timeout\"}`, the laptop is unreachable. "
+                "State this plainly and stop — do NOT retry in a loop or invent "
+                "a result. The work can be redone when the laptop is back."
+            )
         lang = self._settings.operator_language
         if lang:
             text += (

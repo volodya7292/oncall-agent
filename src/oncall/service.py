@@ -1,13 +1,20 @@
-"""Install `oncall api` as a macOS LaunchAgent.
+"""Install oncall processes as macOS LaunchAgents.
 
 LaunchAgents run as the logged-in user (not root), start at login, and are
-restarted by launchd if they crash. That's the right model here — the
-orchestrator needs the user's keychain (for `claude` OAuth) and writes into
-the user's `~/.oncall/` directory.
+restarted by launchd if they crash. That's the right model here — both
+processes need the user's keychain (for `claude` OAuth) and write into the
+user's `~/.oncall/` directory.
 
-The plist just invokes `oncall api`; nothing about the api process changes
-when launched this way. Manual `oncall api` still works for foreground
-testing — just `oncall service stop` first so port 8765 is free.
+Two services, selected by `--worker`:
+
+  * agent  (com.oncall.agent)  → `oncall api`           — the orchestrator.
+  * worker (com.oncall.worker) → `oncall laptop-worker` — the laptop-side
+        capability worker for cloud-primary deployments. Install this on the
+        laptop so it long-polls the server and auto-restarts across reboots,
+        crashes, and (re)login.
+
+Manual `oncall api` / `oncall laptop-worker` still work for foreground
+testing — just `oncall service stop [--worker]` first.
 
 Linux/systemd-user support: TODO.
 """
@@ -19,19 +26,47 @@ import plistlib
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 
-LABEL = "com.oncall.agent"
-PLIST_PATH = Path("~/Library/LaunchAgents").expanduser() / f"{LABEL}.plist"
 LOG_DIR = Path("~/.oncall/logs").expanduser()
-STDOUT_LOG = LOG_DIR / "oncall.out.log"
-STDERR_LOG = LOG_DIR / "oncall.err.log"
 
 
-def _domain_target() -> str:
+@dataclass(frozen=True)
+class ServiceSpec:
+    """One installable LaunchAgent: its label, the `oncall` subcommand it
+    runs, and where its logs go."""
+    label: str
+    args: list[str]
+    stdout: Path
+    stderr: Path
+    desc: str
+
+
+AGENT = ServiceSpec(
+    label="com.oncall.agent",
+    args=["api"],
+    stdout=LOG_DIR / "oncall.out.log",
+    stderr=LOG_DIR / "oncall.err.log",
+    desc="orchestrator API",
+)
+WORKER = ServiceSpec(
+    label="com.oncall.worker",
+    args=["laptop-worker"],
+    stdout=LOG_DIR / "worker.out.log",
+    stderr=LOG_DIR / "worker.err.log",
+    desc="laptop capability worker",
+)
+
+
+def _plist_path(spec: ServiceSpec) -> Path:
+    return Path("~/Library/LaunchAgents").expanduser() / f"{spec.label}.plist"
+
+
+def _domain_target(spec: ServiceSpec) -> str:
     """Modern launchctl service target: gui/<uid>/<label>."""
-    return f"gui/{os.getuid()}/{LABEL}"
+    return f"gui/{os.getuid()}/{spec.label}"
 
 
 def _domain() -> str:
@@ -66,18 +101,18 @@ def _find_oncall_binary() -> Path:
     sys.exit(2)
 
 
-def _build_plist(binary: Path, extra_path: str) -> dict:
+def _build_plist(spec: ServiceSpec, binary: Path, extra_path: str) -> dict:
     """Build the LaunchAgent plist dictionary.
 
     `extra_path` is prepended to the PATH the agent sees, so the executor
     subprocess (which inherits this env) can find `claude`."""
     return {
-        "Label": LABEL,
-        "ProgramArguments": [str(binary), "api"],
+        "Label": spec.label,
+        "ProgramArguments": [str(binary), *spec.args],
         "RunAtLoad": True,
         "KeepAlive": True,
-        "StandardOutPath": str(STDOUT_LOG),
-        "StandardErrorPath": str(STDERR_LOG),
+        "StandardOutPath": str(spec.stdout),
+        "StandardErrorPath": str(spec.stderr),
         "WorkingDirectory": str(Path("~/.oncall").expanduser()),
         "EnvironmentVariables": {
             # Keep PATH explicit so `claude` (and friends) resolve at runtime.
@@ -101,57 +136,62 @@ def _launchctl(*args: str, check: bool = False, capture: bool = False) -> subpro
     )
 
 
-def _is_loaded() -> bool:
+def _is_loaded(spec: ServiceSpec) -> bool:
     """True if the LaunchAgent is currently registered with launchd."""
-    r = _launchctl("print", _domain_target(), capture=True)
+    r = _launchctl("print", _domain_target(spec), capture=True)
     return r.returncode == 0
 
 
-def install() -> None:
+def install(spec: ServiceSpec = AGENT) -> None:
     _check_macos()
     binary = _find_oncall_binary()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    plist_path = _plist_path(spec)
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Inherit the user's current PATH for `claude` discovery.
     current_path = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
-    plist = _build_plist(binary, current_path)
-    with open(PLIST_PATH, "wb") as f:
+    plist = _build_plist(spec, binary, current_path)
+    with open(plist_path, "wb") as f:
         plistlib.dump(plist, f)
-    PLIST_PATH.chmod(0o644)
-    print(f"Wrote {PLIST_PATH}")
+    plist_path.chmod(0o644)
+    print(f"Wrote {plist_path}")
 
     # If already loaded, replace cleanly. Swallow output — bootout prints
     # "No such process" when nothing was loaded, which is harmless noise.
-    _launchctl("bootout", _domain_target(), capture=True)
-    r = _launchctl("bootstrap", _domain(), str(PLIST_PATH), capture=True)
+    _launchctl("bootout", _domain_target(spec), capture=True)
+    r = _launchctl("bootstrap", _domain(), str(plist_path), capture=True)
     if r.returncode != 0:
         print(f"launchctl bootstrap failed: {r.stderr.strip() or r.stdout.strip()}", file=sys.stderr)
         sys.exit(r.returncode)
-    print(f"Loaded service {LABEL} (auto-starts at login, restarts on crash).")
-    print(f"  logs: tail -f {STDOUT_LOG} {STDERR_LOG}")
-    print(f"  status: oncall service status")
-    print(f"  stop:   oncall service stop")
+    print(f"Loaded service {spec.label} ({spec.desc}; auto-starts at login, restarts on crash).")
+    print(f"  logs: tail -f {spec.stdout} {spec.stderr}")
+    flag = " --worker" if spec is WORKER else ""
+    print(f"  status: oncall service status{flag}")
+    print(f"  stop:   oncall service stop{flag}")
 
 
-def uninstall() -> None:
+def uninstall(spec: ServiceSpec = AGENT) -> None:
     _check_macos()
-    if _is_loaded():
-        _launchctl("bootout", _domain_target())
-        print(f"Unloaded {LABEL}.")
+    plist_path = _plist_path(spec)
+    if _is_loaded(spec):
+        _launchctl("bootout", _domain_target(spec))
+        print(f"Unloaded {spec.label}.")
     else:
-        print(f"{LABEL} not currently loaded.")
-    if PLIST_PATH.exists():
-        PLIST_PATH.unlink()
-        print(f"Removed {PLIST_PATH}.")
+        print(f"{spec.label} not currently loaded.")
+    if plist_path.exists():
+        plist_path.unlink()
+        print(f"Removed {plist_path}.")
     else:
-        print(f"{PLIST_PATH} not present.")
+        print(f"{plist_path} not present.")
 
 
-def start() -> None:
+def start(spec: ServiceSpec = AGENT) -> None:
     _check_macos()
-    if not PLIST_PATH.exists():
-        print("Service not installed. Run `oncall service install` first.", file=sys.stderr)
+    plist_path = _plist_path(spec)
+    if not plist_path.exists():
+        flag = " --worker" if spec is WORKER else ""
+        print(f"Service not installed. Run `oncall service install{flag}` first.", file=sys.stderr)
         sys.exit(2)
 
     # Two paths:
@@ -164,8 +204,8 @@ def start() -> None:
     # right after `oncall service stop`). Now we capture+check bootstrap so
     # failures surface, and we only kickstart when there's actually a service
     # to kick.
-    if _is_loaded():
-        r = _launchctl("kickstart", "-k", _domain_target(), capture=True)
+    if _is_loaded(spec):
+        r = _launchctl("kickstart", "-k", _domain_target(spec), capture=True)
         if r.returncode != 0:
             print(
                 f"launchctl kickstart failed (code={r.returncode}): "
@@ -173,10 +213,10 @@ def start() -> None:
                 file=sys.stderr,
             )
             sys.exit(r.returncode)
-        print(f"Restarted {LABEL}.")
+        print(f"Restarted {spec.label}.")
         return
 
-    r = _launchctl("bootstrap", _domain(), str(PLIST_PATH), capture=True)
+    r = _launchctl("bootstrap", _domain(), str(plist_path), capture=True)
     if r.returncode != 0:
         msg = r.stderr.strip() or r.stdout.strip() or "<no output>"
         # Common race: bootout from a recent `stop` hasn't fully settled and
@@ -185,7 +225,7 @@ def start() -> None:
         # pause — usually the second attempt succeeds.
         import time
         time.sleep(0.5)
-        r = _launchctl("bootstrap", _domain(), str(PLIST_PATH), capture=True)
+        r = _launchctl("bootstrap", _domain(), str(plist_path), capture=True)
         if r.returncode != 0:
             msg2 = r.stderr.strip() or r.stdout.strip() or "<no output>"
             print(
@@ -195,34 +235,35 @@ def start() -> None:
                 file=sys.stderr,
             )
             sys.exit(r.returncode)
-    print(f"Loaded and started {LABEL}.")
+    print(f"Loaded and started {spec.label}.")
 
 
-def stop() -> None:
+def stop(spec: ServiceSpec = AGENT) -> None:
     _check_macos()
-    if not _is_loaded():
-        print(f"{LABEL} not loaded.")
+    if not _is_loaded(spec):
+        print(f"{spec.label} not loaded.")
         return
-    _launchctl("bootout", _domain_target())
+    _launchctl("bootout", _domain_target(spec))
     # bootout returns before launchd fully tears the service down — a
     # subsequent `oncall service start` can race on the unload. Poll
     # _is_loaded() briefly so the caller sees a clean state.
     import time
     for _ in range(20):  # up to ~1s
-        if not _is_loaded():
+        if not _is_loaded(spec):
             break
         time.sleep(0.05)
-    print(f"Stopped {LABEL}.")
+    print(f"Stopped {spec.label}.")
 
 
-def status() -> None:
+def status(spec: ServiceSpec = AGENT) -> None:
     _check_macos()
-    if not PLIST_PATH.exists():
-        print(f"Service not installed (no plist at {PLIST_PATH}).")
+    plist_path = _plist_path(spec)
+    if not plist_path.exists():
+        print(f"Service not installed (no plist at {plist_path}).")
         return
-    r = _launchctl("print", _domain_target(), capture=True)
+    r = _launchctl("print", _domain_target(spec), capture=True)
     if r.returncode != 0:
-        print(f"Service installed but NOT loaded.\n  install path: {PLIST_PATH}")
+        print(f"Service installed but NOT loaded.\n  install path: {plist_path}")
         return
     # Distill the useful bits from launchctl print's verbose output.
     out = r.stdout
@@ -230,20 +271,20 @@ def status() -> None:
         line for line in out.splitlines()
         if any(k in line for k in ("state =", "pid =", "last exit", "program ="))
     ]
-    print(f"{LABEL}: LOADED")
+    print(f"{spec.label}: LOADED")
     for line in keep:
         print(f"  {line.strip()}")
-    print(f"  logs: {STDOUT_LOG} (out), {STDERR_LOG} (err)")
+    print(f"  logs: {spec.stdout} (out), {spec.stderr} (err)")
 
 
-def logs(follow: bool = False, lines: int = 100) -> None:
+def logs(spec: ServiceSpec = AGENT, follow: bool = False, lines: int = 100) -> None:
     _check_macos()
-    if not STDOUT_LOG.exists() and not STDERR_LOG.exists():
-        print(f"No logs yet. Looked at {STDOUT_LOG} and {STDERR_LOG}.")
+    if not spec.stdout.exists() and not spec.stderr.exists():
+        print(f"No logs yet. Looked at {spec.stdout} and {spec.stderr}.")
         return
     args = ["tail", f"-n{lines}"]
     if follow:
         args.append("-f")
     # Both files in one tail so user sees interleaved out+err with file headers.
-    files = [str(p) for p in (STDOUT_LOG, STDERR_LOG) if p.exists()]
+    files = [str(p) for p in (spec.stdout, spec.stderr) if p.exists()]
     os.execvp("tail", ["tail", *args[1:], *files])

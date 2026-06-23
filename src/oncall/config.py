@@ -144,6 +144,12 @@ class Settings(BaseSettings):
 
     oncall_token: str = "dev-token-change-me"
     oncall_port: int = 8765
+    # Interface uvicorn binds. Default loopback (safe everywhere). In the
+    # server-role container set ONCALL_BIND_HOST=0.0.0.0 so a TLS reverse
+    # proxy on the docker network can forward the PUBLIC /laptop/* routes to
+    # it. The container port must NOT be published raw to the internet — put
+    # the proxy in front and let it expose only /laptop/*.
+    oncall_bind_host: str = "127.0.0.1"
     # Max concurrent claude executors. Excess submissions queue in `pending`
     # state until a slot opens. Higher = more throughput but more memory and
     # more pressure on the Anthropic rate limit.
@@ -173,6 +179,37 @@ class Settings(BaseSettings):
     oncall_executor_compact_at_tokens: int = 200000
     oncall_db_path: Path = Field(default_factory=lambda: Path("~/.oncall/state.db").expanduser())
     oncall_prod_hosts: str = ""
+
+    # Deployment role. Empty/"laptop" = legacy all-local mode: the executor
+    # uses its own native Bash/Read/Edit/Write on this machine (the original
+    # single-box deployment). "server" = cloud-primary mode: this orchestrator
+    # runs on an always-on VPS, the executor's native local tools are denied
+    # (they'd touch the useless VPS filesystem), and local shell/file work is
+    # routed to the user's laptop via the `mcp__oncall__laptop` proxy tool,
+    # which only functions while the laptop's `oncall laptop-worker` is polling.
+    oncall_role: str = ""
+    # Shared secret authenticating the laptop worker's PUBLIC long-poll routes
+    # (GET /laptop/jobs, POST /laptop/jobs/{id}/result). Distinct from
+    # oncall_token (which guards the loopback/admin surface). Required for
+    # server role; the worker sends it as X-Oncall-Laptop-Token.
+    oncall_laptop_token: str = ""
+    # Worker → server base URL (e.g. https://oncall.example.com). Used by
+    # `oncall laptop-worker` to reach the long-poll routes. Server role
+    # ignores it.
+    oncall_server_url: str = ""
+    # Laptop is considered ONLINE if it has long-polled within this many
+    # seconds. Tune against the poll timeout below so brief network blips
+    # don't read as offline mid-conversation.
+    oncall_laptop_presence_window_seconds: int = 60
+    # How long GET /laptop/jobs holds open waiting for a job before returning
+    # empty (the worker immediately re-polls). Keeps presence fresh and job
+    # delivery latency low.
+    oncall_laptop_poll_timeout_seconds: int = 25
+    # How long the server-side proxy blocks on a dispatched local job before
+    # giving up and returning an error to the executor (e.g. laptop slept
+    # mid-job). MUST be finite — the executor is serialized, so a hung job
+    # would block every later task.
+    oncall_laptop_job_timeout_seconds: int = 300
 
     # Operator memory — semantic, LRU-evicted. Stored in SQLite alongside the
     # rest of state. Capacity caps the number of rows; when extraction would
@@ -322,6 +359,12 @@ class Settings(BaseSettings):
     # Display name the operator uses to refer to itself. Substituted into the
     # operator system prompt as {{agent_name}}. Empty = "On-call agent".
     agent_name: str = ""
+
+    @property
+    def is_server_role(self) -> bool:
+        """True in cloud-primary mode (laptop reached via the proxy). Empty
+        or 'laptop' → legacy all-local mode."""
+        return self.oncall_role.strip().lower() == "server"
 
     @property
     def prod_hosts(self) -> set[str]:
