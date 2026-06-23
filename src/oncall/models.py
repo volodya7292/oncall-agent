@@ -1,15 +1,47 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Literal
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field
+
+log = logging.getLogger(__name__)
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def format_local_now(tz_name: str = "") -> str:
+    """Current wall-clock time, formatted for injection into an LLM prompt.
+
+    `tz_name` is an IANA zone (e.g. 'Europe/Berlin'); an empty string uses
+    the host's local timezone (via `astimezone()`). The string carries the
+    weekday, 24h time, a zone label, and the UTC offset, so a downstream
+    model can both reason about "today/tonight" AND state the time back to
+    the user without inventing one. Example:
+
+        2026-06-24 00:33 (Tuesday), Europe/Berlin (UTC+02:00)
+    """
+    if tz_name:
+        try:
+            now = datetime.now(ZoneInfo(tz_name))
+        except Exception:
+            log.warning(
+                "invalid operator_timezone %r; falling back to system local tz",
+                tz_name,
+            )
+            now = datetime.now().astimezone()
+    else:
+        now = datetime.now().astimezone()
+    off = now.strftime("%z")  # "+0200"; never empty since `now` is tz-aware
+    off_fmt = f"{off[:3]}:{off[3:]}" if off else "+00:00"
+    label = tz_name or now.tzname() or "local"
+    return now.strftime("%Y-%m-%d %H:%M (%A)") + f", {label} (UTC{off_fmt})"
 
 
 def new_uuid() -> UUID:

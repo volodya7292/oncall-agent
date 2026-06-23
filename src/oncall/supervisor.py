@@ -17,8 +17,6 @@ import logging
 import os
 import signal
 import sys
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from .config import (
@@ -31,7 +29,7 @@ from .config import (
 )
 from .db import Database
 from .events import EventBus
-from .models import Task, TaskState, TerminalReason
+from .models import Task, TaskState, TerminalReason, format_local_now
 
 
 log = logging.getLogger(__name__)
@@ -322,13 +320,14 @@ class Supervisor:
 
     def _render_executor_prompt(self) -> str:
         """Read the executor system prompt and substitute spawn-time
-        placeholders. Currently: `{{current_date}}` → ISO UTC datetime
-        captured at spawn — the executor's headless `--print` session
-        doesn't get a reliable date in its built-in context, so we inject
-        one explicitly. Long-running resumed sessions still see the
-        date refresh on each spawn (one per hand_off)."""
+        placeholders. Currently: `{{current_date}}` → local-timezone
+        datetime captured at spawn (operator_timezone, or the host's local
+        tz when unset) — the executor's headless `--print` session doesn't
+        get a reliable date in its built-in context, so we inject one
+        explicitly. Long-running resumed sessions still see the date refresh
+        on each spawn (one per hand_off)."""
         text = self._paths.executor_prompt.read_text(encoding="utf-8")
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        now = format_local_now(self._settings.operator_timezone)
         text = text.replace("{{current_date}}", now)
         lang = self._settings.operator_language
         if lang:

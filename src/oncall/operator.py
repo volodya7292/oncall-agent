@@ -28,7 +28,7 @@ from .db import Database, iso
 from .events import EventBus
 from .lifecycle import Lifecycle
 from .local_claude import ClaudeCliRunner, OneShotRunner
-from .models import utcnow
+from .models import format_local_now, utcnow
 from .operator_memory import Memory, MemoryStore
 from .telegram_service import TelegramService
 
@@ -988,6 +988,17 @@ class Operator:
             else "<call-status>not on a call</call-status>"
         )
         messages.append({"role": "user", "content": call_block})
+
+        # Current time: same transient per-turn shape as the statuses above,
+        # recomputed every turn and never persisted. Without it the operator
+        # has NO clock and will confidently FABRICATE one when asked the time
+        # (it once told the owner "21:05" at 00:33 local). Rendered in
+        # operator_timezone, defaulting to the host's local tz.
+        time_block = (
+            f"<current-time>{format_local_now(self._settings.operator_timezone)}"
+            "</current-time>"
+        )
+        messages.append({"role": "user", "content": time_block})
 
         tool_calls_made: list[dict[str, Any]] = []
         for _round in range(self._max_tool_rounds):
