@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Cloud-primary (ONCALL_ROLE=server) image for the oncall orchestrator.
 #
 # Runs the full daemon — operator, executor (Claude CLI), Telegram, broker —
@@ -37,8 +38,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY . /app
-RUN pip install --no-cache-dir .
+
+# 1) Dependency layer — cache-keyed on pyproject.toml ONLY. Source-only
+#    changes (the common case) keep this a cache hit, so the heavy dependency
+#    set (torch via silero-vad, etc.) is NOT reinstalled every build. Extract
+#    the PEP 508 deps from pyproject and install them without the project. The
+#    pip cache mount reuses already-downloaded wheels when the layer does
+#    rebuild (e.g. a dependency bump).
+COPY pyproject.toml ./
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -c "import tomllib; print('\n'.join(tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']))" > /tmp/requirements.txt \
+    && pip install -r /tmp/requirements.txt
+
+# 2) Project layer — only this rebuilds on a code change; deps already present.
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/pip pip install --no-deps .
 
 # Server role: native executor tools disabled; local work routed to the laptop.
 ENV ONCALL_ROLE=server \
