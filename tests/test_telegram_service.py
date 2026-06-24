@@ -202,6 +202,12 @@ async def service(db):
         important_senders={"alex", "boss"},
         important_keywords={"urgent", "down"},
     )
+    # Inbound triage is gated on the DM allowlist (see _handle_inbound).
+    # Allowlist the chat_ids the triage tests exercise so they test triage,
+    # not the gate — the gate itself is covered by its own test below.
+    await db.allow_dm("12345")
+    await db.allow_dm("111")
+    await db.allow_dm("222")
     await s.start()
     try:
         yield s, client
@@ -480,6 +486,37 @@ async def test_inbound_from_ignored_user_id_is_dropped(db):
             sender_username=None, sender_id=424242, body="reply",
         ))
         assert await db.list_inbox(unread_only=False) == []
+    finally:
+        await s.stop()
+
+
+@pytest.mark.asyncio
+async def test_inbound_from_non_allowlisted_chat_is_dropped(db):
+    """Triage gate: a DM from a chat that is NOT on the dm_allowlist is
+    dropped in _handle_inbound — never recorded, never surfaced. The
+    allowlist is absolute, so even an important_sender/keyword hit from a
+    non-allowlisted chat is ignored."""
+    client = FakeTelegramClient()
+    s = TelegramService(
+        db=db, client=client,
+        important_senders={"alex"}, important_keywords={"urgent"},
+    )
+    await s.start()
+    try:
+        # important_sender AND keyword, but chat 999 isn't allowlisted.
+        await client.handler(make_event(
+            sender_username="alex", body="urgent: server down", chat_id=999,
+        ))
+        assert await db.list_inbox(unread_only=False) == []
+        # Allowlist it, then the same kind of message gets through.
+        await db.allow_dm("999")
+        await client.handler(make_event(
+            sender_username="alex", body="urgent: server down",
+            chat_id=999, message_id=43,
+        ))
+        rows = await db.list_inbox(unread_only=False)
+        assert len(rows) == 1
+        assert rows[0]["chat_id"] == "999"
     finally:
         await s.stop()
 
@@ -869,6 +906,7 @@ async def test_ignore_does_not_block_legitimate_senders(db):
         important_senders=set(), important_keywords=set(),
         ignore_usernames={"banned_bot"},
     )
+    await db.allow_dm("12345")  # triage is allowlist-gated; chat 12345 is default
     await s.start()
     try:
         await client.handler(make_event(

@@ -89,8 +89,8 @@ _SLASH_HELP = (
     "/context — export this session's chat history + latest summary as a markdown file\n"
     "/clear — wipe this chat's history and reset the executor session (memory is preserved)\n"
     "/compact — force-compact older messages into a summary now\n"
-    "/allowdm <chat_id> — allowlist a chat for autonomous DM replies (empty by default)\n"
-    "/denydm <chat_id> — remove a chat from the DM allowlist\n"
+    "/allowdm <chat_id> — allowlist a chat for triage + autonomous DM replies (empty by default; non-allowlisted DMs are dropped, never surfaced)\n"
+    "/denydm <chat_id> — remove a chat from the DM allowlist (stops triaging it)\n"
     "/dmlist — show allowlisted chats\n"
     "/setownername <name> — set your display name used in the operator's system prompt\n"
     "/yes <id> — approve a pending deferred dispatch\n"
@@ -534,7 +534,7 @@ class TelegramAgentService:
         if cmd.startswith("/allowdm"):
             added = await self._db.allow_dm(arg)
             msg = (
-                f"Allowlisted chat_id={arg} for autonomous DM replies."
+                f"Allowlisted chat_id={arg} — its DMs will now be triaged, and autonomous replies are permitted."
                 if added else
                 f"chat_id={arg} was already on the allowlist."
             )
@@ -553,8 +553,8 @@ class TelegramAgentService:
         rows = await self._db.list_dm_allowed()
         if not rows:
             return (
-                "DM allowlist is empty. No chat may receive an autonomous "
-                "reply. Use /allowdm <chat_id> to add one."
+                "DM allowlist is empty. No DMs are triaged and no chat may "
+                "receive an autonomous reply. Use /allowdm <chat_id> to add one."
             )
         lines = ["DM allowlist:"]
         for r in rows:

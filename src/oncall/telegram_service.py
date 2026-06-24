@@ -224,6 +224,21 @@ class TelegramService:
             return
         display = _display_name(sender)
         chat_id = str(getattr(event, "chat_id", None) or getattr(event.message, "chat_id", ""))
+
+        # Triage gate: only chats the owner has explicitly allowlisted (via
+        # /allowdm, shown by /dmlist) are triaged. DMs from everyone else are
+        # dropped here so they never reach the inbox-drain / operator — the
+        # allowlist is absolute, so even an `important_senders`/keyword hit
+        # from a non-allowlisted chat is ignored. The real conversation still
+        # lives in Telegram; we just don't surface it. This is the same
+        # allowlist that gates autonomous DM replies.
+        if not await self._db.is_dm_allowed(chat_id):
+            log.info(
+                "inbound skipped reason=not_allowlisted chat=%s sender=%s",
+                chat_id, username or display,
+            )
+            return
+
         message_id = str(getattr(event.message, "id", ""))
         received_at = getattr(event.message, "date", None) or datetime.now(timezone.utc)
 
