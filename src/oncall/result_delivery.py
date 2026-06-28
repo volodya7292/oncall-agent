@@ -65,10 +65,18 @@ async def deliver_executor_result(
     task_events = await db.list_events(task_id)
     raw = latest_executor_text(task_events)
     if not raw:
-        # Pure side-effect task (e.g. a single emoji reaction): the action
-        # itself is the user-visible signal. Don't fabricate a placeholder —
-        # publishing one spams the user and pollutes operator history with
-        # a fake assistant turn the operator will then "remember" saying.
+        if terminal_state == "failed":
+            # The task broke before producing ANY output — claude errored
+            # (e.g. session clash, missing binary), the subprocess crashed,
+            # etc. Staying silent here is the bug that hid a failure for an
+            # hour: the user asked for something and simply never heard back.
+            # Tell them it failed; specifics stay in the server logs.
+            await _publish_failure_notice(events, chat_session_id, task_id)
+            return
+        # Otherwise (completed / killed with no text): a pure side-effect task
+        # (e.g. a single emoji reaction) or a user-initiated kill. The action
+        # itself is the signal — don't fabricate a placeholder that spams the
+        # user and pollutes operator history with a fake assistant turn.
         log.info(
             "result_delivery: task %s ended in state=%s with no assistant text; skipping publish",
             task_id, terminal_state,
@@ -102,6 +110,32 @@ async def deliver_executor_result(
         })
     except Exception:
         log.exception("result_delivery: failed to publish chat.reply")
+
+
+async def _publish_failure_notice(
+    events: EventBus, chat_session_id: str, task_id: UUID,
+) -> None:
+    """Tell the user a hand_off'd task failed before producing any output.
+
+    Without this, a task that errors before its first assistant turn is silent
+    on Telegram (the no-text branch used to just skip). We don't have the
+    executor's stderr here — that's in the server logs — so keep it terse and
+    honest about uncertainty rather than inventing a reason."""
+    msg = (
+        "SYSTEM: ⚠️ I couldn't complete that — the task failed before it "
+        "produced any result. Nothing was confirmed done. (Details are in the "
+        "server logs.)"
+    )
+    try:
+        await events.publish_global("chat.reply", {
+            "session_id": chat_session_id,
+            "text": msg,
+            "voice_text": "",
+            "trigger": "executor.failed",
+            "task_id": str(task_id),
+        })
+    except Exception:
+        log.exception("result_delivery: failed to publish failure notice for %s", task_id)
 
 
 async def _summarize(llm: Any | None, model: str, text: str) -> str:

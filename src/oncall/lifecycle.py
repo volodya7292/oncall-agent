@@ -328,14 +328,8 @@ class Lifecycle:
                     await self._run_one(task)
                 except asyncio.CancelledError:
                     raise
-                except Exception as exc:
-                    # Backstop for failures OUTSIDE the executor run itself
-                    # (Supervisor construction, runner plumbing, or _supervise's
-                    # own except block throwing). _supervise handles executor-run
-                    # crashes and returns cleanly, so this and that path are
-                    # mutually exclusive — no double notification.
+                except Exception:
                     log.exception("worker loop: unexpected error running task %s", task.id)
-                    await self._notify_task_crash(task, exc)
                 finally:
                     self._current_task_id = None
         finally:
@@ -374,39 +368,13 @@ class Lifecycle:
             return await sup.run(task, resuming=False)
         except asyncio.CancelledError:
             return TerminalReason.KILLED
-        except Exception as exc:
+        except Exception:
             log.exception("supervisor crashed for task %s", task.id)
             await self.db.update_task_state(task.id, TaskState.FAILED, TerminalReason.CLI_ERROR)
             await self.events.publish(task.id, "state.changed", {
                 "state": TaskState.FAILED.value, "terminal_reason": "cli_error",
             })
-            await self._notify_task_crash(task, exc)
+            # The user is told about this via the result-delivery path, which
+            # fires on the terminal state.changed event above and notifies on a
+            # failed task with no assistant text (deliver_executor_result).
             return TerminalReason.CLI_ERROR
-
-    async def _notify_task_crash(self, task: Task, exc: BaseException) -> None:
-        """Surface a supervisor-spawn crash to the user's chat.
-
-        A task that dies BEFORE producing any assistant text (e.g. the `claude`
-        binary is missing → FileNotFoundError) is otherwise silent in Telegram:
-        the result-delivery loop explicitly skips failed tasks with no
-        assistant text, and this crash path is not one of the supervised
-        background loops that call `_notify_system_error`. Without this, such
-        failures are visible only in the server logs. Best-effort: a failed
-        publish is logged and swallowed so it can't mask the original crash."""
-        sid = task.dispatched_by_chat_session
-        if not sid:
-            return
-        msg = (
-            f"SYSTEM: ⚠️ a task failed unexpectedly: "
-            f"{type(exc).__name__}: {str(exc)[:200]}"
-        )
-        try:
-            await self.events.publish_global("chat.reply", {
-                "session_id": sid,
-                "text": msg,
-                "voice_text": "",
-                "trigger": "system.error",
-                "task_id": str(task.id),
-            })
-        except Exception:
-            log.exception("failed to notify chat of task %s crash", task.id)

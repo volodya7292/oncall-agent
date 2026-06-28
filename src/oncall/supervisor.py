@@ -74,7 +74,7 @@ class Supervisor:
         already_initialized = is_executor_session_initialized()
         use_resume = resuming or already_initialized
 
-        terminal, session_missing = await self._spawn_once(
+        terminal, session_missing, session_in_use = await self._spawn_once(
             task, session_id=session_id, use_resume=use_resume,
             write_initial_user_turn=not resuming,
         )
@@ -89,8 +89,26 @@ class Supervisor:
                 "--session-id to recreate", session_id,
             )
             _reset_session_initialized_marker()
-            terminal, _ = await self._spawn_once(
+            terminal, _, _ = await self._spawn_once(
                 task, session_id=session_id, use_resume=False,
+                write_initial_user_turn=True,
+            )
+        # Inverse fallback: we asked for --session-id (marker absent) but the
+        # session already exists in claude's store — a prior create spawn made
+        # it then died before SUCCESS, so the marker was never written. Adopt
+        # the existing session: mark initialized and re-spawn with --resume
+        # instead of looping on "Session ID … is already in use".
+        elif session_in_use and not use_resume:
+            log.warning(
+                "session %s already exists but was unmarked; adopting it "
+                "via --resume", session_id,
+            )
+            try:
+                mark_executor_session_initialized()
+            except OSError as e:
+                log.warning("could not mark executor session initialized: %s", e)
+            terminal, _, _ = await self._spawn_once(
+                task, session_id=session_id, use_resume=True,
                 write_initial_user_turn=True,
             )
 
@@ -128,11 +146,13 @@ class Supervisor:
     async def _spawn_once(
         self, task: Task, *, session_id: str, use_resume: bool,
         write_initial_user_turn: bool,
-    ) -> tuple[TerminalReason, bool]:
+    ) -> tuple[TerminalReason, bool, bool]:
         """Spawn one claude subprocess, drive it to completion. Returns
-        (terminal_reason, session_missing). `session_missing` is True iff
-        stderr revealed claude couldn't find the session under --resume —
-        that signals the caller to retry with --session-id."""
+        (terminal_reason, session_missing, session_in_use).
+        `session_missing` is True iff stderr revealed claude couldn't find the
+        session under --resume (retry with --session-id). `session_in_use` is
+        True iff a --session-id create hit an existing session (adopt it via
+        --resume)."""
         argv = self._build_argv(task, session_id=session_id, use_resume=use_resume)
         log.info("spawning claude for task %s (resume=%s, session=%s): %s",
                  task.id, use_resume, session_id, argv[0])
@@ -190,7 +210,16 @@ class Supervisor:
             use_resume
             and "No conversation found with session ID" in stderr_text
         )
-        return terminal, session_missing
+        # Inverse trap: we asked for --session-id (create) but claude already
+        # has this session — a prior create spawn made it, then failed before
+        # SUCCESS so the `initialized` marker was never written. Signal the
+        # caller to ADOPT it (mark initialized + --resume) rather than loop
+        # forever on "Session ID … is already in use".
+        session_in_use = (
+            not use_resume
+            and "is already in use" in stderr_text
+        )
+        return terminal, session_missing, session_in_use
 
     # ---- context compaction ----
 
