@@ -622,10 +622,22 @@ class Operator:
         # always "not on a call"). Drives the per-turn <call-status> line so the
         # operator knows, this turn, whether its reply will be spoken aloud.
         self._on_call_provider: Callable[[str], bool] | None = None
+        # Cloud-primary mode only: returns True if the user's laptop worker is
+        # currently online (reachable via the proxy). Injected by api.py when
+        # ONCALL_ROLE=server; None in legacy all-local mode (the executor has
+        # native local tools, so there's no "laptop offline" state to surface).
+        # Drives the per-turn <laptop-status> line so the operator declines
+        # local-data requests up front instead of handing off a doomed task.
+        self._laptop_status_provider: Callable[[], bool] | None = None
 
     def set_on_call_provider(self, provider: Callable[[str], bool]) -> None:
         """Register the CallService's live-call check. See _on_call_provider."""
         self._on_call_provider = provider
+
+    def set_laptop_status_provider(self, provider: Callable[[], bool]) -> None:
+        """Register the laptop-presence check (cloud-primary mode). See
+        _laptop_status_provider."""
+        self._laptop_status_provider = provider
 
     def _lock_for(self, session_id: str) -> asyncio.Lock:
         lock = self._session_locks.get(session_id)
@@ -999,6 +1011,28 @@ class Operator:
             "</current-time>"
         )
         messages.append({"role": "user", "content": time_block})
+
+        # Laptop-status: cloud-primary mode only. Tells the operator, this
+        # turn, whether the user's laptop is reachable — i.e. whether a
+        # hand_off that needs local files/shell can succeed. When offline, the
+        # operator should decline local-data requests up front rather than
+        # spawn a task that will only hit `{"error":"laptop_offline"}`. Not
+        # persisted — recomputed each turn. Absent in legacy all-local mode.
+        if self._laptop_status_provider is not None:
+            online = False
+            try:
+                online = bool(self._laptop_status_provider())
+            except Exception:
+                log.warning("laptop status provider raised; treating as offline", exc_info=True)
+            laptop_block = (
+                "<laptop-status>online — local files/shell available via hand_off</laptop-status>"
+                if online
+                else "<laptop-status>offline — the user's laptop is unreachable; "
+                "local files/shell are UNAVAILABLE this turn. If the user asks for "
+                "anything needing their local machine, say it's offline and to try "
+                "again when it's back; do not hand_off.</laptop-status>"
+            )
+            messages.append({"role": "user", "content": laptop_block})
 
         tool_calls_made: list[dict[str, Any]] = []
         for _round in range(self._max_tool_rounds):
@@ -1660,7 +1694,11 @@ class Operator:
                 continue
             if content.startswith("[memory note:") or content.startswith(AUTO_PING_PREFIX):
                 continue
-            if content.startswith("<acting-status>") or content.startswith("<call-status>"):
+            if (
+                content.startswith("<acting-status>")
+                or content.startswith("<call-status>")
+                or content.startswith("<laptop-status>")
+            ):
                 continue
             if content == user_text:
                 # The latest user turn — printed as "user (now)" below.

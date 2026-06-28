@@ -26,6 +26,23 @@ ONCALL_PORT=8765
 ONCALL_DB_PATH=~/.oncall/state.db
 ONCALL_PROD_HOSTS=
 
+# Deployment role.
+#   (unset / "laptop") = legacy all-local mode: the executor uses its own
+#       native Bash/Read/Edit/Write on THIS machine.
+#   "server" = cloud-primary mode: this orchestrator runs on an always-on VPS;
+#       the executor's native local tools are denied and local shell/file work
+#       is routed to the user's laptop via the `mcp__oncall__laptop` proxy. The
+#       laptop runs `oncall laptop-worker` (see below).
+ONCALL_ROLE=
+# Cloud-primary mode only. Shared secret authenticating the laptop worker's
+# public long-poll routes. Generate with `openssl rand -hex 32`. Must match on
+# the server (this file) and on the laptop worker's .env.
+ONCALL_LAPTOP_TOKEN=
+# Laptop worker → server base URL (e.g. https://oncall.example.com). Set this
+# in the LAPTOP's .env (alongside ONCALL_LAPTOP_TOKEN) where you run
+# `oncall laptop-worker`. The server ignores it.
+ONCALL_SERVER_URL=
+
 # Operator backend choice — see .env.example for details.
 # Default uses Google AI Studio (gemini) with gemini-3.1-flash-lite for
 # fast ack-first responses (~0.45s TTFA). Set to "vercel" if you need
@@ -93,7 +110,7 @@ def _serve_api() -> None:
     app = create_app()
     uvicorn.run(
         app,
-        host="127.0.0.1",
+        host=settings.oncall_bind_host,
         port=settings.oncall_port,
         log_level="info",
         # Cap how long uvicorn waits for in-flight connections on SIGTERM
@@ -112,6 +129,11 @@ def _serve_api() -> None:
 
 def _serve_mcp() -> None:
     from .mcp_server import cli_main
+    cli_main()
+
+
+def _serve_laptop_worker() -> None:
+    from .laptop_worker import cli_main
     cli_main()
 
 
@@ -202,6 +224,11 @@ def main() -> None:
                         help="Overwrite an existing ~/.oncall/.env.")
     sub.add_parser("api", help="Run the orchestrator HTTP API")
     sub.add_parser("mcp", help="Run the stdio MCP server (used by claude subprocesses)")
+    sub.add_parser(
+        "laptop-worker",
+        help="Run the laptop capability worker (cloud-primary mode): long-polls "
+             "the server for local shell/file jobs and runs them on this machine.",
+    )
     tg_login_p = sub.add_parser(
         "telegram-login",
         help="One-time interactive Telegram userbot login (writes session file).",
@@ -223,7 +250,14 @@ def main() -> None:
     )
     svc = sub.add_parser(
         "service",
-        help="Install/manage the macOS LaunchAgent that runs `oncall api`.",
+        help="Install/manage the macOS LaunchAgent that runs `oncall api` "
+             "(or `oncall laptop-worker` with --worker).",
+    )
+    svc.add_argument(
+        "--worker", action="store_true",
+        help="Target the laptop capability worker (com.oncall.worker) instead "
+             "of the orchestrator. Use on the laptop in cloud-primary mode so "
+             "`oncall laptop-worker` auto-starts at login and restarts on crash.",
     )
     svc.add_argument(
         "action",
@@ -251,6 +285,8 @@ def main() -> None:
         _serve_api()
     elif args.cmd == "mcp":
         _serve_mcp()
+    elif args.cmd == "laptop-worker":
+        _serve_laptop_worker()
     elif args.cmd == "telegram-login":
         _telegram_login(
             verbose=getattr(args, "verbose", False),
@@ -259,11 +295,12 @@ def main() -> None:
         )
     elif args.cmd == "service":
         from . import service
+        spec = service.WORKER if getattr(args, "worker", False) else service.AGENT
         fn = getattr(service, args.action)
         if args.action == "logs":
-            fn(follow=args.follow, lines=args.lines)
+            fn(spec, follow=args.follow, lines=args.lines)
         else:
-            fn()
+            fn(spec)
     else:
         parser.print_help()
         sys.exit(2)

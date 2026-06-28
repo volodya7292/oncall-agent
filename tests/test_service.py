@@ -18,6 +18,7 @@ from oncall import service
 
 def test_plist_shape():
     p = service._build_plist(
+        service.AGENT,
         binary=Path("/usr/local/bin/oncall"),
         extra_path="/usr/local/bin:/usr/bin:/bin",
     )
@@ -34,9 +35,24 @@ def test_plist_shape():
     assert "HOME" in p["EnvironmentVariables"]
 
 
+def test_worker_plist_runs_laptop_worker():
+    """The --worker spec must run `oncall laptop-worker` under a DISTINCT
+    label + log files so it never collides with the orchestrator agent."""
+    p = service._build_plist(
+        service.WORKER,
+        binary=Path("/usr/local/bin/oncall"),
+        extra_path="/usr/bin",
+    )
+    assert p["Label"] == "com.oncall.worker"
+    assert p["ProgramArguments"] == ["/usr/local/bin/oncall", "laptop-worker"]
+    assert service.WORKER.label != service.AGENT.label
+    assert service.WORKER.stdout != service.AGENT.stdout
+
+
 def test_plist_is_valid_plist_format(tmp_path):
     """plistlib must be able to round-trip the dict we build."""
     p = service._build_plist(
+        service.AGENT,
         binary=Path("/usr/local/bin/oncall"),
         extra_path="/usr/bin",
     )
@@ -51,7 +67,8 @@ def test_plist_is_valid_plist_format(tmp_path):
 def test_label_matches_plist_filename():
     """launchd matches the file's stem to the Label key. Mismatch silently
     fails to load — guard against accidental rename of one but not the other."""
-    assert service.PLIST_PATH.stem == service.LABEL
+    for spec in (service.AGENT, service.WORKER):
+        assert service._plist_path(spec).stem == spec.label
 
 
 def test_install_refuses_on_non_macos(monkeypatch, capsys):

@@ -374,4 +374,7 @@ class Lifecycle:
             await self.events.publish(task.id, "state.changed", {
                 "state": TaskState.FAILED.value, "terminal_reason": "cli_error",
             })
+            # The user is told about this via the result-delivery path, which
+            # fires on the terminal state.changed event above and notifies on a
+            # failed task with no assistant text (deliver_executor_result).
             return TerminalReason.CLI_ERROR
