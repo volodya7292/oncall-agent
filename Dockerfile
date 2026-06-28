@@ -33,6 +33,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && npm install -g @anthropic-ai/claude-code \
+    # Claude Code 2.x ships the CLI as a platform-specific optional-dep binary;
+    # npm's `claude` bin symlink is sometimes NOT created on a clean global
+    # install, leaving the executor unable to spawn `claude`. Force the symlink
+    # to the real binary and verify at build time so a broken link fails loudly.
+    && ln -sf /usr/lib/node_modules/@anthropic-ai/claude-code/node_modules/@anthropic-ai/claude-code-linux-x64/claude /usr/local/bin/claude \
+    && claude --version \
     && apt-get purge -y curl \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
