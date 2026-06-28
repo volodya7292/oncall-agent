@@ -347,7 +347,7 @@ class Supervisor:
         if self._settings.is_server_role:
             argv += [
                 "--disallowedTools",
-                "Bash,Read,Edit,Write,MultiEdit,NotebookEdit,Glob,Grep",
+                "Bash,Read,Edit,Write,NotebookEdit,Glob,Grep",
             ]
         argv += ["--model", task.model or "sonnet"]
         if task.max_turns:
