@@ -10,4 +10,4 @@ cd "$(dirname "$0")/.."
 uv build
 WHEEL="$(ls -t dist/oncall_agent-*-py3-none-any.whl | head -n1)"
 uv tool install --force "$WHEEL"
-oncall service start
+oncall service --worker start
