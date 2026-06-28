@@ -25,19 +25,19 @@
 FROM python:3.12-slim
 
 # System deps:
-#   nodejs/npm  → the Claude Code CLI + py-tgcalls' node runtime
-#   ffmpeg/libopus0 → voice-call audio (opt-in feature, but deps are hard reqs)
+#   ffmpeg/libopus0 → voice-call audio. py-tgcalls uses the NATIVE ntgcalls
+#       backend (prebuilt cffi wheel) — no Node runtime needed.
 #   git, ca-certificates, curl → install + general runtime
+#
+# Claude Code is installed via Anthropic's NATIVE installer (self-contained
+# binary), NOT npm — this drops the entire Node/npm toolchain from the image
+# and avoids the npm optional-dep bin-symlink flakiness that left `claude` off
+# PATH. We symlink it onto a standard PATH dir and run `claude --version` so a
+# broken/missing binary fails the build loudly instead of shipping silently.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates git ffmpeg libopus0 \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g @anthropic-ai/claude-code \
-    # Claude Code 2.x ships the CLI as a platform-specific optional-dep binary;
-    # npm's `claude` bin symlink is sometimes NOT created on a clean global
-    # install, leaving the executor unable to spawn `claude`. Force the symlink
-    # to the real binary and verify at build time so a broken link fails loudly.
-    && ln -sf /usr/lib/node_modules/@anthropic-ai/claude-code/node_modules/@anthropic-ai/claude-code-linux-x64/claude /usr/local/bin/claude \
+    && curl -fsSL https://claude.ai/install.sh | bash \
+    && ln -sf /root/.local/bin/claude /usr/local/bin/claude \
     && claude --version \
     && apt-get purge -y curl \
     && apt-get autoremove -y \
