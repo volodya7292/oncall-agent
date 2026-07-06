@@ -339,14 +339,6 @@ class Settings(BaseSettings):
     # so changes require a daemon restart.
     operator_language: str = ""
 
-    # IANA timezone the operator and executor render "now" in (e.g.
-    # "Europe/Berlin"). Empty = use the host machine's local timezone, which
-    # is the right default for a single-owner on-call agent running on the
-    # owner's own box. Injected fresh per turn (operator) / per spawn
-    # (executor), so changes take effect without a daemon restart for the
-    # operator; the executor picks it up on its next hand_off.
-    operator_timezone: str = ""
-
     # Display name the operator uses to refer to itself. Substituted into the
     # operator system prompt as {{agent_name}}. Empty = "On-call agent".
     agent_name: str = ""

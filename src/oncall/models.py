@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Literal
 from uuid import UUID, uuid4
-from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field
 
@@ -16,32 +15,18 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def format_local_now(tz_name: str = "") -> str:
-    """Current wall-clock time, formatted for injection into an LLM prompt.
+def format_utc_now() -> str:
+    """Current time in UTC, formatted for injection into an LLM prompt.
 
-    `tz_name` is an IANA zone (e.g. 'Europe/Berlin'); an empty string uses
-    the host's local timezone (via `astimezone()`). The string carries the
-    weekday, 24h time, a zone label, and the UTC offset, so a downstream
-    model can both reason about "today/tonight" AND state the time back to
-    the user without inventing one. Example:
+    Always UTC — deterministic regardless of the host/container timezone
+    (the daemon runs on a UTC server). The model converts to the owner's
+    local time using the timezone it knows from memory, and states UTC
+    plainly when it doesn't. Carries the weekday so "today/tonight"
+    reasoning still works. Never raises. Example:
 
-        2026-06-24 00:33 (Tuesday), Europe/Berlin (UTC+02:00)
+        2026-06-24 00:33 UTC (Tuesday)
     """
-    if tz_name:
-        try:
-            now = datetime.now(ZoneInfo(tz_name))
-        except Exception:
-            log.warning(
-                "invalid operator_timezone %r; falling back to system local tz",
-                tz_name,
-            )
-            now = datetime.now().astimezone()
-    else:
-        now = datetime.now().astimezone()
-    off = now.strftime("%z")  # "+0200"; never empty since `now` is tz-aware
-    off_fmt = f"{off[:3]}:{off[3:]}" if off else "+00:00"
-    label = tz_name or now.tzname() or "local"
-    return now.strftime("%Y-%m-%d %H:%M (%A)") + f", {label} (UTC{off_fmt})"
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC (%A)")
 
 
 def new_uuid() -> UUID:
