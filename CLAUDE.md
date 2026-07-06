@@ -2,22 +2,21 @@
 
 Project-specific notes for Claude Code working in this repo.
 
-## Reinstalling after source changes
+## Deployment: server-primary, laptop as worker
 
-The user runs `oncall` from a uv-tool install at `/Users/admin/.local/share/uv/tools/oncall-agent/`, NOT from the editable checkout. That copy is a snapshot from the last `uv build` — source-tree edits do not reach it. After any change that the running daemon needs to see (prompts under `src/oncall/prompts/`, packaged settings under `src/oncall/executor/`, code changes, dependency additions), rebuild and reinstall:
+The orchestrator (`oncall api`, `ONCALL_ROLE=server`) runs in Docker on an always-on hosted server, NOT on this laptop. GitHub CI builds the server image on every push to `main` and publishes it to `ghcr.io/<owner>/oncall-agent` (see [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)). To deploy a change to the daemon: commit, push to `main`, wait for CI, then pull the new image and restart the container on the server. Local `uv build` does nothing for the server.
+
+The laptop runs only the **capability worker** (`oncall laptop-worker`, launchd label `com.oncall.worker`), which long-polls the server and executes local shell/file jobs. It runs from the uv-tool install at `/Users/admin/.local/share/uv/tools/oncall-agent/` — a snapshot from the last `uv build`, so source-tree edits do not reach it. After a change the worker needs to see:
 
 ```sh
 uv build
 uv tool install --force ./dist/oncall_agent-0.1.0-py3-none-any.whl
+oncall service start --worker   # restarts the launchd-managed worker
 ```
 
-Additionally, the running `oncall api` daemon loads the operator system prompt **once at startup** (see `Operator.__init__` in [src/oncall/operator.py](src/oncall/operator.py)). Prompt edits — even on the editable install path — require a daemon restart to take effect. The daemon is launchd-managed; restart with:
+Do NOT `kill` the worker PID directly — launchd respawns it from the same wheel anyway; `oncall service start --worker` is the right knob. Worker logs live at `~/.oncall/logs/worker.{out,err}.log`.
 
-```sh
-oncall service start            # restarts the launchd-managed daemon
-```
-
-Do NOT `kill` the PID directly — launchd will respawn it from the same wheel anyway. `oncall service start` is the right knob.
+Note the `oncall api` daemon loads the operator system prompt **once at startup** (see `Operator.__init__` in [src/oncall/operator.py](src/oncall/operator.py)), so prompt edits also require a container restart on the server.
 
 ## Testing discipline
 
@@ -64,13 +63,13 @@ Any `asyncio.create_task`-launched loop in [src/oncall/api.py](src/oncall/api.py
 
 ## Inspecting SQLite state
 
-The orchestrator runs SQLite in WAL mode at `~/.oncall/state.db`. Safe inspection while the daemon is live:
+The orchestrator runs SQLite in WAL mode at `~/.oncall/state.db` — which, in the server-primary deployment, lives **on the hosted server** inside the container's `/root/.oncall` volume (`oncall_state`), not on this laptop. Safe inspection while the daemon is live:
 
 ```sh
-# Ad-hoc query (WAL allows concurrent reads):
-sqlite3 ~/.oncall/state.db "SELECT id, text, last_accessed_at FROM operator_memories ORDER BY last_accessed_at DESC;"
+# On the server, inside the container (WAL allows concurrent reads):
+docker exec oncall sqlite3 /root/.oncall/state.db \
+  "SELECT id, text, last_accessed_at FROM operator_memories ORDER BY last_accessed_at DESC;"
 
 # Or a snapshot if you'll be poking around for a while:
-sqlite3 ~/.oncall/state.db ".backup /tmp/oncall.db"
-sqlite3 /tmp/oncall.db
+docker exec oncall sqlite3 /root/.oncall/state.db ".backup /tmp/oncall.db"
 ```

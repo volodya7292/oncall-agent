@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -179,16 +180,39 @@ async def run_worker(settings: Settings) -> None:
     read_timeout = settings.oncall_laptop_poll_timeout_seconds + 20
     timeout = httpx.Timeout(connect=10.0, read=read_timeout, write=30.0, pool=10.0)
     backoff = 1.0
+    # Outage tracking so recovery is as loud as failure: monotonic ts of the
+    # first failed poll in the current outage + how many polls failed in it.
+    down_since: float | None = None
+    failed_polls = 0
     log.info("laptop-worker polling %s", server)
+
+    def _mark_reconnected() -> None:
+        nonlocal down_since, failed_polls
+        if down_since is not None:
+            log.info(
+                "laptop-worker reconnected to %s after %.0fs offline (%d failed polls)",
+                server, time.monotonic() - down_since, failed_polls,
+            )
+            down_since = None
+            failed_polls = 0
+
+    def _mark_failed() -> None:
+        nonlocal down_since, failed_polls
+        if down_since is None:
+            down_since = time.monotonic()
+        failed_polls += 1
+
     async with httpx.AsyncClient(timeout=timeout) as client:
         while True:
             try:
                 r = await client.get(f"{server}/laptop/jobs", headers=headers)
                 if r.status_code == 401:
+                    _mark_failed()
                     log.error("laptop-worker auth rejected (check ONCALL_LAPTOP_TOKEN); backing off")
                     await asyncio.sleep(30)
                     continue
                 r.raise_for_status()
+                _mark_reconnected()
                 backoff = 1.0
                 job = r.json().get("job")
                 if job is None:
@@ -203,9 +227,14 @@ async def run_worker(settings: Settings) -> None:
             except asyncio.CancelledError:
                 raise
             except httpx.ReadTimeout:
-                # Expected: the long-poll held past our read window with no job.
+                # Expected: the long-poll held past our read window with no
+                # job. The connection itself succeeded, so this also ends an
+                # outage.
+                _mark_reconnected()
+                backoff = 1.0
                 continue
             except Exception as e:
+                _mark_failed()
                 log.warning("laptop-worker poll error (%s: %s); retrying in %.0fs",
                             type(e).__name__, e, min(backoff, 30))
                 await asyncio.sleep(min(backoff, 30))

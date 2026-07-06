@@ -205,6 +205,12 @@ class _ActiveCall:
     nudges_since_user: int = 0
     tasks: list[asyncio.Task] = field(default_factory=list)
     is_speaking: bool = False              # outbound is currently emitting TTS audio
+    # The user is mid-utterance (VAD saw speech start, turn hasn't ended yet).
+    # Mirrors is_speaking for the inbound side: the watchdog must not count
+    # someone actively talking as "silence" — last_turn_at only advances at
+    # utterance END, so without this flag a long user turn straddling
+    # NUDGE_AFTER_S would trip a nudge mid-sentence.
+    user_speaking: bool = False
     in_flight_tts: asyncio.Task | None = None
     # Monotonic counter feeding the outbound priority-queue tuples.
     outbound_seq: int = 0
@@ -677,6 +683,12 @@ class CallService:
                 # agent actively producing audio.
                 if active.is_speaking:
                     continue
+                # Same for the user: they're mid-utterance (VAD saw speech
+                # start, the turn hasn't ended yet). last_turn_at only moves
+                # at utterance END, so without this gate a long user turn
+                # reads as silence and gets nudged/torn down over.
+                if active.user_speaking:
+                    continue
                 # Proactive re-engagement before the hard idle teardown: if the
                 # line has gone quiet since the last spoken turn and we have
                 # nothing already queued/being synthesized to say, ping the
@@ -978,6 +990,7 @@ class CallService:
                                 pcm_bytes = bytes(utt_buf)
                                 utt_buf.clear()
                                 speaking = False
+                                active.user_speaking = False
                                 silent_ms = 0
                                 voiced_ms = 0
                                 # Trim trailing silence we already accumulated.
@@ -997,6 +1010,7 @@ class CallService:
                             voiced_ms += chunk_ms
                             if voiced_ms >= VAD_START_MS:
                                 speaking = True
+                                active.user_speaking = True
                                 log.info("voice: utterance start")
                                 # Barge-in fires off the same speech-start gate
                                 # (pipecat's VADUserTurnStartStrategy): once the
@@ -1037,6 +1051,10 @@ class CallService:
             raise
         except Exception:
             log.exception("voice inbound loop crashed")
+        finally:
+            # Don't leave the flag stuck if the loop dies mid-utterance —
+            # the watchdog would then never idle the call out.
+            active.user_speaking = False
             raise
 
     def _call_start_note(self, active: _ActiveCall) -> str:
