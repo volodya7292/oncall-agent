@@ -287,11 +287,13 @@ def create_app() -> FastAPI:
                 settings.oncall_operator_backend,
             )
         # Primary Telegram userbot — runs on the owner's account. Inbound
-        # gating happens entirely at the DM allowlist (/allowdm): chats not
-        # on it — including the agent account's own chat — never reach the
-        # inbox.
+        # gating happens at the DM allowlist (/allowdm); on top of that the
+        # agent account's own chat is dropped unconditionally so its replies
+        # can't loop back into the inbox.
+        from .config import read_telegram_agent_user_id
         telegram: TelegramService | None = await _maybe_start_telegram(
             settings, db, events,
+            agent_user_id=read_telegram_agent_user_id(),
         )
         # Shared one-shot Claude CLI runner — used by the operator for chat
         # context compression and by the auto-ping loop for per-task summaries.
@@ -1166,6 +1168,8 @@ async def _maybe_start_voice_call(
 
 async def _maybe_start_telegram(
     settings, db: Database, events: EventBus,
+    *,
+    agent_user_id: int | None = None,
 ) -> TelegramService | None:
     """Boot the telethon listener if credentials and a session file are present.
     Failures are logged but never crash the API — `/chat` and tasks still work
@@ -1191,6 +1195,7 @@ async def _maybe_start_telegram(
             db=db,
             client=client,
             on_new_message=_emit_received,
+            agent_user_id=agent_user_id,
         )
         await service.start()
         return service
@@ -1571,17 +1576,23 @@ def _register_routes(app: FastAPI) -> None:
             if db is None:
                 raise HTTPException(503, "db not available")
             # Allowlist: owner is always callable; everyone else must be
-            # on the DM allowlist (the same one `/dmlist` shows).
-            allowed = False
+            # on the DM allowlist (the same one `/dmlist` shows) AND in the
+            # owner's Telegram contacts — the same contacts-only floor that
+            # gates text. The owner bypasses the contact check (you're not
+            # your own contact).
             if owner_user_id and str(target) == str(owner_user_id):
-                allowed = True
-            else:
-                allowed = await db.is_dm_allowed(str(target))
-            if not allowed:
+                pass
+            elif not await db.is_dm_allowed(str(target)):
                 raise HTTPException(
                     403,
                     f"chat_id {target} is not on the call allowlist "
                     f"(must be the owner or on /dmlist)",
+                )
+            elif not await tg.is_owner_contact(str(target)):
+                raise HTTPException(
+                    403,
+                    f"chat_id {target} is not in the owner's Telegram "
+                    f"contacts; the agent only calls known contacts",
                 )
             try:
                 await call_service.place_call(target, reason=reason)

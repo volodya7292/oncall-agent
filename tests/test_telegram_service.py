@@ -36,6 +36,7 @@ class FakeTelegramClient:
         messages: dict[int, list[dict[str, Any]]] | None = None,
         dialogs: list[dict[str, Any]] | None = None,
         contact_search_users: list[dict[str, Any]] | None = None,
+        non_contact_ids: set[int] | None = None,
     ) -> None:
         self.connected = False
         self.disconnected = False
@@ -43,6 +44,9 @@ class FakeTelegramClient:
         self.handler: Any = None
         self.event_filter: Any = None
         self.sent: list[dict[str, Any]] = []
+        # get_entity(id) reports .contact=True unless the id is listed here.
+        # Lets outbound-contact-gate tests simulate a stranger.
+        self._non_contact_ids = non_contact_ids or set()
         # outgoing[chat_id_int] = [{"id": int, "message": str, "date": dt}]
         # — only the user's own outgoing, used by get_chat_style tests.
         self._outgoing = outgoing or {}
@@ -95,6 +99,14 @@ class FakeTelegramClient:
         msg_id = 1000 + len(self.sent)
         self.sent.append({"entity": entity, "message": message, "id": msg_id})
         return SimpleNamespace(id=msg_id)
+
+    async def get_entity(self, entity):
+        # The outbound contacts gate resolves the target and reads .contact.
+        try:
+            eid = int(entity)
+        except (TypeError, ValueError):
+            eid = None
+        return SimpleNamespace(id=eid, contact=(eid not in self._non_contact_ids))
 
     def iter_messages(self, entity, *, limit=20, from_user=None, search=None, **kwargs):
         chat_id = entity if isinstance(entity, int) else 0
@@ -160,12 +172,12 @@ def make_event(
     *, sender_username: str | None, body: str, is_private: bool = True,
     chat_id: int = 12345, message_id: int = 42, is_bot: bool = False,
     is_self: bool = False, out: bool = False, sender_id: int = 7777,
-    reply_to: Any = None,
+    reply_to: Any = None, is_contact: bool = True,
 ) -> Any:
     sender = SimpleNamespace(
         id=sender_id, username=sender_username,
         first_name="Alex", last_name=None,
-        bot=is_bot, is_self=is_self,
+        bot=is_bot, is_self=is_self, contact=is_contact,
     )
     message = SimpleNamespace(
         message=body, id=message_id, out=out,
@@ -262,6 +274,43 @@ async def test_reply_anchor_prepended_to_inbox_body(service, db):
 
 
 @pytest.mark.asyncio
+async def test_inbound_from_non_contact_is_dropped(service, db):
+    """Contacts-only floor: a DM from a sender who is NOT in the owner's
+    contacts is dropped even when the chat is on the DM allowlist."""
+    s, client = service
+    # chat 12345 is allowlisted by the fixture, but the sender is a stranger.
+    await client.handler(make_event(
+        sender_username="stranger", body="hi, buy my coin", is_contact=False,
+    ))
+    assert await db.list_inbox(unread_only=False) == []
+    # A contact in the same allowlisted chat gets through normally.
+    await client.handler(make_event(
+        sender_username="friend", body="hey", is_contact=True, message_id=43,
+    ))
+    rows = await db.list_inbox(unread_only=False)
+    assert len(rows) == 1
+    assert rows[0]["sender_username"] == "friend"
+
+
+@pytest.mark.asyncio
+async def test_agent_self_chat_dropped_even_if_allowlisted(db):
+    """Backstop: the agent account's own chat never enters the primary
+    userbot's inbox, even if its chat_id is on the DM allowlist."""
+    client = FakeTelegramClient()
+    s = TelegramService(db=db, client=client, agent_user_id=999000)
+    await db.allow_dm("999000")  # pathological: agent chat allowlisted
+    await s.start()
+    try:
+        await client.handler(make_event(
+            sender_username="agentacct", body="[auto] on it",
+            chat_id=999000, sender_id=999000,
+        ))
+        assert await db.list_inbox(unread_only=False) == []
+    finally:
+        await s.stop()
+
+
+@pytest.mark.asyncio
 async def test_non_private_chat_ignored(service, db):
     s, client = service
     event = make_event(sender_username="bot", body="ad spam", is_private=False)
@@ -332,6 +381,22 @@ async def test_send_calls_underlying_client(db):
     assert client.sent and client.sent[0]["message"] == "draft reply"
     assert client.sent[0]["entity"] == 12345  # coerced to int
     assert out["message_id"] == str(client.sent[0]["id"])
+
+
+@pytest.mark.asyncio
+async def test_send_to_non_contact_is_refused(db):
+    """Outbound contacts floor: sending to a chat that isn't in the owner's
+    contacts is refused before any message leaves, mirroring the inbound
+    drop. Guards against cold-messaging a stranger via a stray chat_id."""
+    client = FakeTelegramClient(non_contact_ids={55555})
+    s = TelegramService(db=db, client=client)
+    await s.start()
+    try:
+        with pytest.raises(ValueError, match="not in the owner's"):
+            await s.send("55555", "unsolicited message")
+        assert client.sent == []
+    finally:
+        await s.stop()
 
 
 @pytest.mark.asyncio

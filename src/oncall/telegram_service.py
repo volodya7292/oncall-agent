@@ -74,12 +74,20 @@ class TelegramService:
         db: Database,
         client: TelegramClientLike,
         on_new_message: NewMessageCallback | None = None,
+        agent_user_id: int | None = None,
     ) -> None:
         self._db = db
         self._client = client
         self._on_new_message = on_new_message
         self._handler_ref: Any = None
         self._started = False
+        # Hard guard: the agent account's chat with the owner must never
+        # enter the primary userbot's inbox — otherwise the agent's own
+        # replies would loop back as inbound DMs. The DM allowlist normally
+        # keeps it out (the owner just doesn't /allowdm it), but this is an
+        # unconditional backstop that holds even if that chat_id somehow
+        # lands on the allowlist. None until the agent account is known.
+        self._agent_user_id = agent_user_id
 
     @property
     def is_started(self) -> bool:
@@ -185,6 +193,29 @@ class TelegramService:
         username = (getattr(sender, "username", None) or "").lower() or None
         display = _display_name(sender)
         chat_id = str(getattr(event, "chat_id", None) or getattr(event.message, "chat_id", ""))
+
+        # Unconditional backstop: never surface the agent account's own chat,
+        # even if it somehow ends up on the DM allowlist. In a 1:1 DM,
+        # chat_id == the other party's user_id.
+        if self._agent_user_id is not None and chat_id == str(self._agent_user_id):
+            log.info(
+                "inbound skipped reason=agent_self_chat chat=%s", chat_id,
+            )
+            return
+
+        # Contacts-only floor: the agent may only ever communicate with
+        # people in the owner's Telegram address book. The primary userbot
+        # runs on the owner's account, so the sender User's `.contact` flag
+        # is exactly "is this person an owner contact". Strangers (spam,
+        # cold DMs, injection attempts) are dropped before triage. This sits
+        # beneath the allowlist: allowlisting a non-contact still won't
+        # surface them.
+        if not getattr(sender, "contact", False):
+            log.info(
+                "inbound skipped reason=not_a_contact chat=%s sender=%s",
+                chat_id, username or display,
+            )
+            return
 
         # Triage gate: only chats the owner has explicitly allowlisted (via
         # /allowdm, shown by /dmlist) are triaged. DMs from everyone else are
@@ -577,7 +608,34 @@ class TelegramService:
             "is_user": is_user,
         }
 
+    async def is_owner_contact(self, chat_id: str) -> bool:
+        """Whether `chat_id` resolves to a user in the owner's Telegram
+        address book. The primary userbot runs on the owner's account, so a
+        resolved User's `.contact` flag is exactly "owner contact". Fails
+        closed (False) when the entity can't be resolved or isn't a user."""
+        try:
+            entity = await self._client.get_entity(_entity_arg(chat_id))
+        except Exception as e:
+            log.warning(
+                "contact check: get_entity failed for chat=%s: %s", chat_id, e,
+            )
+            return False
+        return bool(getattr(entity, "contact", False))
+
+    async def _require_owner_contact(self, chat_id: str) -> None:
+        """Refuse to message a chat that isn't in the owner's Telegram
+        address book. The agent may only ever communicate with the owner's
+        known contacts — a hard boundary against cold-messaging strangers,
+        mirroring the inbound contacts-only floor. Fails closed: if the
+        entity can't be resolved, the send is refused rather than allowed."""
+        if not await self.is_owner_contact(chat_id):
+            raise ValueError(
+                f"refusing to message chat_id={chat_id}: not in the owner's "
+                f"Telegram contacts (or the contact could not be verified)"
+            )
+
     async def send(self, chat_id: str, text: str) -> dict[str, Any]:
+        await self._require_owner_contact(chat_id)
         entity = _entity_arg(chat_id)
         text = re.sub(r"[ \t]*[–—][ \t]*", " - ", text)
         sent = await self._client.send_message(entity, text)
@@ -598,6 +656,7 @@ class TelegramService:
         p = Path(file_path).expanduser()
         if not p.is_file():
             raise ValueError(f"file not found or not a regular file: {p}")
+        await self._require_owner_contact(chat_id)
         entity = _entity_arg(chat_id)
         normalized_caption = (
             re.sub(r"[ \t]*[–—][ \t]*", " - ", caption) if caption else None
@@ -628,6 +687,7 @@ class TelegramService:
             msg_id_int = int(str(message_id).strip())
         except (TypeError, ValueError):
             raise ValueError(f"invalid message_id: {message_id!r}")
+        await self._require_owner_contact(chat_id)
         from telethon.tl.functions.messages import SendReactionRequest  # type: ignore
         from telethon.tl.types import ReactionEmoji  # type: ignore
         entity = _entity_arg(chat_id)
