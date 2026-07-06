@@ -248,6 +248,11 @@ WATCHDOG_TICK_S = 5.0       # how often _call_watchdog re-checks
 NUDGE_AFTER_S = 12.0
 MAX_NUDGES = 2
 
+# Amplitude scale applied to the ambient office bed at load time. 0.7 = a
+# 30% reduction from the asset's native level, so the bed sits further
+# under speech.
+_BED_GAIN = 0.7
+
 
 class CallService:
     def __init__(
@@ -347,8 +352,14 @@ class CallService:
         if usable <= 0:
             log.warning("voice: ambient bed decoded empty; running bed-free")
             return
-        self._bed_pcm = pcm[:usable]
-        log.info("voice: ambient bed loaded (%.1fs loop)", usable / 2 / PCM_RATE)
+        # Attenuate the whole loop once at load time so every consumer (idle
+        # bed loop + the under-speech mix) gets the quieter bed at no
+        # per-frame cost.
+        self._bed_pcm = audioop.mul(pcm[:usable], 2, _BED_GAIN)
+        log.info(
+            "voice: ambient bed loaded (%.1fs loop, gain %.2f)",
+            usable / 2 / PCM_RATE, _BED_GAIN,
+        )
 
     def _next_bed_frame(self, active: _ActiveCall) -> bytes:
         """One BYTES_PER_FRAME slice of the bed, advancing (and wrapping) the
