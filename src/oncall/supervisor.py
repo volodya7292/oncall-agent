@@ -338,16 +338,20 @@ class Supervisor:
             # the moment the subprocess exited, so the next spawn would
             # fail with "No conversation found".
         ]
-        # Cloud-primary mode: this process runs on a VPS with no useful local
-        # filesystem. Deny the executor's native local tools so it can't
-        # silently operate on the server box — all local work must go through
-        # the `mcp__oncall__laptop` proxy, which runs on the user's laptop.
+        # Cloud-primary mode: this process runs in a container on a VPS.
+        # Deny the executor's native MUTATING tools so it can't silently
+        # operate on the server box — local work goes through the
+        # `mcp__oncall__laptop` proxy, which runs on the user's laptop.
+        # Read-only tools (Read/Glob/Grep) stay enabled: the container is
+        # isolated, and Telegram attachments land on the SERVER's disk
+        # (~/.oncall/inbound) — without native Read the executor has no way
+        # to open them (the laptop proxy looks at the wrong machine).
         # WebFetch/WebSearch (allowlisted in settings.json) and the MCP tools
         # stay available.
         if self._settings.is_server_role:
             argv += [
                 "--disallowedTools",
-                "Bash,Read,Edit,Write,NotebookEdit,Glob,Grep",
+                "Bash,Edit,Write,NotebookEdit",
             ]
         argv += ["--model", task.model or "sonnet"]
         if task.max_turns:
@@ -375,10 +379,16 @@ class Supervisor:
         if self._settings.is_server_role:
             text += (
                 "\n\n# Execution environment (cloud)\n\n"
-                "You are running on a cloud server, NOT the user's machine. You "
-                "have NO local filesystem, shell, or access to the user's files "
-                "of your own — your native Bash/Read/Edit/Write/Glob/Grep tools "
-                "are disabled here.\n\n"
+                "You are running in a container on a cloud server, NOT the "
+                "user's machine. Your native Bash/Edit/Write tools are "
+                "disabled here. Read/Glob/Grep work, but they see the "
+                "SERVER's filesystem — not the user's files.\n\n"
+                "- Attachments the user sends over Telegram (images, PDFs, "
+                "documents) are saved on the server and announced in the "
+                "message as `[file attached: <path>]`. `Read` that path "
+                "directly — images and PDFs come back inline. Do NOT use the "
+                "laptop tool for these; the file does not exist on the "
+                "laptop.\n"
                 "- For web research and reasoning, use WebSearch / WebFetch "
                 "directly.\n"
                 "- For ANYTHING on the user's machine (their files, repos, local "
