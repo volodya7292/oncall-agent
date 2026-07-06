@@ -303,15 +303,6 @@ class Settings(BaseSettings):
         default_factory=lambda: Path("~/.oncall/telegram.session").expanduser()
     )
 
-    telegram_important_senders: str = ""
-    telegram_important_keywords: str = "urgent,down,production,outage,critical"
-    # Senders (lowercased @handles, comma-separated) whose messages should
-    # never reach the inbox. The agent userbot's own chat with the owner is
-    # filtered separately by chat_id (TELEGRAM_AGENT_USER_ID_FILE). This list
-    # is for OTHER senders you'd rather not see (e.g. service bots like
-    # @userinfobot).
-    telegram_userbot_ignore_usernames: str = ""
-
     # Agent userbot — runs on a dedicated second Telegram account. This is
     # the user-facing surface: the owner DMs it to talk to the operator,
     # approval prompts arrive here, chat.reply auto-pings land here. Voice
@@ -370,18 +361,6 @@ class Settings(BaseSettings):
     def prod_hosts(self) -> set[str]:
         return {h.strip() for h in self.oncall_prod_hosts.split(",") if h.strip()}
 
-    @property
-    def important_senders(self) -> set[str]:
-        return {s.strip().lstrip("@") for s in self.telegram_important_senders.split(",") if s.strip()}
-
-    @property
-    def important_keywords(self) -> set[str]:
-        return {k.strip().lower() for k in self.telegram_important_keywords.split(",") if k.strip()}
-
-    @property
-    def userbot_ignore_usernames(self) -> set[str]:
-        return {s.strip().lstrip("@").lower()
-                for s in self.telegram_userbot_ignore_usernames.split(",") if s.strip()}
 
 
 class Paths:

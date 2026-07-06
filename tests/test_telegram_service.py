@@ -1,8 +1,8 @@
 """TelegramService tests with a fake TelegramClientLike.
 
 These cover:
-  * NewMessage handler writes inbound DM to messenger_inbox with correct fields
-    and triages importance (sender allowlist + keyword match).
+  * NewMessage handler writes inbound DM to messenger_inbox with correct
+    fields, gated on the DM allowlist.
   * Private filter rejects non-private events.
   * Duplicate (chat_id, message_id) doesn't insert twice.
   * `get_chat_style` reads only the user's OWN outgoing messages.
@@ -207,11 +207,7 @@ async def db(tmp_path):
 @pytest.fixture
 async def service(db):
     client = FakeTelegramClient()
-    s = TelegramService(
-        db=db, client=client,
-        important_senders={"alex", "boss"},
-        important_keywords={"urgent", "down"},
-    )
+    s = TelegramService(db=db, client=client)
     # Inbound triage is gated on the DM allowlist (see _handle_inbound).
     # Allowlist the chat_ids the triage tests exercise so they test triage,
     # not the gate — the gate itself is covered by its own test below.
@@ -241,36 +237,16 @@ async def test_inbound_dm_written_to_inbox(service, db):
     assert row["body"] == "hey, free tonight?"
     assert row["chat_id"] == "12345"
     assert row["sender_username"] == "someone"
-    assert row["is_important"] is False
 
 
 @pytest.mark.asyncio
-async def test_inbound_dm_triaged_important_by_sender(service, db):
-    s, client = service
-    event = make_event(sender_username="alex", body="just saying hi")
-    await client.handler(event)
-    rows = await db.list_inbox()
-    assert rows[0]["is_important"] is True
-
-
-@pytest.mark.asyncio
-async def test_inbound_dm_triaged_important_by_keyword(service, db):
-    s, client = service
-    event = make_event(sender_username="rando", body="staging is DOWN")
-    await client.handler(event)
-    rows = await db.list_inbox()
-    assert rows[0]["is_important"] is True
-
-
-@pytest.mark.asyncio
-async def test_reply_anchor_stored_but_quoted_keyword_not_important(service, db):
-    """Guard against importance-by-quotation: a Telegram reply stores a
-    `[replying to ...]` anchor with the quoted text, but triage runs on the
-    raw body — a keyword appearing ONLY in the quoted message must not mark
-    the new inbound important."""
+async def test_reply_anchor_prepended_to_inbox_body(service, db):
+    """A Telegram reply stores a `[replying to ...]` anchor quoting the
+    referenced message — without it the reply pointer is invisible to the
+    operator and deictic answers lose their anchor."""
     s, client = service
     quoted = SimpleNamespace(
-        id=41, message="prod is DOWN, urgent!", out=True, media=None,
+        id=41, message="can you send the report today?", out=True, media=None,
     )
     event = make_event(
         sender_username="rando", body="ok, looking now", reply_to=quoted,
@@ -278,9 +254,9 @@ async def test_reply_anchor_stored_but_quoted_keyword_not_important(service, db)
     await client.handler(event)
     rows = await db.list_inbox()
     row = rows[0]
-    assert row["is_important"] is False
     assert row["body"] == (
-        '[replying to the owner\'s earlier message: "prod is DOWN, urgent!"]'
+        '[replying to the owner\'s earlier message: '
+        '"can you send the report today?"]'
         "\nok, looking now"
     )
 
@@ -334,7 +310,7 @@ async def test_get_chat_style_returns_user_outgoing(db):
             {"id": 7, "message": "+1", "date": base + timedelta(minutes=2)},
         ],
     })
-    s = TelegramService(db=db, client=client, important_senders=set(), important_keywords=set())
+    s = TelegramService(db=db, client=client)
     await s.start()
     try:
         samples = await s.get_chat_style("12345", limit=10)
@@ -347,7 +323,7 @@ async def test_get_chat_style_returns_user_outgoing(db):
 @pytest.mark.asyncio
 async def test_send_calls_underlying_client(db):
     client = FakeTelegramClient()
-    s = TelegramService(db=db, client=client, important_senders=set(), important_keywords=set())
+    s = TelegramService(db=db, client=client)
     await s.start()
     try:
         out = await s.send("12345", "draft reply")
@@ -476,67 +452,16 @@ async def test_mark_read_flag(service, db):
     assert await s.mark_read(inbox_id) is False
 
 
-# ---------------------------------------------------------------------------
-# Ignore filter — drops senders the user doesn't want in the inbox
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_inbound_from_ignored_username_is_dropped(db):
-    """The own-bot username is added to the ignore set so its outbound
-    replies don't re-enter the userbot's inbox. Verify by username."""
-    client = FakeTelegramClient()
-    s = TelegramService(
-        db=db, client=client,
-        important_senders=set(), important_keywords=set(),
-        ignore_usernames={"my_own_bot"},
-    )
-    await s.start()
-    try:
-        await client.handler(make_event(
-            sender_username="my_own_bot", body="auto-reply from my bot",
-        ))
-        # Inbox should be empty — the message was filtered.
-        rows = await db.list_inbox(unread_only=False)
-        assert rows == []
-    finally:
-        await s.stop()
-
-
-@pytest.mark.asyncio
-async def test_inbound_from_ignored_user_id_is_dropped(db):
-    """Auto-registration of the own bot uses user_id (which is captured from
-    Bot API getMe). Verify by id."""
-    client = FakeTelegramClient()
-    s = TelegramService(
-        db=db, client=client,
-        important_senders=set(), important_keywords=set(),
-    )
-    await s.start()
-    try:
-        # Simulate runtime registration: bot's user_id added after startup.
-        s.add_ignore_user_id(424242)
-        await client.handler(make_event(
-            sender_username=None, sender_id=424242, body="reply",
-        ))
-        assert await db.list_inbox(unread_only=False) == []
-    finally:
-        await s.stop()
-
-
 @pytest.mark.asyncio
 async def test_inbound_from_non_allowlisted_chat_is_dropped(db):
     """Triage gate: a DM from a chat that is NOT on the dm_allowlist is
     dropped in _handle_inbound — never recorded, never surfaced. The
-    allowlist is absolute, so even an important_sender/keyword hit from a
-    non-allowlisted chat is ignored."""
+    allowlist is absolute."""
     client = FakeTelegramClient()
-    s = TelegramService(
-        db=db, client=client,
-        important_senders={"alex"}, important_keywords={"urgent"},
-    )
+    s = TelegramService(db=db, client=client)
     await s.start()
     try:
-        # important_sender AND keyword, but chat 999 isn't allowlisted.
+        # Chat 999 isn't allowlisted.
         await client.handler(make_event(
             sender_username="alex", body="urgent: server down", chat_id=999,
         ))
@@ -570,7 +495,6 @@ async def test_get_chat_history_returns_both_sides(db):
     })
     s = TelegramService(
         db=db, client=client,
-        important_senders=set(), important_keywords=set(),
     )
     await s.start()
     try:
@@ -597,7 +521,6 @@ async def test_search_chats_substring_match_on_name_and_username(db):
     ])
     s = TelegramService(
         db=db, client=client,
-        important_senders=set(), important_keywords=set(),
     )
     await s.start()
     try:
@@ -614,7 +537,6 @@ async def test_search_chats_empty_query_returns_nothing(db):
     client = FakeTelegramClient(dialogs=[{"id": 1, "name": "x"}])
     s = TelegramService(
         db=db, client=client,
-        important_senders=set(), important_keywords=set(),
     )
     await s.start()
     try:
@@ -647,7 +569,6 @@ async def test_search_messages_filters_by_query_and_returns_both_sides(db):
     })
     s = TelegramService(
         db=db, client=client,
-        important_senders=set(), important_keywords=set(),
     )
     await s.start()
     try:
@@ -671,7 +592,6 @@ async def test_search_messages_empty_query_returns_nothing(db):
     ]})
     s = TelegramService(
         db=db, client=client,
-        important_senders=set(), important_keywords=set(),
     )
     await s.start()
     try:
@@ -693,7 +613,6 @@ async def test_search_chats_token_and_match_handles_word_order(db):
     ])
     s = TelegramService(
         db=db, client=client,
-        important_senders=set(), important_keywords=set(),
     )
     await s.start()
     try:
@@ -719,7 +638,6 @@ async def test_search_chats_contact_fallback_for_transliterated_name(db):
     )
     s = TelegramService(
         db=db, client=client,
-        important_senders=set(), important_keywords=set(),
     )
     await s.start()
     try:
@@ -740,7 +658,6 @@ async def test_search_chats_respects_limit(db):
     ])
     s = TelegramService(
         db=db, client=client,
-        important_senders=set(), important_keywords=set(),
     )
     await s.start()
     try:
@@ -764,7 +681,6 @@ async def test_get_chat_history_skips_empty_messages(db):
     })
     s = TelegramService(
         db=db, client=client,
-        important_senders=set(), important_keywords=set(),
     )
     await s.start()
     try:
@@ -798,7 +714,6 @@ async def test_get_chat_history_surfaces_media_only_messages(db):
     })
     s = TelegramService(
         db=db, client=client,
-        important_senders=set(), important_keywords=set(),
     )
     await s.start()
     try:
@@ -830,7 +745,6 @@ async def test_list_chats_returns_recent_dialogs_in_order(db):
     ])
     s = TelegramService(
         db=db, client=client,
-        important_senders=set(), important_keywords=set(),
     )
     await s.start()
     try:
@@ -855,7 +769,6 @@ async def test_list_chats_unread_only_filter(db):
     ])
     s = TelegramService(
         db=db, client=client,
-        important_senders=set(), important_keywords=set(),
     )
     await s.start()
     try:
@@ -875,7 +788,6 @@ async def test_list_chats_dms_only_filter(db):
     ])
     s = TelegramService(
         db=db, client=client,
-        important_senders=set(), important_keywords=set(),
     )
     await s.start()
     try:
@@ -899,7 +811,6 @@ async def test_list_chats_includes_archived(db):
     ])
     s = TelegramService(
         db=db, client=client,
-        important_senders=set(), important_keywords=set(),
     )
     await s.start()
     try:
@@ -919,7 +830,6 @@ async def test_list_chats_respects_limit(db):
     ])
     s = TelegramService(
         db=db, client=client,
-        important_senders=set(), important_keywords=set(),
     )
     await s.start()
     try:
@@ -929,28 +839,3 @@ async def test_list_chats_respects_limit(db):
     assert len(rows) == 7
 
 
-@pytest.mark.asyncio
-async def test_ignore_does_not_block_legitimate_senders(db):
-    """Sanity: the ignore set must only block matching senders. Others go
-    through normally."""
-    client = FakeTelegramClient()
-    s = TelegramService(
-        db=db, client=client,
-        important_senders=set(), important_keywords=set(),
-        ignore_usernames={"banned_bot"},
-    )
-    await db.allow_dm("12345")  # triage is allowlist-gated; chat 12345 is default
-    await s.start()
-    try:
-        await client.handler(make_event(
-            sender_username="banned_bot", body="ignored",
-        ))
-        await client.handler(make_event(
-            sender_username="real_person", body="hello",
-            message_id=43,
-        ))
-        rows = await db.list_inbox(unread_only=False)
-        assert len(rows) == 1
-        assert rows[0]["sender_username"] == "real_person"
-    finally:
-        await s.stop()

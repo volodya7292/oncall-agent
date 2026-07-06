@@ -73,44 +73,17 @@ class TelegramService:
         *,
         db: Database,
         client: TelegramClientLike,
-        important_senders: set[str],
-        important_keywords: set[str],
         on_new_message: NewMessageCallback | None = None,
-        ignore_usernames: set[str] | None = None,
-        ignore_user_ids: set[int] | None = None,
     ) -> None:
         self._db = db
         self._client = client
-        self._important_senders = {s.lstrip("@").lower() for s in important_senders}
-        self._important_keywords = {k.lower() for k in important_keywords}
         self._on_new_message = on_new_message
         self._handler_ref: Any = None
         self._started = False
-        # Senders whose messages should never reach the inbox. Two channels:
-        #   * ignore_usernames: lowercased @handles (from env). Useful for
-        #     blocking third-party bots that auto-DM you (e.g. @userinfobot).
-        #   * ignore_user_ids: numeric ids (populated at runtime when the
-        #     own-bot front-end starts and tells us its user_id, so the bot's
-        #     own replies don't show up in your DM inbox stream).
-        self._ignore_usernames: set[str] = {
-            s.lstrip("@").lower() for s in (ignore_usernames or set())
-        }
-        self._ignore_user_ids: set[int] = set(ignore_user_ids or set())
 
     @property
     def is_started(self) -> bool:
         return self._started
-
-    def add_ignore_user_id(self, user_id: int) -> None:
-        """Add a numeric user_id whose messages should be dropped from the
-        inbox. Safe to call any time — checked on each inbound.
-
-        Used at startup to populate the peer filter that drops the agent
-        userbot's chat with the owner from the primary inbox stream
-        (TELEGRAM_AGENT_USER_ID_FILE). In a 1:1 DM, chat_id == sender_id ==
-        the other party's user_id, so checking sender_id covers both the
-        "agent sends to owner" and "owner views chat with agent" cases."""
-        self._ignore_user_ids.add(int(user_id))
 
     # ---- lifecycle ----
 
@@ -210,29 +183,14 @@ class TelegramService:
             return
 
         username = (getattr(sender, "username", None) or "").lower() or None
-        sender_id = getattr(sender, "id", None)
-        if sender_id is not None and sender_id in self._ignore_user_ids:
-            log.info(
-                "inbound skipped reason=ignored_user_id chat=%s sender_id=%s",
-                chat_id_raw, sender_id,
-            )
-            return
-        if username is not None and username in self._ignore_usernames:
-            log.info(
-                "inbound skipped reason=ignored_username chat=%s username=%s",
-                chat_id_raw, username,
-            )
-            return
         display = _display_name(sender)
         chat_id = str(getattr(event, "chat_id", None) or getattr(event.message, "chat_id", ""))
 
         # Triage gate: only chats the owner has explicitly allowlisted (via
         # /allowdm, shown by /dmlist) are triaged. DMs from everyone else are
-        # dropped here so they never reach the inbox-drain / operator — the
-        # allowlist is absolute, so even an `important_senders`/keyword hit
-        # from a non-allowlisted chat is ignored. The real conversation still
-        # lives in Telegram; we just don't surface it. This is the same
-        # allowlist that gates autonomous DM replies.
+        # dropped here so they never reach the inbox-drain / operator. The
+        # real conversation still lives in Telegram; we just don't surface
+        # it. This is the same allowlist that gates autonomous DM replies.
         if not await self._db.is_dm_allowed(chat_id):
             log.info(
                 "inbound skipped reason=not_allowlisted chat=%s sender=%s",
@@ -243,10 +201,6 @@ class TelegramService:
         message_id = str(getattr(event.message, "id", ""))
         received_at = getattr(event.message, "date", None) or datetime.now(timezone.utc)
 
-        # Triage on the raw body BEFORE prepending the reply anchor, so
-        # quoted text from the replied-to message can't trip an importance
-        # keyword by itself.
-        important = self._triage(username, body)
         if getattr(event.message, "reply_to", None) is not None:
             try:
                 reply = await _maybe_await(event.message.get_reply_message())
@@ -275,7 +229,6 @@ class TelegramService:
             sender_username=username,
             sender_display_name=display,
             body=body,
-            is_important=important,
             received_at=received_at,
         )
         if not inserted:
@@ -283,19 +236,13 @@ class TelegramService:
 
         telegram_log.info("inbound " + fmt(
             inbox=inbox_id, chat=chat_id, sender=username or display,
-            important=important, body_len=len(body), body=body,
+            body_len=len(body), body=body,
         ))
 
         if self._on_new_message is not None:
             row = await self._db.get_inbox_message(inbox_id)
             if row is not None:
                 await self._on_new_message(row)
-
-    def _triage(self, username: str | None, body: str) -> bool:
-        if username and username in self._important_senders:
-            return True
-        body_l = body.lower()
-        return any(kw in body_l for kw in self._important_keywords)
 
     # ---- DB-backed queries (no telethon needed) ----
 

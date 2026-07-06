@@ -91,13 +91,6 @@ TELEGRAM_API_HASH=
 TELEGRAM_SESSION_PATH=~/.oncall/telegram.session
 TELEGRAM_AGENT_SESSION_PATH=~/.oncall/telegram_agent.session
 TELEGRAM_OWNER_USER_ID=
-TELEGRAM_IMPORTANT_SENDERS=
-TELEGRAM_IMPORTANT_KEYWORDS=urgent,down,production,outage,critical
-# Comma-separated @usernames the primary userbot should NEVER surface
-# (e.g. service bots like @userinfobot). The agent userbot's chat with
-# the owner is filtered separately (by user_id, auto-discovered at
-# `telegram-login --agent`).
-TELEGRAM_USERBOT_IGNORE_USERNAMES=
 """
 
 

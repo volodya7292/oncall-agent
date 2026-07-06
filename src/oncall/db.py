@@ -190,7 +190,6 @@ CREATE TABLE IF NOT EXISTS messenger_inbox (
     sender_username TEXT,
     sender_display_name TEXT,
     body TEXT NOT NULL,
-    is_important INTEGER NOT NULL DEFAULT 0,
     received_at TEXT NOT NULL,
     read_at TEXT,
     replied_message_id TEXT
@@ -871,7 +870,6 @@ class Database:
         sender_username: str | None,
         sender_display_name: str | None,
         body: str,
-        is_important: bool,
         received_at: datetime,
     ) -> bool:
         """Insert one inbound message. Returns True if a new row was inserted
@@ -882,12 +880,12 @@ class Database:
                 """
                 INSERT INTO messenger_inbox
                   (id, platform, chat_id, message_id, sender_username,
-                   sender_display_name, body, is_important, received_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   sender_display_name, body, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     inbox_id, platform, chat_id, message_id, sender_username,
-                    sender_display_name, body, 1 if is_important else 0,
+                    sender_display_name, body,
                     iso(received_at),
                 ),
             )
@@ -1023,7 +1021,7 @@ class Database:
         async with self.conn.execute(
             """
             SELECT id, platform, chat_id, message_id, sender_username,
-                   sender_display_name, body, is_important, received_at,
+                   sender_display_name, body, received_at,
                    read_at, replied_message_id
             FROM messenger_inbox
             WHERE chat_id = ?
@@ -1554,7 +1552,6 @@ def _row_to_inbox(row: aiosqlite.Row) -> dict[str, Any]:
         "sender_username": row["sender_username"],
         "sender_display_name": row["sender_display_name"],
         "body": row["body"],
-        "is_important": bool(row["is_important"]),
         "received_at": row["received_at"],
         "read_at": row["read_at"],
         "replied_message_id": row["replied_message_id"],

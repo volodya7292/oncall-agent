@@ -287,19 +287,11 @@ def create_app() -> FastAPI:
                 settings.oncall_operator_backend,
             )
         # Primary Telegram userbot — runs on the owner's account. Inbound
-        # DMs from senders listed in `telegram_userbot_ignore_usernames`
-        # are skipped at the handler, as is the chat with the agent
-        # account (TELEGRAM_AGENT_USER_ID_FILE) so the user↔agent surface
-        # is never mis-classified as a relay-able inbox.
-        from .config import read_telegram_agent_user_id
-        agent_user_id_for_filter = read_telegram_agent_user_id()
+        # gating happens entirely at the DM allowlist (/allowdm): chats not
+        # on it — including the agent account's own chat — never reach the
+        # inbox.
         telegram: TelegramService | None = await _maybe_start_telegram(
             settings, db, events,
-            ignore_usernames=settings.userbot_ignore_usernames,
-            ignore_user_ids=(
-                {agent_user_id_for_filter}
-                if agent_user_id_for_filter is not None else None
-            ),
         )
         # Shared one-shot Claude CLI runner — used by the operator for chat
         # context compression and by the auto-ping loop for per-task summaries.
@@ -355,18 +347,6 @@ def create_app() -> FastAPI:
                 settings, operator, events,
                 broker=broker, db=db, telegram=telegram,
             )
-        # If the agent service is up and reports a different user_id than
-        # what was on disk at startup, update the primary userbot's peer
-        # filter so the agent chat doesn't leak into the relay inbox even
-        # in the brand-new-install case.
-        if telegram is not None and telegram_agent is not None \
-                and telegram_agent.agent_user_id is not None:
-            telegram.add_ignore_user_id(telegram_agent.agent_user_id)
-            log.info(
-                "primary userbot will ignore inbound from agent (id=%d)",
-                telegram_agent.agent_user_id,
-            )
-
         # Voice calls — owner places a 1:1 voice call to the agent userbot.
         # Binds py-tgcalls to the agent's existing telethon client. Opt-in
         # via VOICE_CALL_ENABLED + STT/TTS endpoint env vars.
@@ -423,11 +403,10 @@ def create_app() -> FastAPI:
                 name="result-delivery",
             )
             _supervise_bg_task(auto_ping_task, events, notify_sid, "result-delivery")
-        # Inbox drain: when the primary userbot lands an *important* inbound DM,
-        # push it into the agent's session as an auto-ping so the user finds
-        # out immediately. Non-important DMs sit silently in messenger_inbox
-        # and are picked up later via /status or `read_inbox`. Requires the
-        # agent userbot (we ping its session).
+        # Inbox drain: when the primary userbot lands an inbound DM from an
+        # allowlisted chat, push it into the agent's session as an auto-ping
+        # so the user finds out promptly. Requires the agent userbot (we
+        # ping its session).
         inbox_drain_task: asyncio.Task | None = None
         if operator is not None and telegram_agent is not None:
             inbox_drain_task = asyncio.create_task(
@@ -1187,9 +1166,6 @@ async def _maybe_start_voice_call(
 
 async def _maybe_start_telegram(
     settings, db: Database, events: EventBus,
-    *,
-    ignore_usernames: set[str] | None = None,
-    ignore_user_ids: set[int] | None = None,
 ) -> TelegramService | None:
     """Boot the telethon listener if credentials and a session file are present.
     Failures are logged but never crash the API — `/chat` and tasks still work
@@ -1214,11 +1190,7 @@ async def _maybe_start_telegram(
         service = TelegramService(
             db=db,
             client=client,
-            important_senders=settings.important_senders,
-            important_keywords=settings.important_keywords,
             on_new_message=_emit_received,
-            ignore_usernames=ignore_usernames or set(),
-            ignore_user_ids=ignore_user_ids or set(),
         )
         await service.start()
         return service
