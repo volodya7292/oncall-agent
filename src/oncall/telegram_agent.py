@@ -44,6 +44,7 @@ from .telegram_format import (
     chunk_message,
     label_for_chat,
     relative_age,
+    reply_context_note,
     truncate,
 )
 from . import service
@@ -275,6 +276,28 @@ class TelegramAgentService:
         # pure text it's the text; for a media message with caption it's
         # the caption; for media without caption it's empty.
         text = (getattr(event.message, "message", None) or "").strip()
+        # Telegram reply pointer → explicit anchor for the operator. Without
+        # it, a reply to a specific agent message is indistinguishable from
+        # a plain message and deictic answers ("yes, that one") get resolved
+        # against whatever is most recent in history.
+        reply_note: str | None = None
+        if getattr(event.message, "reply_to", None) is not None:
+            try:
+                reply = await event.message.get_reply_message()
+            except Exception:
+                log.warning(
+                    "agent: fetching replied-to message failed", exc_info=True,
+                )
+                reply = None
+            if reply is not None:
+                # In the agent userbot's client, out=True → the agent's own
+                # message (i.e. the operator's), else the owner's.
+                who = (
+                    "your earlier message"
+                    if getattr(reply, "out", False)
+                    else "their own earlier message"
+                )
+                reply_note = reply_context_note(reply, who=who)
         attachments: list[dict[str, Any]] = []
         if getattr(event.message, "media", None) is not None:
             try:
@@ -342,6 +365,12 @@ class TelegramAgentService:
                     f"Unknown command: {cmd}. Send /help for the list."
                 )
             return
+
+        # Prepend the reply anchor only for the operator path — approval
+        # phrases and slash commands above must match the raw text even
+        # when sent as a Telegram reply.
+        if reply_note:
+            text = f"{reply_note}\n{text}"
 
         telegram_log.info("agent inbound " + fmt(
             session=self._session_id, len=len(text),

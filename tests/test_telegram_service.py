@@ -160,6 +160,7 @@ def make_event(
     *, sender_username: str | None, body: str, is_private: bool = True,
     chat_id: int = 12345, message_id: int = 42, is_bot: bool = False,
     is_self: bool = False, out: bool = False, sender_id: int = 7777,
+    reply_to: Any = None,
 ) -> Any:
     sender = SimpleNamespace(
         id=sender_id, username=sender_username,
@@ -170,6 +171,15 @@ def make_event(
         message=body, id=message_id, out=out,
         date=datetime.now(timezone.utc), chat_id=chat_id,
     )
+    if reply_to is not None:
+        message.reply_to = SimpleNamespace(
+            reply_to_msg_id=getattr(reply_to, "id", 1),
+        )
+
+        async def get_reply_message():
+            return reply_to
+
+        message.get_reply_message = get_reply_message
 
     async def get_sender():
         return sender
@@ -250,6 +260,29 @@ async def test_inbound_dm_triaged_important_by_keyword(service, db):
     await client.handler(event)
     rows = await db.list_inbox()
     assert rows[0]["is_important"] is True
+
+
+@pytest.mark.asyncio
+async def test_reply_anchor_stored_but_quoted_keyword_not_important(service, db):
+    """Guard against importance-by-quotation: a Telegram reply stores a
+    `[replying to ...]` anchor with the quoted text, but triage runs on the
+    raw body — a keyword appearing ONLY in the quoted message must not mark
+    the new inbound important."""
+    s, client = service
+    quoted = SimpleNamespace(
+        id=41, message="prod is DOWN, urgent!", out=True, media=None,
+    )
+    event = make_event(
+        sender_username="rando", body="ok, looking now", reply_to=quoted,
+    )
+    await client.handler(event)
+    rows = await db.list_inbox()
+    row = rows[0]
+    assert row["is_important"] is False
+    assert row["body"] == (
+        '[replying to the owner\'s earlier message: "prod is DOWN, urgent!"]'
+        "\nok, looking now"
+    )
 
 
 @pytest.mark.asyncio

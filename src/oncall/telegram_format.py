@@ -54,6 +54,18 @@ def truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def reply_context_note(reply_msg: Any, *, who: str, limit: int = 150) -> str:
+    """One-line `[replying to ...]` anchor describing the Telegram message a
+    new inbound message replies to. `who` names the quoted message's author
+    from the reader's perspective (e.g. "your earlier message"). Telegram's
+    reply pointer is otherwise invisible to the operator, which would leave
+    it resolving "yes, that one" against whatever is most recent."""
+    body = (getattr(reply_msg, "message", None) or "").strip()
+    if not body and getattr(reply_msg, "media", None) is not None:
+        body = "<media message>"
+    return f'[replying to {who}: "{truncate(body, limit)}"]'
+
+
 def age(when: datetime) -> str:
     """Compact human age: 5s / 12m / 3h / 4d. `when` is timezone-aware UTC."""
     return format_seconds((datetime.now(timezone.utc) - when).total_seconds())

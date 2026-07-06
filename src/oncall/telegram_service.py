@@ -33,6 +33,7 @@ from uuid import uuid4
 
 from .audit import fmt, telegram_log
 from .db import Database
+from .telegram_format import reply_context_note
 
 
 _ONE_SECOND = timedelta(seconds=1)
@@ -242,7 +243,29 @@ class TelegramService:
         message_id = str(getattr(event.message, "id", ""))
         received_at = getattr(event.message, "date", None) or datetime.now(timezone.utc)
 
+        # Triage on the raw body BEFORE prepending the reply anchor, so
+        # quoted text from the replied-to message can't trip an importance
+        # keyword by itself.
         important = self._triage(username, body)
+        if getattr(event.message, "reply_to", None) is not None:
+            try:
+                reply = await _maybe_await(event.message.get_reply_message())
+            except Exception:
+                log.warning(
+                    "fetching replied-to message failed chat=%s msg=%s",
+                    chat_id, message_id, exc_info=True,
+                )
+                reply = None
+            if reply is not None:
+                # Primary userbot: out=True → the owner sent the quoted
+                # message; else the sender quotes themself (or a bot/service
+                # message in this 1:1 chat).
+                who = (
+                    "the owner's earlier message"
+                    if getattr(reply, "out", False)
+                    else "their own earlier message"
+                )
+                body = f"{reply_context_note(reply, who=who)}\n{body}"
         inbox_id = str(uuid4())
         inserted = await self._db.record_inbox(
             inbox_id=inbox_id,
