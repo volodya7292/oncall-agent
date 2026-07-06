@@ -1,14 +1,8 @@
 name: Publish Docker image to GHCR
 
-# Builds the server-role image and pushes it to ghcr.io/<owner>/oncall-agent.
-# Runs on pushes to main and on version tags. No secrets needed beyond the
-# auto-provided GITHUB_TOKEN (the Claude OAuth login is applied at deploy time
-# on the VPS, never baked into the image).
-
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   workflow_dispatch:
 
 env:
@@ -38,8 +32,6 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=tag
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
