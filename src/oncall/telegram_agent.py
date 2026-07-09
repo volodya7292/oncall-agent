@@ -272,6 +272,19 @@ class TelegramAgentService:
             ))
             return
 
+        # Send a Telegram read receipt now that the agent has picked up the
+        # owner's message, so it shows as read on their client instead of
+        # sitting on a single check while we process it. Best-effort — a
+        # failure here must not block handling the message.
+        try:
+            await self._client.send_read_acknowledge(
+                event.chat_id, event.message,
+            )
+        except Exception:
+            log.warning(
+                "agent: send_read_acknowledge failed", exc_info=True,
+            )
+
         # In telethon, `event.message.message` is the message body — for
         # pure text it's the text; for a media message with caption it's
         # the caption; for media without caption it's empty.
