@@ -63,6 +63,36 @@ class OllamaEmbeddingClient:
         body = r.json()
         return [list(v) for v in body.get("embeddings", [])]
 
+    async def ensure_model(self) -> None:
+        """Pull the embed model into Ollama if it isn't there yet.
+
+        On a fresh Ollama volume the model is absent and `/api/embed` errors
+        ("model not found") rather than auto-pulling — so we provision it
+        here before warmup. No-op once the model is resident, so it's safe to
+        run on every daemon start. The pull can be hundreds of MB, so we
+        stream `/api/pull` to completion with no read timeout instead of
+        blocking on a single slow response."""
+        import httpx
+
+        r = await self._http.get(f"{self._host}/api/tags")
+        r.raise_for_status()
+        have = {m.get("name") for m in r.json().get("models", [])}
+        if self._model in have:
+            return
+        log.info("ollama: embed model %s absent, pulling", self._model)
+        async with self._http.stream(
+            "POST",
+            f"{self._host}/api/pull",
+            json={"model": self._model},
+            timeout=httpx.Timeout(30.0, read=None),
+        ) as resp:
+            resp.raise_for_status()
+            # Drain the NDJSON progress stream; the final line is the
+            # {"status": "success"} that means the blob is on disk.
+            async for _ in resp.aiter_lines():
+                pass
+        log.info("ollama: pull complete for %s", self._model)
+
     async def warmup(self) -> None:
         """Trigger Ollama to load the model now (one throwaway embed). On
         a freshly-started Ollama daemon this is the only way to force the

@@ -1006,12 +1006,15 @@ async def _build_startup_status(
 
 
 async def _warmup_embedder(embedder: OllamaEmbeddingClient) -> None:
-    """Background task: ask Ollama to load the embed model now (one
-    throwaway embed). Without this the first user message after
-    `ollama serve` pays the cold-load. Non-fatal — embed() has its own
-    error handling, the operator just sees empty memory for that turn."""
+    """Background task: make sure Ollama has the embed model pulled, then
+    ask it to load the model now (one throwaway embed). The pull provisions
+    a fresh Ollama volume so a clean deploy needs no manual `ollama pull`;
+    the warmup means the first user message after `ollama serve` skips the
+    cold-load. Non-fatal — embed() has its own error handling, the operator
+    just sees empty memory until the model is ready."""
     started = time.monotonic()
     try:
+        await embedder.ensure_model()
         await embedder.warmup()
     except Exception as e:
         log.warning("embedder warmup failed: %s: %s", type(e).__name__, e)
