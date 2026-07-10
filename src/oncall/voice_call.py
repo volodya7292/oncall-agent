@@ -160,6 +160,15 @@ _PRI_CHAT = 2
 # asked for, which is stale the moment it's delayed behind small talk.
 _INTERRUPTING_TRIGGERS = frozenset({"executor.done"})
 
+# Silent procedural marker appended to the OWNER's shared session when an
+# inbound call tears down, closing the lingering `_call_start_note` so a later
+# text turn doesn't read as still-in-call (see _teardown_active). Kept static
+# and procedural — it goes through the same [system note: ...] path the memory
+# extractor reads, so it must not look like a user-attributed preference.
+_CALL_END_NOTE = (
+    "the voice call just ended — you are back in TEXT chat with the owner now."
+)
+
 # Sentinel returned by _await_synth when barge-in wins the race against a
 # chunk's TTS synthesis.
 _BARGE = object()
@@ -1838,8 +1847,6 @@ class CallService:
         # Outbound calls to non-owners ran in an ephemeral session — the
         # owner's text chat saw "call placed" and then silence. Brief the
         # owner now so they know whether it connected and what was said.
-        # Inbound (owner) calls share the owner's session, so no extra
-        # notification is needed — they already saw the conversation.
         if not active.is_owner:
             task = asyncio.create_task(
                 self._brief_owner_on_call_end(active, reason),
@@ -1847,6 +1854,25 @@ class CallService:
             )
             self._brief_tasks.add(task)
             task.add_done_callback(self._brief_tasks.discard)
+            return
+        # Inbound (owner) calls share the owner's text session. The call-start
+        # note (_call_start_note) is left in that history with NO matching
+        # end-marker, so a later TEXT turn reads as if the call is still live —
+        # and the model drifts back into voice behavior, leaking spoken
+        # expression tags ([laughter], [confirmation-en]) into text replies.
+        # Close the call out with a SILENT procedural marker: no reply, no
+        # Telegram ping, just a history row the next text turn will see. We
+        # await it inline (a single INSERT) so the marker is ordered after the
+        # call's last turn and before any subsequent text turn.
+        try:
+            await self._operator.append_system_note(
+                active.session_id, _CALL_END_NOTE,
+            )
+        except Exception:
+            log.warning(
+                "voice: failed to append owner call-end marker (session=%s)",
+                active.session_id, exc_info=True,
+            )
 
     async def _brief_owner_on_call_end(
         self, active: _ActiveCall, reason: str,

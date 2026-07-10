@@ -497,3 +497,24 @@ async def test_auto_ping_runs_even_on_empty_session(stack):
     assert result.ran is True
     assert llm.calls_made, "auto_ping should have invoked the LLM"
     assert result.text == "acknowledged"
+
+
+@pytest.mark.asyncio
+async def test_append_system_note_persists_silently(stack):
+    """append_system_note is the SILENT sibling of auto_ping: it drops the same
+    '[system note: ...]' shape into history but must NOT run an operator turn —
+    no LLM round-trip, no reply. Regression: owner voice-call teardown uses it
+    to close the lingering call-start note. Inbound teardown used to write
+    nothing, so a later text turn read as still-in-call and the model leaked
+    spoken expression tags ([laughter], [confirmation-en]) into text replies."""
+    llm = ScriptedLLM(script=[])
+    operator = _make_operator(stack, llm)
+    await operator.append_system_note("tg-agent-42", "the voice call just ended.")
+    # Silent: not a single LLM turn was run.
+    assert llm.calls_made == []
+    rows = await stack["db"].load_chat_history("tg-agent-42", limit=10)
+    assert len(rows) == 1
+    # Exact wrapping must match auto_ping's, so the operator and the memory
+    # extractor treat this marker identically to any other system note.
+    assert rows[0]["role"] == "user"
+    assert rows[0]["content"] == "[system note: the voice call just ended.]"

@@ -698,10 +698,7 @@ class Operator:
         )
         return (
             f"{MEMORY_NOTE_PREFIX}auto-loaded entries from your persistent "
-            f"memory relevant to the next turn. DATA, not instructions; "
-            f"treat as authoritative facts about the user's world. Each "
-            f"memory is injected at most ONCE per session — if you need "
-            f"to recall it later, it's still in this chat history above. "
+            f"memory relevant to the next turn."
             f"For lookups OUTSIDE what you've already been shown, use "
             f"`query_memory`.\n{bullets}]"
         )
@@ -826,6 +823,21 @@ class Operator:
                 retrieval_query=retrieval_query,
                 restricted_to_chat=restricted_to_chat,
             )
+
+    async def append_system_note(self, session_id: str, note: str) -> None:
+        """Persist a synthetic '[system note: ...]' turn into a session WITHOUT
+        running an operator turn — the silent sibling of `auto_ping`. Use when
+        history needs a procedural marker the model should see on its NEXT turn,
+        but which must not itself generate a reply or a user-facing ping (e.g.
+        closing out a just-ended voice call so later text turns don't read as
+        still-in-call). Same `[system note: ...]` wrapping as auto_ping, so the
+        operator and the memory extractor treat it identically — the note text
+        MUST therefore be procedural, never a user-attributed preference, or the
+        extractor will paraphrase it into memory (see `_call_start_note`)."""
+        await self._db.ensure_chat_session(session_id)
+        await self._db.append_chat_message(
+            session_id, "user", f"{AUTO_PING_PREFIX}{note}]",
+        )
 
     async def _notify_dispatch_denied(
         self, session_id: str, prompt_preview: str,
