@@ -236,29 +236,40 @@ class Settings(BaseSettings):
     oncall_memory_hybrid_beta: float = 0.3
     oncall_memory_relevance_floor: float = 0.30
     oncall_memory_max_inject: int = 10
-    # Operator backend: OpenAI-compatible HTTP via Vercel AI Gateway.
-    # https://vercel.com/docs/ai-gateway/sdks-and-apis/python
-    # Set ONCALL_OPERATOR_MODEL to a gateway model id like "openai/gpt-oss-20b".
-    # Default is gemini-3.5-flash via AI Studio: ~0.6s TTFA on a bare "Hi"
-    # with thinking=minimal (vs ~0.59s on flash-lite — within noise, but
-    # 3.5-flash had a tighter distribution). Natively supports ack-first
-    # (text + function_call in the same response).
-    oncall_operator_model: str = "gemini-3.5-flash"
-    # Reasoning level. "low" buys ~100-160 reasoning tokens for noticeably
-    # better triage / memory / tool-routing decisions vs "minimal", at a
-    # cost of a few hundred ms TTFA. Set to "minimal" to claw back the
-    # latency, or None to leave the dial unset (model default — usually
-    # "medium" or higher, which is slower than we want).
-    oncall_operator_reasoning_effort: str | None = "minimal"
+    # Operator model. Default is openai/gpt-oss-120b via OpenRouter
+    # ("openrouter" backend), pinned to fast providers (see below). Measured
+    # ~0.26s TTFT on Groq with the real operator prompt — comfortably under the
+    # 0.6s target — at ~$0.15/Mtok in (~10x cheaper than claude-haiku). It's a
+    # reasoning model; low effort keeps it fast while helping tool routing.
+    # Switch models by pairing ONCALL_OPERATOR_BACKEND with the right id:
+    #   openrouter → an OpenRouter slug ("openai/gpt-oss-120b", "deepseek/deepseek-v4-flash")
+    #   gemini     → a bare AI Studio id ("gemini-3.5-flash")
+    #   anthropic  → a hyphenated Claude id ("claude-haiku-4-5")
+    oncall_operator_model: str = "openai/gpt-oss-120b"
+    # Reasoning level. On gpt-oss "low" buys better triage / tool-routing for a
+    # small TTFT cost; "minimal" is not accepted by all reasoning models, so the
+    # portable low-latency floor is "low". None leaves the dial unset.
+    oncall_operator_reasoning_effort: str | None = "low"
     # Which API surface to use for the operator's LLM.
+    #   "openrouter" → OpenAI-compatible via OpenRouter. The default. Pins
+    #              provider routing (ONCALL_OPERATOR_PROVIDER_ORDER) for lowest
+    #              TTFT and gets automatic prompt caching on capable providers.
+    #   "anthropic" → native Anthropic Messages API (anthropic SDK). Kept
+    #              available; the only surface with explicit cache_control.
     #   "gemini" → native Google AI Studio API (google-genai SDK). Required
-    #              for ack-first behavior on Google models (the Vercel gateway
-    #              strips assistant text when a tool_call rides in the same
-    #              response). Also required for flash-lite's thought_signature
-    #              round-trip on multi-round tool flows.
-    #   "vercel" → OpenAI-compatible via Vercel AI Gateway. Useful for
-    #              non-Google models (zai/, minimax/, etc).
-    oncall_operator_backend: str = "gemini"
+    #              for ack-first behavior on Google models (the OpenAI-compat
+    #              gateways strip assistant text when a tool_call rides in the
+    #              same response). Also flash-lite's thought_signature round-trip.
+    #   "vercel" → OpenAI-compatible via Vercel AI Gateway.
+    oncall_operator_backend: str = "openrouter"
+    # OpenRouter provider preference for the operator model, highest priority
+    # first (comma-separated). Fallbacks stay ON, so it drops to the next one if
+    # the top provider rate-limits. For gpt-oss-120b these are the sub-0.5s TTFT
+    # providers measured; retune per model.
+    oncall_operator_provider_order: str = "Groq,Cerebras,BaseTen"
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_api_key: str = ""           # OpenRouter key (oncall_operator_backend=openrouter)
+    anthropic_api_key: str = ""            # Claude API key (oncall_operator_backend=anthropic)
     gemini_api_key: str = ""               # AI Studio key (oncall_operator_backend=gemini)
     ai_gateway_base_url: str = "https://ai-gateway.vercel.sh/v1"
     ai_gateway_api_key: str = ""           # local dev

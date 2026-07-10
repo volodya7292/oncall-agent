@@ -38,7 +38,13 @@ from .events import EventBus
 from .laptop_bridge import LaptopBridge
 from .lifecycle import Lifecycle
 from .local_claude import ClaudeCliRunner
-from .operator import GatewayLLMClient, GenAILLMClient, Operator
+from .operator import (
+    AnthropicLLMClient,
+    GatewayLLMClient,
+    GenAILLMClient,
+    OpenRouterLLMClient,
+    Operator,
+)
 from .operator_memory import OperatorMemory
 from .result_delivery import deliver_executor_result
 from .telegram_agent import TelegramAgentService
@@ -263,8 +269,28 @@ def create_app() -> FastAPI:
         # otherwise /chat returns a clear 503.
         operator: Operator | None = None
         memory: OperatorMemory | None = None
-        llm: GenAILLMClient | GatewayLLMClient | None = None
-        if settings.oncall_operator_backend == "gemini" and settings.gemini_api_key:
+        llm: (
+            OpenRouterLLMClient | AnthropicLLMClient | GenAILLMClient
+            | GatewayLLMClient | None
+        ) = None
+        _provider_order = [
+            p.strip() for p in settings.oncall_operator_provider_order.split(",")
+            if p.strip()
+        ]
+        if settings.oncall_operator_backend == "openrouter" and settings.openrouter_api_key:
+            llm = OpenRouterLLMClient(
+                base_url=settings.openrouter_base_url,
+                api_key=settings.openrouter_api_key,
+                provider_order=_provider_order,
+            )
+            log.info(
+                "operator LLM backend: openrouter (model=%s, providers=%s)",
+                settings.oncall_operator_model, _provider_order or "auto",
+            )
+        elif settings.oncall_operator_backend == "anthropic" and settings.anthropic_api_key:
+            llm = AnthropicLLMClient(api_key=settings.anthropic_api_key)
+            log.info("operator LLM backend: anthropic (native Messages API, prompt caching on)")
+        elif settings.oncall_operator_backend == "gemini" and settings.gemini_api_key:
             llm = GenAILLMClient(api_key=settings.gemini_api_key)
             log.info("operator LLM backend: gemini (AI Studio)")
         elif settings.oncall_operator_backend == "vercel" and settings.gateway_key:
@@ -273,10 +299,32 @@ def create_app() -> FastAPI:
                 api_key=settings.gateway_key,
             )
             log.info("operator LLM backend: vercel (AI Gateway)")
-        elif settings.gateway_key:
-            # Fallback: backend was set to "gemini" but key missing — and
-            # vercel key happens to be there. Use vercel so the daemon still
+        elif settings.openrouter_api_key:
+            # Fallback: configured backend's key is missing but the OpenRouter
+            # key is present. Use it (the default surface) so the daemon still
             # boots with a working operator.
+            llm = OpenRouterLLMClient(
+                base_url=settings.openrouter_base_url,
+                api_key=settings.openrouter_api_key,
+                provider_order=_provider_order,
+            )
+            log.warning(
+                "ONCALL_OPERATOR_BACKEND=%s but its key is unset; "
+                "falling back to openrouter",
+                settings.oncall_operator_backend,
+            )
+        elif settings.anthropic_api_key:
+            # Fallback: configured backend's key is missing but the Anthropic
+            # key is present. Use it so the daemon still boots with a working
+            # (and cache-cheap) operator.
+            llm = AnthropicLLMClient(api_key=settings.anthropic_api_key)
+            log.warning(
+                "ONCALL_OPERATOR_BACKEND=%s but its key is unset; "
+                "falling back to anthropic (native Messages API)",
+                settings.oncall_operator_backend,
+            )
+        elif settings.gateway_key:
+            # Last-ditch fallback: only the Vercel gateway key is present.
             llm = GatewayLLMClient(
                 base_url=settings.ai_gateway_base_url,
                 api_key=settings.gateway_key,

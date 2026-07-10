@@ -23,7 +23,7 @@ from oncall.config import Paths, Settings
 from oncall.db import Database
 from oncall.events import EventBus
 from oncall.lifecycle import Lifecycle
-from oncall.operator import OPERATOR_TOOLS, Operator
+from oncall.operator import OPERATOR_TOOLS, AnthropicLLMClient, Operator
 from oncall.operator_memory import Memory
 
 
@@ -518,3 +518,100 @@ async def test_append_system_note_persists_silently(stack):
     # extractor treat this marker identically to any other system note.
     assert rows[0]["role"] == "user"
     assert rows[0]["content"] == "[system note: the voice call just ended.]"
+
+
+# ---------------------------------------------------------------------------
+# AnthropicLLMClient: OpenAI -> Anthropic request translation
+#
+# _build_request is pure (no network) — it does the load-bearing, non-obvious
+# work of the native backend: pull system out, pair tool_use/tool_result, merge
+# the volatile-tail run of user messages into alternating turns, and drop the
+# ONE cache breakpoint at the end of the STABLE prefix. The cache breakpoint
+# placement is the invariant that pays for Haiku: if it lands on (or after) the
+# per-turn clock, every turn writes a fresh cache entry and reads nothing.
+# ---------------------------------------------------------------------------
+
+def _openai_history_with_tail() -> list[dict]:
+    """A realistic operator call: system + a tool round-trip + the current
+    owner turn, then the transient per-turn tail (status / call / clock)."""
+    return [
+        {"role": "system", "content": "SYS-PROMPT"},
+        {"role": "user", "content": "check my disk usage"},
+        {"role": "assistant", "content": "On it.",
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "hand_off",
+                                      "arguments": json.dumps({"ack_msg": "On it."})}}]},
+        {"role": "tool", "tool_call_id": "c1",
+         "content": json.dumps({"status": "queued"})},
+        {"role": "assistant", "content": "Queued it."},
+        {"role": "user", "content": "thanks, what's my timezone?"},   # last STABLE block
+        {"role": "user", "content": "<acting-status>idle</acting-status>"},
+        {"role": "user", "content": "<call-status>not on a call</call-status>"},
+        {"role": "user", "content": "<current-time>2026-07-10T18:03:11Z</current-time>"},
+    ]
+
+
+def _client() -> AnthropicLLMClient:
+    # No network: __init__ only constructs AsyncAnthropic; the key is unused.
+    return AnthropicLLMClient(api_key="sk-test-not-real")
+
+
+def _cache_breakpoints(msgs: list[dict]) -> list[dict]:
+    return [b for m in msgs for b in m["content"]
+            if isinstance(b, dict) and "cache_control" in b]
+
+
+def test_anthropic_cache_breakpoint_is_before_the_volatile_tail():
+    """Exactly one breakpoint, and it sits on the last STABLE block — the
+    owner's real turn — never on a `<...-status>`/`<current-time>` block. This
+    is what keeps the per-turn clock outside the cache so it reads across turns
+    instead of rewriting every time."""
+    kwargs = _client()._build_request(
+        model="claude-haiku-4-5", messages=_openai_history_with_tail(),
+        tools=OPERATOR_TOOLS, max_tokens=2048, reasoning_effort="minimal",
+    )
+    bps = _cache_breakpoints(kwargs["messages"])
+    assert len(bps) == 1, f"expected exactly one cache breakpoint, got {len(bps)}"
+    assert bps[0].get("type") == "text"
+    assert bps[0]["text"] == "thanks, what's my timezone?"
+    for tag in ("<acting-status>", "<call-status>", "<current-time>"):
+        assert not bps[0]["text"].startswith(tag)
+
+
+def test_anthropic_translation_alternates_roles_and_pairs_tools():
+    """System is hoisted out; the trailing run of user messages (owner turn +
+    3 status blocks) collapses to a single alternating user turn; tool_use and
+    tool_result survive with a matching id."""
+    kwargs = _client()._build_request(
+        model="claude-haiku-4-5", messages=_openai_history_with_tail(),
+        tools=OPERATOR_TOOLS, max_tokens=2048, reasoning_effort="minimal",
+    )
+    assert [b["text"] for b in kwargs["system"]] == ["SYS-PROMPT"]
+    msgs = kwargs["messages"]
+    roles = [m["role"] for m in msgs]
+    assert all(roles[i] != roles[i + 1] for i in range(len(roles) - 1)), roles
+    assert roles[0] == "user"  # Anthropic requires the first turn to be user
+    tool_use = [b for m in msgs for b in m["content"] if b.get("type") == "tool_use"]
+    tool_res = [b for m in msgs for b in m["content"] if b.get("type") == "tool_result"]
+    assert len(tool_use) == 1 and len(tool_res) == 1
+    assert tool_use[0]["id"] == tool_res[0]["tool_use_id"] == "c1"
+    assert tool_use[0]["name"] == "hand_off"
+    # the 4 status/owner user messages merged into the final single user turn
+    assert msgs[-1]["role"] == "user"
+    assert sum(b.get("type") == "text" for b in msgs[-1]["content"]) == 4
+
+
+def test_anthropic_reasoning_effort_controls_thinking():
+    """'minimal'/None -> no extended thinking (fastest TTFT, the operator
+    default). A real level -> thinking enabled with budget < max_tokens (the
+    API rejects budget >= max_tokens), so max_tokens is bumped to fit."""
+    build = _client()._build_request
+    msgs = [{"role": "system", "content": "S"}, {"role": "user", "content": "hi"}]
+    assert "thinking" not in build(model="claude-haiku-4-5", messages=msgs,
+                                   tools=[], max_tokens=2048, reasoning_effort="minimal")
+    assert "thinking" not in build(model="claude-haiku-4-5", messages=msgs,
+                                   tools=[], max_tokens=2048, reasoning_effort=None)
+    hi = build(model="claude-haiku-4-5", messages=msgs, tools=[],
+               max_tokens=2048, reasoning_effort="high")
+    assert hi["thinking"] == {"type": "enabled", "budget_tokens": 8192}
+    assert hi["max_tokens"] > hi["thinking"]["budget_tokens"]

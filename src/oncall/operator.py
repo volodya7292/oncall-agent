@@ -308,6 +308,303 @@ class GatewayLLMClient:
         }
 
 
+class OpenRouterLLMClient:
+    """OpenAI Chat Completions via OpenRouter. Same wire format as
+    GatewayLLMClient, but points at OpenRouter and PINS provider routing so we
+    land on the lowest-TTFT backend for the operator model — e.g. gpt-oss-120b
+    is ~0.26s on Groq vs ~1s if OpenRouter load-balances freely. `provider.order`
+    lists preferred providers in priority order; `allow_fallbacks=True` lets it
+    drop to the next one (Cerebras/BaseTen) if the top choice rate-limits.
+
+    Caching: OpenRouter auto-caches on caching-capable providers (Groq ~0.5x,
+    DeepSeek ~0.1x) with NO cache_control needed — nothing to plumb here. Note
+    caching cuts cost, not TTFT (the operator's latency is round-trip-bound).
+
+    The operator's hand_off ack rides INSIDE the tool call (ack_msg arg), not as
+    parallel assistant text, so the gateway's text+tool_call stripping — the
+    reason GenAILLMClient exists for Gemini — is a non-issue here."""
+
+    def __init__(
+        self, base_url: str, api_key: str, provider_order: list[str] | None = None,
+    ) -> None:
+        # Import lazily so tests don't need the openai package.
+        from openai import AsyncOpenAI
+        # Bound requests so a wedged upstream can't block a session lock forever
+        # (the Gemini/Anthropic clients wrap their own 20s wait_for; the OpenAI
+        # client takes a per-client timeout instead).
+        self._client = AsyncOpenAI(
+            api_key=api_key, base_url=base_url, timeout=30.0, max_retries=1,
+        )
+        self._provider_order = list(provider_order or [])
+
+    async def chat(
+        self, *, model, messages, tools, max_tokens=None, reasoning_effort=None,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "tools": tools or None,
+        }
+        if self._provider_order:
+            kwargs["extra_body"] = {
+                "provider": {"order": self._provider_order, "allow_fallbacks": True},
+            }
+        if max_tokens is not None:
+            kwargs["max_completion_tokens"] = max_tokens
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
+        # OpenAI client rejects tools=None — strip if so.
+        if kwargs["tools"] is None:
+            kwargs.pop("tools")
+        resp = await self._client.chat.completions.create(**kwargs)
+        msg = resp.choices[0].message
+        return {
+            "role": "assistant",
+            "content": msg.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "name": tc.function.name,
+                    "arguments_json": tc.function.arguments,
+                }
+                for tc in (msg.tool_calls or [])
+            ],
+        }
+
+
+def _openai_content_to_anthropic_blocks(content: Any) -> list[dict[str, Any]]:
+    """Translate an OpenAI-style message `content` (a plain string, or the
+    vision list-content shape used by attachments / read_image) into Anthropic
+    content blocks. Empty text blocks are dropped — the Messages API rejects
+    them with 400."""
+    if not isinstance(content, list):
+        text = content or ""
+        return [{"type": "text", "text": text}] if text else []
+    blocks: list[dict[str, Any]] = []
+    for c in content:
+        if not isinstance(c, dict):
+            continue
+        ctype = c.get("type")
+        if ctype == "text":
+            text = c.get("text") or ""
+            if text:
+                blocks.append({"type": "text", "text": text})
+        elif ctype == "image_url":
+            url = (c.get("image_url") or {}).get("url") or ""
+            if url.startswith("data:"):
+                header, _, b64 = url.partition(",")
+                media = header.removeprefix("data:").split(";", 1)[0] or "application/octet-stream"
+                blocks.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": media, "data": b64},
+                })
+            # Non-data URLs are skipped: we don't fetch remote bytes model-side.
+    return blocks
+
+
+class AnthropicLLMClient:
+    """Operator LLM on the native Anthropic Messages API (`anthropic` SDK).
+
+    Chosen for Claude models because it is the ONLY surface that supports
+    prompt caching. The OpenAI-compatible endpoint at api.anthropic.com and the
+    Vercel gateway both silently drop `cache_control` — confirmed against
+    Anthropic's own OpenAI-SDK-compatibility docs: "Prompt caching is not
+    supported, but it is supported in the Anthropic SDKs" (and `usage.
+    prompt_tokens_details` there is "always empty").
+
+    Caching is what makes Haiku viable for the operator: the ~2k-token system
+    prompt plus the rolling history is a stable prefix that repeats verbatim
+    every turn. We drop ONE cache breakpoint at the end of that prefix — on the
+    last content block that is NOT part of the per-turn volatile tail (the
+    `<acting-status>` / `<call-status>` / `<current-time>` / `<laptop-status>`
+    blocks the operator appends after history, plus inline attachment bytes).
+    A block-level breakpoint caches tools + system + history through that point;
+    the volatile tail stays OUTSIDE the cached region, so the clock changing
+    every turn doesn't invalidate the cache. Cache reads bill at ~0.1x and skip
+    prefill for the cached tokens — that's what buys the sub-0.6s TTFT.
+
+    Streams like GenAILLMClient: a 20s wall-clock bound and per-stream
+    cancellation independent of whatever retry/backoff the SDK does internally.
+    """
+
+    # User content-block prefixes that mark the per-turn volatile tail. Kept in
+    # sync with the transient blocks appended in Operator._run_turn. The cache
+    # breakpoint is placed BEFORE any block starting with one of these.
+    _VOLATILE_TAIL_TAGS = (
+        "<acting-status>", "<call-status>",
+        "<current-time>", "<laptop-status>",
+    )
+
+    def __init__(self, api_key: str) -> None:
+        import anthropic
+        self._client = anthropic.AsyncAnthropic(api_key=api_key)
+
+    def _is_volatile_user(self, content: Any) -> bool:
+        """A user message is 'volatile' (kept outside the cached prefix) if it's
+        one of the per-turn status blocks or carries inline attachment bytes
+        (list content). Everything else — the owner's real turns, tool results,
+        assistant replies — is stable history and belongs in the cache."""
+        if isinstance(content, list):
+            return True  # inline attachment bytes: present once, then a placeholder
+        text = (content or "").lstrip()
+        return text.startswith(self._VOLATILE_TAIL_TAGS)
+
+    def _build_request(
+        self, *, model, messages, tools, max_tokens=None, reasoning_effort=None,
+    ) -> dict[str, Any]:
+        """Translate the operator's OpenAI-style call into Anthropic Messages
+        API kwargs: pull system messages out, pair tool_use/tool_result, merge
+        consecutive same-role turns, and drop the single cache breakpoint at the
+        end of the stable prefix. Pure (no network) so it can be unit-tested."""
+        # Drop an "anthropic/" prefix if the model was pinned via a gateway-style
+        # slug; the native API wants the bare id (e.g. "claude-haiku-4-5").
+        ant_model = model.split("/", 1)[1] if model.startswith("anthropic/") else model
+
+        # ---- OpenAI messages -> Anthropic system + messages ----
+        system_blocks: list[dict[str, Any]] = []
+        conv: list[dict[str, Any]] = []
+        pending_tool_results: list[dict[str, Any]] = []
+        # Reference to the last content block that belongs in the cached prefix;
+        # we tag exactly this one with cache_control after merging.
+        last_stable_block: dict[str, Any] | None = None
+
+        def _flush_tool_results() -> None:
+            nonlocal pending_tool_results
+            if pending_tool_results:
+                conv.append({"role": "user", "content": pending_tool_results})
+                pending_tool_results = []
+
+        for m in messages:
+            role = m.get("role")
+            if role == "system":
+                if m.get("content"):
+                    system_blocks.append({"type": "text", "text": m["content"]})
+                continue
+            if role == "tool":
+                # Anthropic requires tool_results in a user turn; buffer
+                # consecutive tool messages and flush them together.
+                block = {
+                    "type": "tool_result",
+                    "tool_use_id": m.get("tool_call_id", ""),
+                    "content": m.get("content") or "",
+                }
+                pending_tool_results.append(block)
+                last_stable_block = block  # tool results are stable history
+                continue
+            _flush_tool_results()
+            if role == "user":
+                blocks = _openai_content_to_anthropic_blocks(m.get("content"))
+                if not blocks:
+                    continue
+                conv.append({"role": "user", "content": blocks})
+                if not self._is_volatile_user(m.get("content")):
+                    last_stable_block = blocks[-1]
+            elif role == "assistant":
+                blocks = []
+                if m.get("content"):
+                    blocks.append({"type": "text", "text": m["content"]})
+                for tc in (m.get("tool_calls") or []):
+                    fn = tc.get("function", {})
+                    raw = fn.get("arguments") or "{}"
+                    try:
+                        inp = json.loads(raw) if raw else {}
+                    except json.JSONDecodeError:
+                        inp = {}
+                    blocks.append({
+                        "type": "tool_use",
+                        "id": tc.get("id", ""),
+                        "name": fn.get("name", ""),
+                        "input": inp,
+                    })
+                if not blocks:
+                    continue  # degenerate empty assistant row — skip
+                conv.append({"role": "assistant", "content": blocks})
+                last_stable_block = blocks[-1]
+        _flush_tool_results()
+
+        # Merge consecutive same-role turns (the volatile tail is a run of user
+        # messages; the API wants alternating roles). The block dicts are reused
+        # by reference, so the last_stable_block tag below still lands correctly.
+        merged: list[dict[str, Any]] = []
+        for msg in conv:
+            if merged and merged[-1]["role"] == msg["role"]:
+                merged[-1]["content"].extend(msg["content"])
+            else:
+                merged.append({"role": msg["role"], "content": list(msg["content"])})
+
+        # Single cache breakpoint at the end of the stable prefix.
+        if last_stable_block is not None:
+            last_stable_block["cache_control"] = {"type": "ephemeral"}
+
+        anthropic_tools = [
+            {
+                "name": t["function"]["name"],
+                "description": t["function"].get("description", ""),
+                "input_schema": t["function"].get("parameters") or {
+                    "type": "object", "properties": {},
+                },
+            }
+            for t in (tools or [])
+        ]
+
+        kwargs: dict[str, Any] = {
+            "model": ant_model,
+            "messages": merged,
+            "max_tokens": max_tokens or 2048,
+        }
+        if system_blocks:
+            kwargs["system"] = system_blocks
+        if anthropic_tools:
+            kwargs["tools"] = anthropic_tools
+        # reasoning_effort -> extended thinking. Haiku 4.5 predates the 4.6
+        # `adaptive` change, so depth is `thinking:{type:enabled,budget_tokens}`.
+        # "minimal"/None means no thinking (fastest TTFT — the operator default).
+        # budget must be < max_tokens, so bump max_tokens when thinking is on.
+        if reasoning_effort and reasoning_effort.lower() not in ("minimal", "none", ""):
+            budget = {"low": 1024, "medium": 4096, "high": 8192}.get(
+                reasoning_effort.lower(), 1024,
+            )
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            kwargs["max_tokens"] = max(kwargs["max_tokens"], budget + 1024)
+
+        return kwargs
+
+    async def chat(
+        self, *, model, messages, tools, max_tokens=None, reasoning_effort=None,
+    ) -> dict[str, Any]:
+        kwargs = self._build_request(
+            model=model, messages=messages, tools=tools,
+            max_tokens=max_tokens, reasoning_effort=reasoning_effort,
+        )
+
+        # Stream to bound the call on wall-clock (mirrors GenAILLMClient). We
+        # only need the assembled final message, not per-token deltas.
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+
+        async def _consume() -> None:
+            async with self._client.messages.stream(**kwargs) as stream:
+                final = await stream.get_final_message()
+            for block in final.content:
+                if block.type == "text":
+                    text_parts.append(block.text)
+                elif block.type == "tool_use":
+                    tool_calls.append({
+                        "id": block.id,
+                        "name": block.name,
+                        "arguments_json": json.dumps(block.input),
+                    })
+                # thinking / redacted_thinking blocks are not replayed.
+
+        await asyncio.wait_for(_consume(), timeout=20.0)
+
+        return {
+            "role": "assistant",
+            "content": "".join(text_parts),
+            "tool_calls": tool_calls,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Tool schemas (OpenAI Chat Completions tool-call format)
 # ---------------------------------------------------------------------------

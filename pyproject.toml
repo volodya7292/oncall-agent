@@ -24,6 +24,7 @@ dependencies = [
     "opuslib>=3.0",      # Opus encode/decode for the OpenAI-compat STT/TTS endpoints
     "silero-vad>=6.2",   # Voice activity detection for utterance segmentation + barge-in
     "audioop-lts>=0.2; python_version >= '3.13'",  # stdlib audioop dropped in 3.13; we need ratecv for 48k→16k
+    "anthropic>=0.49",
 ]
 
 [project.optional-dependencies]
