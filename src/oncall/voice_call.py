@@ -86,7 +86,7 @@ from .events import EventBus
 from .models import TaskState
 from .operator import Operator
 from .telegram_agent import agent_session_id
-from .voice import strip_expression_tag_backticks
+from .voice import strip_expression_tag_backticks, to_voice_text
 
 log = logging.getLogger(__name__)
 
@@ -1784,10 +1784,16 @@ class CallService:
         return payload.get("text", "") if isinstance(payload, dict) else ""
 
     async def _tts_http(self, text: str) -> bytes:
-        # Strip backticks the operator keeps wrapping expression tags in — every
-        # spoken byte flows through here, so this is the one chokepoint that
-        # covers conversational, prewarm, and pub/sub voice paths alike.
-        text = strip_expression_tag_backticks(text)
+        # Every spoken byte flows through here, so this is the one chokepoint
+        # that covers conversational, prewarm, and pub/sub voice paths alike.
+        # Full markdown strip so no path (live agent turn, auto-ping, in-call
+        # greeting/approval) leaks **bold**, `code`, [links](url) etc. into the
+        # TTS engine. to_voice_text leaves bare expression tags like [laughter]
+        # untouched; strip_expression_tag_backticks then mops up the asymmetric
+        # single-backtick case (`[sigh]` / [sigh]`) that the paired-backtick
+        # inline-code rule can't catch. Both are idempotent, so paths that
+        # already sanitized upstream are unaffected.
+        text = strip_expression_tag_backticks(to_voice_text(text))
         url = f"{self._tts_base_url}/v1/audio/speech"
         body = {
             "model": "tts-1",

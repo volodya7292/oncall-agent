@@ -47,6 +47,7 @@ from .telegram_format import (
     reply_context_note,
     truncate,
 )
+from .voice import strip_expression_tags
 from . import service
 
 
@@ -952,6 +953,15 @@ class TelegramAgentService:
     # ---- send ----
 
     async def _send(self, text: str) -> None:
+        # Deterministic backstop: expression tags ([laughter], [sigh], …) are
+        # voice-only — the TTS path renders each as sound, but in text they show
+        # as literal [brackets]. The prompt forbids them off-call, yet the model
+        # still drifts (its own in-call turns linger in the shared session
+        # history and bias it). Strip them here, the single owner-text
+        # chokepoint (both the direct reply and the chat.reply subscriber pass
+        # through). Voice is unaffected — it flows through voice_text/TTS, not
+        # this path.
+        text = strip_expression_tags(text)
         if not text:
             return
         for piece in chunk_message(text):
