@@ -226,12 +226,19 @@ class GenAILLMClient:
         # minutes when the upstream is rate-limited or wedged.
         text_parts: list[str] = []
         tool_calls: list[dict[str, Any]] = []
+        # Last non-null usage_metadata seen on the stream. Gemini sends a
+        # cumulative snapshot on (typically) the final chunk; we keep the most
+        # recent so we can log cache effectiveness after the stream drains.
+        usage: Any = None
 
         async def _consume() -> None:
+            nonlocal usage
             stream = await self._client.aio.models.generate_content_stream(
                 model=gem_model, contents=contents, config=cfg,
             )
             async for chunk in stream:
+                if getattr(chunk, "usage_metadata", None) is not None:
+                    usage = chunk.usage_metadata
                 for c in (chunk.candidates or []):
                     if not (c.content and c.content.parts):
                         continue
@@ -258,6 +265,24 @@ class GenAILLMClient:
                             tool_calls.append(entry)
 
         await asyncio.wait_for(_consume(), timeout=20.0)
+
+        # Cache observability. Gemini 2.5+/3.x auto-cache the stable request
+        # prefix (system_instruction + history) implicitly — no config on our
+        # side. There's no hit/miss flag, so we log the token split: a nonzero
+        # `cached` means the implicit cache fired for this turn; a persistent
+        # zero on a long-lived session means the prefix is under the model's
+        # min-cache floor, or entries are evicting between turns. `cached` bills
+        # at ~0.1x, so cached/prompt is the cost-savings ratio.
+        if usage is not None:
+            prompt = getattr(usage, "prompt_token_count", None) or 0
+            cached = getattr(usage, "cached_content_token_count", None) or 0
+            pct = (100 * cached // prompt) if prompt else 0
+            log.info(
+                "gemini usage model=%s prompt=%d cached=%d (%d%%) output=%d thoughts=%d",
+                gem_model, prompt, cached, pct,
+                getattr(usage, "candidates_token_count", None) or 0,
+                getattr(usage, "thoughts_token_count", None) or 0,
+            )
 
         return {
             "role": "assistant",
