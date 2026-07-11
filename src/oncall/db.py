@@ -309,6 +309,13 @@ class Database:
         await self._migrate_add_column(
             "operator_memories", "model", "TEXT NOT NULL DEFAULT ''",
         )
+        # Per-message snapshot of the transient turn statuses (call/acting/
+        # laptop) that were in effect when the row was written. Debug-only:
+        # NOT fed back into the model context (load_chat_history ignores it) —
+        # it exists so we can answer "what was the call-status when this reply
+        # was generated?" after the fact. NULL for rows written outside a
+        # status-bearing turn. JSON blob.
+        await self._migrate_add_column("chat_messages", "statuses", "TEXT")
         # Rename existing `tg-bot-<owner>` chat sessions to `tg-agent-<owner>`.
         # The HTTP Bot API was retired in favor of a second telethon userbot;
         # the new session-id naming is `tg-agent-*`. This migration is
@@ -686,10 +693,20 @@ class Database:
         )
         await self.conn.commit()
 
-    async def append_chat_message(self, session_id: str, role: str, content: str) -> None:
+    async def append_chat_message(
+        self, session_id: str, role: str, content: str,
+        statuses: dict[str, Any] | None = None,
+    ) -> None:
+        # `statuses` is a debug-only snapshot of the turn's transient statuses
+        # (see the chat_messages.statuses migration). Serialized to JSON; NULL
+        # when the caller has none. It is never read back into model context.
         await self.conn.execute(
-            "INSERT INTO chat_messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-            (session_id, role, content, iso(utcnow())),
+            "INSERT INTO chat_messages (session_id, role, content, created_at, statuses) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                session_id, role, content, iso(utcnow()),
+                json.dumps(statuses, ensure_ascii=False) if statuses else None,
+            ),
         )
         await self.conn.commit()
 

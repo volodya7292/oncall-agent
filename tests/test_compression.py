@@ -24,6 +24,21 @@ from oncall.lifecycle import Lifecycle
 from oncall.operator import Operator
 
 
+# A realistic-length summary. The compression sanity guard (Operator.
+# _summarize_older) rejects a summary that is implausibly short relative to its
+# input, so fakes that stand in for a *successful* compression must return
+# something proportionate, not a 2-word stub.
+_LONG_SUMMARY = (
+    "The user asked the operator to plan and track the redis migration and a "
+    "few follow-up chores. The operator dispatched task T1 to inventory the "
+    "current cluster and T2 to draft the cutover runbook, and confirmed the "
+    "user prefers changes shipped on weekdays only. They also chatted about "
+    "the user's trip to Hamburg and a gelato place worth revisiting. Open "
+    "threads: the operator still owes the user the T2 runbook and a decision "
+    "on the maintenance window."
+)
+
+
 # ---------------------------------------------------------------------------
 # Fakes
 # ---------------------------------------------------------------------------
@@ -31,7 +46,7 @@ from oncall.operator import Operator
 class FakeRunner:
     """Stand-in for ClaudeCliRunner. Records prompts; returns canned text."""
 
-    def __init__(self, *, output: str | None = "compressed summary") -> None:
+    def __init__(self, *, output: str | None = _LONG_SUMMARY) -> None:
         self.output = output
         self.calls: list[dict[str, Any]] = []
 
@@ -148,7 +163,7 @@ async def test_compression_skipped_under_threshold(stack):
 @pytest.mark.asyncio
 async def test_compression_triggers_above_threshold(stack):
     """Big history → one runner call, one chat_summaries row, history shrunk."""
-    runner = FakeRunner(output="user wanted X, operator dispatched T1, T1 done.")
+    runner = FakeRunner(output=_LONG_SUMMARY)
     operator = _make_operator(stack, runner)
     # Each user message is 800 chars → ~200 tokens. 10 turns ≈ 2000 tokens,
     # well above the 200-token threshold.
@@ -157,7 +172,7 @@ async def test_compression_triggers_above_threshold(stack):
     summary, history = await operator._load_and_maybe_compress("s1")
 
     assert summary is not None
-    assert summary["summary"] == "user wanted X, operator dispatched T1, T1 done."
+    assert summary["summary"] == _LONG_SUMMARY
     assert summary["through_message_id"] > 0
     assert len(runner.calls) == 1
 
@@ -205,7 +220,7 @@ async def test_compression_fail_soft_returns_uncompressed(stack):
 async def test_compression_split_lands_on_user_boundary(stack):
     """The summarized older portion must end at a `user` row so the LIVE tail
     starts with a user turn — keeps assistant_tool_calls/tool pairs intact."""
-    runner = FakeRunner(output="summary")
+    runner = FakeRunner(output=_LONG_SUMMARY)
     operator = _make_operator(stack, runner)
     await _populate_history(stack["db"], "s1", n_user_turns=10, padding=800)
 
@@ -220,7 +235,7 @@ async def test_compression_split_lands_on_user_boundary(stack):
 @pytest.mark.asyncio
 async def test_subsequent_load_uses_existing_summary(stack):
     """Second call doesn't re-summarize if total stays under threshold."""
-    runner = FakeRunner(output="first summary")
+    runner = FakeRunner(output=_LONG_SUMMARY)
     operator = _make_operator(stack, runner)
     await _populate_history(stack["db"], "s1", n_user_turns=10, padding=800)
     await operator._load_and_maybe_compress("s1")
@@ -231,7 +246,7 @@ async def test_subsequent_load_uses_existing_summary(stack):
 
     summary, history = await operator._load_and_maybe_compress("s1")
 
-    assert summary is not None and summary["summary"] == "first summary"
+    assert summary is not None and summary["summary"] == _LONG_SUMMARY
     assert len(runner.calls) == 1, "must not re-summarize when under threshold"
     # History tail contains the new row plus whatever survived the first split.
     assert any(r["content"] == "short follow-up" for r in history)
@@ -394,7 +409,7 @@ async def test_export_context_includes_summary_and_live_messages(stack):
     live message tail. Memory entries are not exported (they're query-
     scoped, not session-scoped) but the count appears in the header."""
     db = stack["db"]
-    runner = FakeRunner(output="rolled-up summary text")
+    runner = FakeRunner(output=_LONG_SUMMARY)
     operator = _make_operator(stack, runner)
     # Big history so a summary checkpoint gets persisted.
     await _populate_history(db, "s1", n_user_turns=10, padding=800)
@@ -407,7 +422,7 @@ async def test_export_context_includes_summary_and_live_messages(stack):
 
     assert "# Operator context — session s1" in dump
     assert "## Compression summary" in dump
-    assert "rolled-up summary text" in dump
+    assert _LONG_SUMMARY in dump
     assert "## Live history" in dump
     assert "tail user msg" in dump
     assert "tail assistant msg" in dump
@@ -444,5 +459,27 @@ async def test_compress_now_handles_runner_failure(stack):
     out = await operator.compress_now("s1")
 
     assert out["compressed"] is False
-    assert out["reason"] == "runner returned empty"
+    assert "empty" in out["reason"] or "implausible" in out["reason"]
     assert await db.get_latest_chat_summary("s1") is None
+
+
+@pytest.mark.asyncio
+async def test_compression_rejects_implausibly_short_summary(stack):
+    """Regression: the model role-plays / refuses instead of summarizing and
+    returns a near-empty string (once observed: a 7-token echo of the
+    assistant's last line for a 471-message history, which got persisted and
+    gutted the session context). The sanity guard must reject such a result —
+    no summary row, history returned uncompressed — so the prior context
+    survives instead of being destroyed."""
+    runner = FakeRunner(output="На зв'язку!")  # a conversational echo, not a summary
+    operator = _make_operator(stack, runner)
+    # Large input → a handful of tokens back is implausibly short (< 3%).
+    await _populate_history(stack["db"], "s1", n_user_turns=10, padding=800)
+
+    summary, history = await operator._load_and_maybe_compress("s1")
+
+    assert summary is None, "implausibly short summary must be rejected"
+    assert len(history) == 20, "all rows retained; context not destroyed"
+    assert await stack["db"].get_latest_chat_summary("s1") is None
+    # The runner WAS called — rejection happens after, on the result.
+    assert len(runner.calls) == 1

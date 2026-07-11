@@ -167,9 +167,14 @@ class Settings(BaseSettings):
     # snappy first-token latency.
     oncall_compression_threshold_tokens: int = 64000
     # Model used for summarization one-shots (both chat compression and task
-    # result summary). Passed to `claude --model`. "sonnet" is the alias
-    # that resolves to the latest Sonnet on the user's subscription.
-    oncall_compression_model: str = "sonnet"
+    # result summary). Passed to `claude --model`. "opus" is the alias that
+    # resolves to the latest Opus on the user's subscription — chosen over
+    # sonnet after Sonnet role-played the conversation (returning a 7-token
+    # echo of the assistant's last line) instead of summarizing a long
+    # small-talk-heavy history; the stronger model follows the "summarize, do
+    # not participate" instruction more reliably. Runs via the local claude
+    # subscription and is infrequent, so the extra cost is negligible.
+    oncall_compression_model: str = "opus"
     # Executor context guard. The single long-lived `claude` session
     # accumulates context across every hand_off (see supervisor). When a
     # task finishes with the live context window at or above this many

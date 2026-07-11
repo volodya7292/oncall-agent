@@ -824,21 +824,35 @@ MEMORY_NOTE_PREFIX = "[memory note: "
 
 
 COMPRESSION_SYSTEM_PROMPT = """\
-You are summarizing the history of an on-call agent's chat with its user, so
-the conversation fits in a smaller context window.
+You are summarizing the running history of an on-call agent's chat with its
+user, so the conversation still fits a smaller context window.
+
+You are a summarizer, never a participant. Do NOT reply to the user, continue
+the conversation, or adopt the assistant's voice, language, or expression tags
+(e.g. [laughter]). Describe what happened in third-person plain prose ("the
+user asked...", "the operator dispatched...") — even when the transcript is
+casual chit-chat, you narrate it, you do not join it.
 
 Preserve:
 - Every task ID (UUID or short form) the operator dispatched, and what the user wanted from each.
 - User preferences, durable decisions, and constraints they stated.
 - Open threads: things the operator owes the user, questions awaiting an answer.
+- The gist of casual conversation — topics discussed, plans, opinions, and personal context the user shared. Condense it; do not discard it wholesale.
 
 Drop:
 - Verbose tool outputs — the operator can re-query the database by task ID for current state.
-- Resolved small talk.
-- Redundant information.
+- Exact turn-by-turn wording; keep the substance.
 
-Output: a single block of plain prose, third-person ("the user asked...", "the operator dispatched..."), under 400 words. No headers, no bullets, no markdown. End with a blank line.
+Match the target length stated in the request. Output a single block of plain prose. No headers, no bullets, no markdown. End with a blank line.
 """
+
+# Compression sanity-guard thresholds (see Operator._summarize_older). A
+# summary below _MIN_SUMMARY_RATIO of its input token count, or one that shrank
+# a prior summary below _PRIOR_RETENTION_FLOOR of its size, is rejected as an
+# implausible (likely role-played) result rather than persisted. Set well below
+# the ~10% retention target so only clearly-broken outputs trip it.
+_MIN_SUMMARY_RATIO = 0.03
+_PRIOR_RETENTION_FLOOR = 0.5
 
 
 class Operator:
@@ -1326,21 +1340,34 @@ class Operator:
         # operator should decline local-data requests up front rather than
         # spawn a task that will only hit `{"error":"laptop_offline"}`. Not
         # persisted — recomputed each turn. Absent in legacy all-local mode.
+        laptop_online: bool | None = None
         if self._laptop_status_provider is not None:
-            online = False
+            laptop_online = False
             try:
-                online = bool(self._laptop_status_provider())
+                laptop_online = bool(self._laptop_status_provider())
             except Exception:
                 log.warning("laptop status provider raised; treating as offline", exc_info=True)
             laptop_block = (
                 "<laptop-status>online — local files/shell available via hand_off</laptop-status>"
-                if online
+                if laptop_online
                 else "<laptop-status>offline — the user's laptop is unreachable; "
                 "local files/shell are UNAVAILABLE this turn. If the user asks for "
                 "anything needing their local machine, say it's offline and to try "
                 "again when it's back; do not hand_off.</laptop-status>"
             )
             messages.append({"role": "user", "content": laptop_block})
+
+        # Debug-only snapshot of THIS turn's transient statuses, persisted on
+        # every message row written below (see chat_messages.statuses). Never
+        # fed back into context — it exists purely so we can later inspect what
+        # the operator saw when it produced a given reply (e.g. confirm
+        # <call-status> was off when a voice-only tag leaked into text).
+        turn_statuses: dict[str, Any] = {
+            "on_call": on_call,
+            "acting_busy": bool(status.get("busy")),
+            "acting_queue_depth": int(status.get("queue_depth") or 0),
+            "laptop_online": laptop_online,
+        }
 
         tool_calls_made: list[dict[str, Any]] = []
         for _round in range(self._max_tool_rounds):
@@ -1362,7 +1389,9 @@ class Operator:
                 final_text = _strip_breadcrumb_impersonation(
                     resp.get("content") or ""
                 )
-                await self._db.append_chat_message(session_id, "assistant", final_text)
+                await self._db.append_chat_message(
+                    session_id, "assistant", final_text, statuses=turn_statuses,
+                )
                 return OperatorTurnResult(text=final_text, tool_calls_made=tool_calls_made)
 
             # Persist the assistant turn that holds the tool_calls (OpenAI format
@@ -1387,6 +1416,7 @@ class Operator:
             messages.append(assistant_dict)
             await self._db.append_chat_message(
                 session_id, "assistant_tool_calls", json.dumps(assistant_dict),
+                statuses=turn_statuses,
             )
 
             for tc in tc_list:
@@ -1430,6 +1460,7 @@ class Operator:
                         "tool_call_id": tc["id"], "name": tc["name"],
                         "args": args, "result": result,
                     }),
+                    statuses=turn_statuses,
                 )
                 if attachment is not None:
                     # In-memory: full image bytes via a list-content user
@@ -1463,7 +1494,7 @@ class Operator:
                         f"{attachment['source']}; content not persisted]"
                     )
                     await self._db.append_chat_message(
-                        session_id, "user", placeholder,
+                        session_id, "user", placeholder, statuses=turn_statuses,
                     )
 
             # Short-circuit after a successful hand_off: the operator
@@ -1490,7 +1521,9 @@ class Operator:
 
         # Hit the tool-round cap.
         msg = "I'm stuck — too many tool rounds without a final answer. Try rephrasing."
-        await self._db.append_chat_message(session_id, "assistant", msg)
+        await self._db.append_chat_message(
+            session_id, "assistant", msg, statuses=turn_statuses,
+        )
         return OperatorTurnResult(text=msg, tool_calls_made=tool_calls_made)
 
     # ---- context compression ----
@@ -1522,6 +1555,75 @@ class Operator:
         history = await self._db.load_chat_history(session_id, since_id=since_id, limit=2000)
         return new_summary, history
 
+    async def _summarize_older(
+        self,
+        session_id: str,
+        prior_summary: dict[str, Any] | None,
+        older: list[dict[str, Any]],
+    ) -> str | None:
+        """Fold `older` (+ any prior summary) into an updated summary string,
+        or None when there's nothing to summarize OR the model returned an
+        implausible result that must NOT be persisted (persisting it would
+        replace the folded rows with garbage and destroy the session's live
+        context). Shared by the auto (`_compress_history`) and manual
+        (`compress_now`) paths so the ~10% length target and the sanity guard
+        cover both."""
+        if not older:
+            return None
+        prior_text = (prior_summary or {}).get("summary") or "(no prior summary)"
+        prior_est = int((prior_summary or {}).get("estimated_token_count") or 0)
+        in_tokens = sum(len(r["content"]) // 4 for r in older) + prior_est
+        # ~10% retention, clamped: enough to keep the gist of even casual
+        # conversation, still a large shrink. Handed to the model as a word
+        # target (tokens ≈ words × 1.33).
+        target_words = max(120, min(1200, int(in_tokens * 0.10 / 1.33)))
+        formatted = "\n".join(
+            f"[{r['role']}]: {r['content'][:2000]}" for r in older
+        )
+        prompt = (
+            "Fold the transcript below into an updated running summary of the "
+            "conversation so far.\n\n"
+            f"Summary so far:\n{prior_text}\n\n"
+            f"Target length: about {target_words} words (~10% of the source). "
+            "Never shorter than the summary above — you are extending it, not "
+            "replacing it.\n\n"
+            "<transcript>\n"
+            f"{formatted}\n"
+            "</transcript>\n\n"
+            "Output ONLY the updated summary as third-person plain prose."
+        )
+        text = await self._runner.one_shot(
+            prompt,
+            system_prompt=COMPRESSION_SYSTEM_PROMPT,
+            model=self._settings.oncall_compression_model,
+            timeout_s=60.0,
+        )
+        if not text:
+            log.warning(
+                "compression: runner returned empty (session=%s)", session_id,
+            )
+            return None
+        # Sanity guard. A summary far below its input size — or one that shrank
+        # a prior summary it was meant to EXTEND — is almost certainly the model
+        # role-playing or refusing instead of summarizing. Reject it and keep
+        # the prior checkpoint rather than persist context loss. Regression:
+        # Opus/Sonnet fed 471 rows of in-character small talk once returned a
+        # 7-token echo of the assistant's last line ("На зв'язку!"), which
+        # persisted and gutted the session's context.
+        est = len(text) // 4
+        if est < int(in_tokens * _MIN_SUMMARY_RATIO) or (
+            prior_est and est < int(prior_est * _PRIOR_RETENTION_FLOOR)
+        ):
+            log.warning(
+                "compression: rejecting implausible summary — model likely "
+                "role-played instead of summarizing (session=%s est_tokens=%s "
+                "in_tokens=%s prior_est=%s older_rows=%s); keeping prior "
+                "checkpoint. Head: %r",
+                session_id, est, in_tokens, prior_est, len(older), text[:120],
+            )
+            return None
+        return text
+
     async def _compress_history(
         self,
         session_id: str,
@@ -1529,9 +1631,9 @@ class Operator:
         history: list[dict[str, Any]],
     ) -> dict[str, Any] | None:
         """Walk history backwards, choose a safe split point at a user-message
-        boundary near the halfway-token mark, call the runner to summarize the
-        older portion (+ any prior summary), and persist a new chat_summaries
-        row. Returns the new summary dict or None on failure."""
+        boundary near the halfway-token mark, summarize the older portion (+ any
+        prior summary), and persist a new chat_summaries row. Returns the new
+        summary dict or None on failure / rejection."""
         threshold = self._settings.oncall_compression_threshold_tokens
         # Walk from newest to oldest; mark the split when we've covered ~half
         # the token budget and we're sitting at a `user` row (safe boundary —
@@ -1547,23 +1649,7 @@ class Operator:
             # Nothing safely splittable. Skip.
             return None
         older = history[:split_idx]
-        if not older:
-            return None
-
-        formatted_old = "\n".join(
-            f"[{row['role']}]: {row['content'][:2000]}" for row in older
-        )
-        prior_text = (prior_summary or {}).get("summary") or "(no prior summary)"
-        prompt = (
-            f"Prior summary of older history:\n{prior_text}\n\n"
-            f"Recent history to fold into the summary:\n{formatted_old}\n"
-        )
-        text = await self._runner.one_shot(
-            prompt,
-            system_prompt=COMPRESSION_SYSTEM_PROMPT,
-            model=self._settings.oncall_compression_model,
-            timeout_s=60.0,
-        )
+        text = await self._summarize_older(session_id, prior_summary, older)
         if not text:
             return None
         through_id = older[-1]["id"]
@@ -1808,22 +1894,12 @@ class Operator:
             if split_idx is None or split_idx == 0:
                 return {"compressed": False, "reason": "no older user turn to anchor split"}
             older = history[:split_idx]
-            formatted = "\n".join(
-                f"[{r['role']}]: {r['content'][:2000]}" for r in older
-            )
-            prior_text = (prior or {}).get("summary") or "(no prior summary)"
-            prompt = (
-                f"Prior summary of older history:\n{prior_text}\n\n"
-                f"Recent history to fold into the summary:\n{formatted}\n"
-            )
-            text = await self._runner.one_shot(
-                prompt,
-                system_prompt=COMPRESSION_SYSTEM_PROMPT,
-                model=self._settings.oncall_compression_model,
-                timeout_s=60.0,
-            )
+            text = await self._summarize_older(session_id, prior, older)
             if not text:
-                return {"compressed": False, "reason": "runner returned empty"}
+                return {
+                    "compressed": False,
+                    "reason": "runner returned empty or summary rejected as implausible",
+                }
             through_id = older[-1]["id"]
             est = len(text) // 4
             await self._db.insert_chat_summary(
