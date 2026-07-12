@@ -1397,10 +1397,12 @@ class Operator:
 
         tool_calls_made: list[dict[str, Any]] = []
         for _round in range(self._max_tool_rounds):
-            # One LLM round-trip. `timed` records wall-clock into the "llm"
-            # latency window (surfaced in /status); a raise (timeout/error)
-            # lands as an error sample, not a bogus latency reading.
-            with timed("llm"):
+            # One operator LLM round-trip. `timed` records wall-clock into the
+            # "operator" latency window (surfaced in /status); a raise
+            # (timeout/error) lands as an error sample, not a bogus reading.
+            # This times the operator's own model only — the Claude executor
+            # on the hand_off path runs elsewhere and is not measured here.
+            with timed("operator"):
                 resp = await self._llm.chat(
                     model=self._settings.oncall_operator_model,
                     messages=messages,

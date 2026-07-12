@@ -699,7 +699,7 @@ class TelegramAgentService:
         lat = LATENCY.snapshot()
         lat_lines = [
             f"- {label}: {_fmt_latency(lat[key])}"
-            for key, label in (("llm", "LLM"), ("tts", "TTS"))
+            for key, label in (("operator", "Operator"), ("tts", "TTS"))
             if key in lat and (lat[key]["n"] or lat[key]["errors"])
         ]
         if lat_lines:
