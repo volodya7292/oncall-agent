@@ -162,10 +162,10 @@ class Settings(BaseSettings):
     oncall_approval_timeout_seconds: int = 1800
     # Context compression: when the operator's loaded chat history exceeds
     # this many tokens (estimated as chars/4), summarize older turns via the
-    # local `claude` CLI and persist the summary. 64K leaves plenty of head
-    # room inside Gemma's 128K window while keeping prompts small enough for
-    # snappy first-token latency.
-    oncall_compression_threshold_tokens: int = 64000
+    # local `claude` CLI and persist the summary. 32K caps the prompt prefill
+    # well short of the model's window so first-token latency stays snappy —
+    # the smaller the stable prefix, the less there is to prefill each turn.
+    oncall_compression_threshold_tokens: int = 32000
     # Model used for summarization one-shots (both chat compression and task
     # result summary). Passed to `claude --model`. "opus" is the alias that
     # resolves to the latest Opus on the user's subscription — chosen over
