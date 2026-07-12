@@ -1093,16 +1093,13 @@ class CallService:
         to. Memory access isn't gated — the prompt asks for judgement."""
         if active.is_owner:
             return (
-                "voice call from the owner just started. greet them briefly "
-                "(one sentence, conversational, no markdown). your reply will "
-                "be spoken aloud by TTS. audio may be garbled or partly "
-                "inaudible, so before you act on anything consequential "
-                "(sending a message, placing a call, deleting or changing "
-                "something), read back what you understood in one line and "
-                "wait for the owner to confirm before you hand off — don't "
-                "act on a guess. skip the read-back for chitchat and simple "
-                "answers. this note is procedural — do not save anything to "
-                "memory based on it."
+                "owner voice call started. open in one spoken sentence, no "
+                "markdown. this is your text-chat session, so if the recent "
+                "conversation left a thread open you may pick it up instead of "
+                "a bare hello — but don't force it or invent one. audio may be "
+                "garbled: before anything consequential (send, call, delete, "
+                "change), read back what you heard and wait for confirmation; "
+                "skip that for chitchat. procedural note — don't save to memory."
             )
         return (
             f"you have just placed an outbound voice call from the "
