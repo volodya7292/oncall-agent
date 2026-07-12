@@ -28,6 +28,7 @@ from .db import Database, iso
 from .events import EventBus
 from .lifecycle import Lifecycle
 from .local_claude import ClaudeCliRunner, OneShotRunner
+from .metrics import timed
 from .models import format_utc_now, utcnow
 from .operator_memory import Memory, MemoryStore
 from .telegram_service import TelegramService
@@ -1396,19 +1397,23 @@ class Operator:
 
         tool_calls_made: list[dict[str, Any]] = []
         for _round in range(self._max_tool_rounds):
-            resp = await self._llm.chat(
-                model=self._settings.oncall_operator_model,
-                messages=messages,
-                tools=OPERATOR_TOOLS,
-                # Gemini thinking models count `thoughts_token_count`
-                # against `max_output_tokens` — at reasoning_effort=low
-                # that's ~500–1300 tokens before any visible output, so
-                # 512 truncated replies mid-sentence. 2048 leaves ~1.5k+
-                # for the actual reply even at MEDIUM. Operator replies
-                # are still terse by prompt — this is just headroom.
-                max_tokens=2048,
-                reasoning_effort=self._settings.oncall_operator_reasoning_effort,
-            )
+            # One LLM round-trip. `timed` records wall-clock into the "llm"
+            # latency window (surfaced in /status); a raise (timeout/error)
+            # lands as an error sample, not a bogus latency reading.
+            with timed("llm"):
+                resp = await self._llm.chat(
+                    model=self._settings.oncall_operator_model,
+                    messages=messages,
+                    tools=OPERATOR_TOOLS,
+                    # Gemini thinking models count `thoughts_token_count`
+                    # against `max_output_tokens` — at reasoning_effort=low
+                    # that's ~500–1300 tokens before any visible output, so
+                    # 512 truncated replies mid-sentence. 2048 leaves ~1.5k+
+                    # for the actual reply even at MEDIUM. Operator replies
+                    # are still terse by prompt — this is just headroom.
+                    max_tokens=2048,
+                    reasoning_effort=self._settings.oncall_operator_reasoning_effort,
+                )
             tc_list = resp.get("tool_calls") or []
             if not tc_list:
                 final_text = _strip_breadcrumb_impersonation(

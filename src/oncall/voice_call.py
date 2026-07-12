@@ -83,6 +83,7 @@ from .approval_client import is_deny_phrase, phrases_match
 from .broker import Broker
 from .config import Paths
 from .events import EventBus
+from .metrics import timed
 from .models import TaskState
 from .operator import Operator
 from .telegram_agent import agent_session_id
@@ -1801,16 +1802,21 @@ class CallService:
             "input": text,
             "response_format": "opus",
         }
+        # Time the synth round-trip into the "tts" latency window (surfaced in
+        # /status). This is every-spoken-byte's chokepoint, so it captures
+        # conversational, prewarm, and pub/sub paths alike. A raise (timeout /
+        # HTTP error) records an error sample, not a latency reading.
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            r = await client.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {self._tts_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=body,
-            )
-            r.raise_for_status()
+            with timed("tts"):
+                r = await client.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {self._tts_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                )
+                r.raise_for_status()
             return r.content
 
     def _opus_decode(self, ogg_or_opus: bytes) -> bytes:

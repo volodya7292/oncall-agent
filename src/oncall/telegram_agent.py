@@ -37,6 +37,7 @@ from .audit import fmt, telegram_log
 from .broker import Broker
 from .db import Database
 from .events import EventBus
+from .metrics import LATENCY
 from .models import TaskState
 from .operator import Operator
 from .telegram_format import (
@@ -83,6 +84,20 @@ def agent_session_id(owner_user_id: int) -> str:
     """Deterministic chat-session id for the agent's conversation with the
     owner. One owner ↔ one session, persistent across daemon restarts."""
     return f"tg-agent-{owner_user_id}"
+
+
+def _fmt_ms(ms: float) -> str:
+    """Human-friendly duration: sub-second in ms, else seconds."""
+    return f"{ms:.0f}ms" if ms < 1000 else f"{ms / 1000:.1f}s"
+
+
+def _fmt_latency(s: dict[str, float | int]) -> str:
+    """One-line rolling-latency summary from a metrics window snapshot."""
+    parts = [f"p50 {_fmt_ms(s['p50'])}", f"p95 {_fmt_ms(s['p95'])}"]
+    detail = [f"last {_fmt_ms(s['last_ms'])}", f"n={s['n']}"]
+    if s["errors"]:
+        detail.append(f"{s['errors']} err")
+    return f"{', '.join(parts)} ({', '.join(detail)})"
 
 
 _SLASH_HELP = (
@@ -681,7 +696,16 @@ class TelegramAgentService:
             else:
                 lines.append("- last compression: none yet")
 
-        if not (running or queued or approvals or pending) and op is None:
+        lat = LATENCY.snapshot()
+        lat_lines = [
+            f"- {label}: {_fmt_latency(lat[key])}"
+            for key, label in (("llm", "LLM"), ("tts", "TTS"))
+            if key in lat and (lat[key]["n"] or lat[key]["errors"])
+        ]
+        if lat_lines:
+            lines += ["", "Latency (rolling):", *lat_lines]
+
+        if not (running or queued or approvals or pending) and op is None and not lat_lines:
             return "All quiet. No tasks, no pending approvals, no pending DMs."
 
         return "\n".join(lines)
