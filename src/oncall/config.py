@@ -249,10 +249,12 @@ class Settings(BaseSettings):
     #   gemini     → a bare AI Studio id ("gemini-3.5-flash")
     #   anthropic  → a hyphenated Claude id ("claude-haiku-4-5")
     oncall_operator_model: str = "gemini-3.5-flash"
-    # Reasoning level. On gpt-oss "low" buys better triage / tool-routing for a
-    # small TTFT cost; "minimal" is not accepted by all reasoning models, so the
-    # portable low-latency floor is "low". None leaves the dial unset.
-    oncall_operator_reasoning_effort: str | None = "low"
+    # Reasoning level. gemini-3.5-flash maps this to thinking_level (accepts
+    # minimal / low / medium / high). "minimal" is the lowest-footprint,
+    # fastest-TTFT setting — fewest thinking tokens before the first visible
+    # token. Bump to "low"/"medium" if tool-routing quality suffers. None
+    # leaves the dial unset.
+    oncall_operator_reasoning_effort: str | None = "minimal"
     # Which API surface to use for the operator's LLM.
     #   "gemini" → native Google AI Studio API (google-genai SDK). The default.
     #              Required for ack-first behavior on Google models (the
