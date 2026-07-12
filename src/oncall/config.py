@@ -241,32 +241,31 @@ class Settings(BaseSettings):
     oncall_memory_hybrid_beta: float = 0.3
     oncall_memory_relevance_floor: float = 0.30
     oncall_memory_max_inject: int = 10
-    # Operator model. Default is openai/gpt-oss-120b via OpenRouter
-    # ("openrouter" backend), pinned to fast providers (see below). Measured
-    # ~0.26s TTFT on Groq with the real operator prompt — comfortably under the
-    # 0.6s target — at ~$0.15/Mtok in (~10x cheaper than claude-haiku). It's a
-    # reasoning model; low effort keeps it fast while helping tool routing.
-    # Switch models by pairing ONCALL_OPERATOR_BACKEND with the right id:
+    # Operator model. Default is gemini-3.5-flash via the native Google AI
+    # Studio API ("gemini" backend). It's a thinking model; the reasoning dial
+    # below trades TTFT against tool-routing quality. Switch models by pairing
+    # ONCALL_OPERATOR_BACKEND with the right id:
     #   openrouter → an OpenRouter slug ("openai/gpt-oss-120b", "deepseek/deepseek-v4-flash")
     #   gemini     → a bare AI Studio id ("gemini-3.5-flash")
     #   anthropic  → a hyphenated Claude id ("claude-haiku-4-5")
-    oncall_operator_model: str = "openai/gpt-oss-120b"
+    oncall_operator_model: str = "gemini-3.5-flash"
     # Reasoning level. On gpt-oss "low" buys better triage / tool-routing for a
     # small TTFT cost; "minimal" is not accepted by all reasoning models, so the
     # portable low-latency floor is "low". None leaves the dial unset.
     oncall_operator_reasoning_effort: str | None = "low"
     # Which API surface to use for the operator's LLM.
-    #   "openrouter" → OpenAI-compatible via OpenRouter. The default. Pins
-    #              provider routing (ONCALL_OPERATOR_PROVIDER_ORDER) for lowest
-    #              TTFT and gets automatic prompt caching on capable providers.
+    #   "gemini" → native Google AI Studio API (google-genai SDK). The default.
+    #              Required for ack-first behavior on Google models (the
+    #              OpenAI-compat gateways strip assistant text when a tool_call
+    #              rides in the same response). Also flash-lite's
+    #              thought_signature round-trip.
+    #   "openrouter" → OpenAI-compatible via OpenRouter. Pins provider routing
+    #              (ONCALL_OPERATOR_PROVIDER_ORDER) for lowest TTFT and gets
+    #              automatic prompt caching on capable providers.
     #   "anthropic" → native Anthropic Messages API (anthropic SDK). Kept
     #              available; the only surface with explicit cache_control.
-    #   "gemini" → native Google AI Studio API (google-genai SDK). Required
-    #              for ack-first behavior on Google models (the OpenAI-compat
-    #              gateways strip assistant text when a tool_call rides in the
-    #              same response). Also flash-lite's thought_signature round-trip.
     #   "vercel" → OpenAI-compatible via Vercel AI Gateway.
-    oncall_operator_backend: str = "openrouter"
+    oncall_operator_backend: str = "gemini"
     # OpenRouter provider preference for the operator model, highest priority
     # first (comma-separated). Fallbacks stay ON, so it drops to the next one if
     # the top provider rate-limits. For gpt-oss-120b these are the sub-0.5s TTFT
