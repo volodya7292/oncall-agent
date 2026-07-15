@@ -216,6 +216,24 @@ class Settings(BaseSettings):
     # would block every later task.
     oncall_laptop_job_timeout_seconds: int = 300
 
+    # ---- Autonomous developer (invoke_developer) ----
+    # A separate `claude --permission-mode auto` session spawned ON THE LAPTOP
+    # to do file/git work autonomously, isolated from the oncall MCP / broker /
+    # Telegram (see developer_runner.py). The executor delegates one coding task
+    # (one broker approval) and is notified of the result via a `<developers>`
+    # context update. These are read on the LAPTOP (worker) side.
+    oncall_developer_model: str = "opus"
+    oncall_developer_effort: str = "high"
+    # Hard cap: the worker kills the developer's whole process group at this
+    # age, regardless of polling. 30 min covers real coding tasks.
+    oncall_developer_timeout_seconds: int = 1800
+    # How long a `developer_wait` control-plane call blocks before returning the
+    # current status (paces the server-side watcher's polling). MUST stay below
+    # oncall_laptop_presence_window_seconds (60): while the worker is inside a
+    # wait it is not refreshing its GET /laptop/jobs heartbeat, so a full-window
+    # wait could flip presence to offline at the boundary.
+    oncall_developer_wait_seconds: int = 45
+
     # Operator memory — semantic, LRU-evicted. Stored in SQLite alongside the
     # rest of state. Capacity caps the number of rows; when extraction would
     # exceed it, the least-recently-retrieved rows are dropped. Hybrid score
@@ -383,6 +401,10 @@ class Paths:
         self.settings_json = _PACKAGE_DIR / "executor" / "settings.json"
         self.executor_prompt = _PACKAGE_DIR / "prompts" / "executor_system.md"
         self.operator_prompt = _PACKAGE_DIR / "prompts" / "operator_system.md"
+        # Autonomous-developer Claude CLI settings (catastrophic deny list) and
+        # system prompt. Spawned on the laptop by `invoke_developer`.
+        self.developer_settings_json = _PACKAGE_DIR / "developer" / "settings.json"
+        self.developer_prompt = _PACKAGE_DIR / "prompts" / "developer_system.md"
         # Looped office-ambience bed mixed under voice calls (see Settings).
         self.ambient_bed = _PACKAGE_DIR / "assets" / "office_bed.ogg"
 

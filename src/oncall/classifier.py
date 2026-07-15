@@ -137,6 +137,25 @@ def classify(tool_name: str, tool_input: dict[str, Any]) -> Verdict:
         )
     if tool_name == "mcp__oncall__laptop":
         return _classify_laptop(tool_input)
+    if tool_name == "mcp__oncall__invoke_developer":
+        folder = str(tool_input.get("folder", ""))
+        task = str(tool_input.get("task", ""))[:120]
+        return Verdict(
+            kind=ClassifierVerdict.MUTATING,
+            canonical=f"invoke_developer(folder={folder}, task={task!r})",
+            blast_radius=(
+                f"Spawns an autonomous auto-approval coding agent in '{folder}' on "
+                f"the user's laptop. It can edit files and run git/shell there "
+                f"without further approval (catastrophic commands still blocked)."
+            ),
+        )
+    if tool_name == "mcp__oncall__cancel_developer":
+        dev_id = str(tool_input.get("developer_id", "?"))
+        return Verdict(
+            kind=ClassifierVerdict.READONLY,
+            canonical=f"cancel_developer({dev_id})",
+            blast_radius="Stops an already-approved developer job on the laptop.",
+        )
     if tool_name == "mcp__oncall__messenger_inbox":
         return _classify_messenger(tool_input)
     if tool_name == "mcp__oncall__memory":

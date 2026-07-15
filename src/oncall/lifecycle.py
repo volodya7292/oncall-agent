@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from uuid import UUID, uuid4
 
@@ -40,6 +41,10 @@ class Lifecycle:
     events: EventBus
     settings: Settings
     paths: Paths
+    # Optional provider of the `<developers>` snapshot block prepended to each
+    # executor turn (set by api.py to DeveloperManager.snapshot_block). Lets the
+    # executor see its in-flight autonomous developer jobs. None = omit.
+    developers_snapshot_provider: Callable[[], str] | None = None
     running: dict[UUID, RunningTask] = field(default_factory=dict)
     _queue: "asyncio.Queue[Task] | None" = field(default=None, init=False, repr=False)
     _worker_task: "asyncio.Task[None] | None" = field(default=None, init=False, repr=False)
@@ -338,7 +343,10 @@ class Lifecycle:
                     fut.cancel()
 
     async def _run_one(self, task: Task) -> None:
-        sup = Supervisor(db=self.db, events=self.events, settings=self.settings, paths=self.paths)
+        sup = Supervisor(
+            db=self.db, events=self.events, settings=self.settings, paths=self.paths,
+            developers_snapshot_provider=self.developers_snapshot_provider,
+        )
         runner = asyncio.create_task(self._supervise(task, sup))
         self.running[task.id] = RunningTask(task=task, supervisor=sup, runner=runner)
         try:

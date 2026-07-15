@@ -93,6 +93,61 @@ _LAPTOP_TOOL = Tool(
 )
 
 
+# Autonomous-developer tools, advertised only in cloud-primary (server) mode.
+# `invoke_developer` spawns a sandboxed `claude --permission-mode auto` session
+# on the laptop that does file/git work without per-action approval; it is
+# isolated from this MCP / broker / Telegram. The executor keeps its broker —
+# so this one call requires one human approval, then the developer runs on its
+# own. Results come back asynchronously as a `<developers>` context update, NOT
+# from this tool (which returns a handle immediately).
+_INVOKE_DEVELOPER_TOOL = Tool(
+    name="invoke_developer",
+    description=(
+        "Delegate a self-contained CODING task to an autonomous developer agent "
+        "running ON THE USER'S LAPTOP, in the working directory `folder`. Use "
+        "this for real code/file/git work (implement X, fix Y, refactor Z) "
+        "instead of driving many individual `laptop` bash/write_file calls — the "
+        "developer edits files and runs git/tests itself, without asking for "
+        "approval on each step.\n"
+        "Requires the user's approval (once, for this delegation). Returns "
+        "IMMEDIATELY with `{developer_id, status:\"running\"}` — the work runs "
+        "asynchronously and can take many minutes. Do NOT block, poll, or call "
+        "this again for the same job: when it finishes you are automatically "
+        "notified with a `<developer-update>` turn carrying its summary. Your "
+        "currently-running developers are listed in the `<developers>` block at "
+        "the top of each turn; never launch a second developer for a folder+task "
+        "already running there.\n"
+        "`folder` must be an absolute path on the laptop (you know the right one "
+        "from your memories). `task` should be a clear, complete brief — the "
+        "developer cannot ask you clarifying questions."
+    ),
+    inputSchema={
+        "type": "object",
+        "required": ["task", "folder"],
+        "properties": {
+            "task": {"type": "string", "description": "Complete brief for the coding task."},
+            "folder": {"type": "string", "description": "Absolute path to the working directory on the laptop."},
+        },
+    },
+)
+
+_CANCEL_DEVELOPER_TOOL = Tool(
+    name="cancel_developer",
+    description=(
+        "Stop a running developer job by `developer_id` (from a prior "
+        "invoke_developer or the `<developers>` block). Kills the developer's "
+        "session on the laptop. No approval needed."
+    ),
+    inputSchema={
+        "type": "object",
+        "required": ["developer_id"],
+        "properties": {
+            "developer_id": {"type": "string"},
+        },
+    },
+)
+
+
 @app.list_tools()
 async def list_tools() -> list[Tool]:
     tools = [
@@ -252,10 +307,13 @@ async def list_tools() -> list[Tool]:
             },
         ),
     ]
-    # The laptop proxy tool only exists in cloud-primary deployments; in
-    # legacy all-local mode the executor uses its native Bash/Read/Edit/Write.
+    # The laptop proxy + developer tools only exist in cloud-primary
+    # deployments; in legacy all-local mode the executor uses its native
+    # Bash/Read/Edit/Write and can code directly.
     if _is_server_role():
         tools.append(_LAPTOP_TOOL)
+        tools.append(_INVOKE_DEVELOPER_TOOL)
+        tools.append(_CANCEL_DEVELOPER_TOOL)
     return tools
 
 
@@ -273,6 +331,10 @@ async def call_tool(
         result = await _proxy_ask_user(arguments)
     elif name == "laptop":
         result = await _proxy_laptop(arguments)
+    elif name == "invoke_developer":
+        result = await _proxy_developer("developer_start", arguments)
+    elif name == "cancel_developer":
+        result = await _proxy_developer("developer_cancel", arguments)
     else:
         result = {"error": f"unknown tool '{name}'"}
     # messenger_inbox.read_image returns image bytes inline. Strip the
@@ -401,6 +463,38 @@ async def _proxy_laptop(args: dict[str, Any]) -> dict[str, Any]:
         return {"error": detail, "status": e.response.status_code}
     except Exception as e:
         log.exception("laptop proxy failed")
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+async def _proxy_developer(op: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Dispatch an invoke_developer / cancel_developer call to the server's
+    DeveloperManager (loopback). Like the laptop proxy, the developer job runs
+    asynchronously — but the control-plane op here (start/cancel) returns fast,
+    so no long block. `op` is the internal bridge op; the tool args become
+    `input`."""
+    payload = {
+        "session_id": _session_id(),
+        "op":         op,
+        "input":      {k: v for k, v in args.items() if v is not None},
+    }
+    headers = {"X-Oncall-Token": _token(), "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{_orchestrator_url()}/internal/developer/dispatch",
+                json=payload,
+                headers=headers,
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as e:
+        try:
+            detail = e.response.json().get("detail", str(e))
+        except Exception:
+            detail = str(e)
+        return {"error": detail, "status": e.response.status_code}
+    except Exception as e:
+        log.exception("developer proxy failed")
         return {"error": f"{type(e).__name__}: {e}"}
 
 

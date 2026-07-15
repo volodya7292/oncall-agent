@@ -29,6 +29,7 @@ import httpx
 
 from .classifier import classify
 from .config import Settings
+from .developer_runner import DeveloperRunner
 from .models import ClassifierVerdict
 
 
@@ -148,8 +149,14 @@ def _which(prog: str) -> bool:
     )
 
 
-async def execute_job(job: dict[str, Any]) -> dict[str, Any]:
-    """Run one job descriptor `{id, kind, input}` and return its result dict."""
+async def execute_job(
+    job: dict[str, Any], runner: DeveloperRunner | None = None,
+) -> dict[str, Any]:
+    """Run one job descriptor `{id, kind, input}` and return its result dict.
+
+    `runner` owns the developer-job registry; it must be the same instance
+    across calls (created once in run_worker), so the developer_* control-plane
+    ops share state. The fast ops ignore it."""
     kind = job.get("kind")
     inp = job.get("input") or {}
     if kind == "bash":
@@ -162,6 +169,14 @@ async def execute_job(job: dict[str, Any]) -> dict[str, Any]:
         return _run_glob(str(inp.get("pattern", "")), inp.get("path"))
     if kind == "grep":
         return await _run_grep(str(inp.get("pattern", "")), inp.get("path"))
+    if kind in ("developer_start", "developer_wait", "developer_cancel"):
+        if runner is None:
+            return {"error": "developer_unavailable", "detail": "no developer runner"}
+        if kind == "developer_start":
+            return runner.start(str(inp.get("task", "")), str(inp.get("folder", "")))
+        if kind == "developer_wait":
+            return await runner.wait(str(inp.get("developer_id", "")))
+        return runner.cancel(str(inp.get("developer_id", "")))
     return {"error": "unknown_kind", "detail": f"worker can't run '{kind}'"}
 
 
@@ -176,6 +191,9 @@ async def run_worker(settings: Settings) -> None:
             "in ~/.oncall/.env (the server's public URL + its laptop token)."
         )
     headers = {"X-Oncall-Laptop-Token": token}
+    # One runner for the whole worker lifetime — it holds the in-flight
+    # developer-job registry, which must persist across execute_job calls.
+    runner = DeveloperRunner(settings)
     # Read timeout must outlast the server's long-poll hold.
     read_timeout = settings.oncall_laptop_poll_timeout_seconds + 20
     timeout = httpx.Timeout(connect=10.0, read=read_timeout, write=30.0, pool=10.0)
@@ -218,13 +236,16 @@ async def run_worker(settings: Settings) -> None:
                 if job is None:
                     continue  # idle long-poll elapsed; re-poll immediately
                 log.info("running job %s (kind=%s)", job.get("id"), job.get("kind"))
-                result = await execute_job(job)
+                result = await execute_job(job, runner)
                 await client.post(
                     f"{server}/laptop/jobs/{job['id']}/result",
                     json={"result": result},
                     headers=headers,
                 )
             except asyncio.CancelledError:
+                # Clean shutdown: kill any live developer sessions so we don't
+                # orphan a `claude` running detached in its own process group.
+                runner.kill_all()
                 raise
             except httpx.ReadTimeout:
                 # Expected: the long-poll held past our read window with no

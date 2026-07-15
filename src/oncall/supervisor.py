@@ -17,6 +17,7 @@ import logging
 import os
 import signal
 import sys
+from collections.abc import Callable
 from typing import Any
 
 from .config import (
@@ -52,11 +53,13 @@ class Supervisor:
         events: EventBus,
         settings: Settings,
         paths: Paths,
+        developers_snapshot_provider: "Callable[[], str] | None" = None,
     ) -> None:
         self._db = db
         self._events = events
         self._settings = settings
         self._paths = paths
+        self._developers_snapshot_provider = developers_snapshot_provider
         self._proc: asyncio.subprocess.Process | None = None
         # Live context-window fill (tokens) reported by the most recent
         # task's final `result` event. Drives the post-task /compact guard.
@@ -408,8 +411,22 @@ class Supervisor:
             )
         return text
 
+    def _with_developers_block(self, text: str) -> str:
+        if self._developers_snapshot_provider is None:
+            return text
+        try:
+            block = self._developers_snapshot_provider() or ""
+        except Exception:
+            log.warning("developers snapshot provider raised; skipping", exc_info=True)
+            return text
+        return f"{block}\n\n{text}" if block else text
+
     async def _write_user_turn(self, text: str) -> None:
         assert self._proc and self._proc.stdin
+        # Prepend the current `<developers>` snapshot (in-flight autonomous
+        # developer jobs) so the executor sees them and doesn't re-delegate the
+        # same work. Best-effort: a provider failure must not block the turn.
+        text = self._with_developers_block(text)
         line = json.dumps({
             "type": "user",
             "message": {

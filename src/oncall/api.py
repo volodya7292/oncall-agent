@@ -33,6 +33,7 @@ from .approval_client import HttpLongPollApprovalClient, is_kill_phrase
 from .broker import Broker
 from .config import get_paths, get_settings
 from .db import Database
+from .developer_manager import DeveloperManager
 from .embeddings import OllamaEmbeddingClient
 from .events import EventBus
 from .laptop_bridge import LaptopBridge
@@ -168,6 +169,15 @@ class LaptopResultBody(BaseModel):
     # (e.g. {stdout, stderr, exit_code} for bash) — forwarded verbatim to
     # the blocked executor dispatch.
     result: dict[str, Any]
+
+
+class DeveloperDispatchBody(BaseModel):
+    # Calling executor's session id (forwarded by the MCP proxy) — used to
+    # resolve which chat delegated the developer, so the completion notice
+    # routes back to the right user.
+    session_id: str | None = None
+    op: str  # developer_start | developer_cancel
+    input: dict[str, Any] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +452,17 @@ def create_app() -> FastAPI:
         # the user (chat.reply) and the operator's history. Operator stays
         # out of this loop entirely — it already said "Looking…" earlier.
         notify_sid = telegram_agent.session_id if telegram_agent is not None else None
+        # Autonomous developer (invoke_developer) — cloud-primary mode only.
+        # Owns developer-job metadata + watchers and pushes completion back into
+        # the executor. Its snapshot feeds every executor turn via lifecycle.
+        developer_manager: DeveloperManager | None = None
+        if settings.is_server_role:
+            developer_manager = DeveloperManager(
+                bridge=laptop_bridge, lifecycle=lifecycle, db=db, events=events,
+                settings=settings, notify_session_id=notify_sid,
+            )
+            lifecycle.developers_snapshot_provider = developer_manager.snapshot_block
+        app.state.developer_manager = developer_manager
         auto_ping_task: asyncio.Task | None = None
         if operator is not None:
             auto_ping_task = asyncio.create_task(
@@ -533,6 +554,8 @@ def create_app() -> FastAPI:
                     await bg_task
                 except (asyncio.CancelledError, Exception):
                     pass
+            if developer_manager is not None:
+                await developer_manager.shutdown()
             await lifecycle.shutdown()
             if voice_call is not None:
                 await voice_call.stop()
@@ -1434,6 +1457,25 @@ def _register_routes(app: FastAPI) -> None:
     async def laptop_dispatch(body: LaptopDispatchBody, request: Request) -> dict[str, Any]:
         bridge: LaptopBridge = request.app.state.laptop_bridge
         return await bridge.dispatch(body.op, body.input)
+
+    @app.post("/internal/developer/dispatch", dependencies=[Depends(verify_loopback)])
+    async def developer_dispatch(body: DeveloperDispatchBody, request: Request) -> dict[str, Any]:
+        """Loopback: the invoke_developer / cancel_developer MCP tools land here
+        (AFTER the broker gated invoke_developer). The DeveloperManager forwards
+        to the laptop and tracks the async job."""
+        mgr: DeveloperManager | None = request.app.state.developer_manager
+        if mgr is None:
+            return {"error": "developer_unavailable", "detail": "not in server role"}
+        inp = body.input or {}
+        if body.op == "developer_start":
+            return await mgr.start(
+                body.session_id or "",
+                str(inp.get("task", "")),
+                str(inp.get("folder", "")),
+            )
+        if body.op == "developer_cancel":
+            return await mgr.cancel(str(inp.get("developer_id", "")))
+        return {"error": "unknown_developer_op", "detail": body.op}
 
     @app.get("/laptop/jobs", dependencies=[Depends(verify_laptop_token)])
     async def laptop_jobs(request: Request) -> dict[str, Any]:

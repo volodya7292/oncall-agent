@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [],
+    "ask": [],
+    "deny": [
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf ~*)",
+      "Bash(rm -rf $HOME*)",
+      "Bash(rm -rf --no-preserve-root*)",
+      "Bash(dd if=* of=/dev/*)",
+      "Bash(mkfs*)",
+      "Bash(mkfs.*)",
+      "Bash(:(){ :|:& };:*)",
+      "Bash(chmod -R 777 /*)",
+      "Bash(chown -R *)",
+      "Bash(shutdown*)",
+      "Bash(reboot*)",
+      "Bash(halt*)",
+      "Bash(poweroff*)",
+      "Bash(init 0*)",
+      "Bash(init 6*)",
+      "Bash(curl * | sh*)",
+      "Bash(curl * | bash*)",
+      "Bash(wget * | sh*)",
+      "Bash(wget * | bash*)"
+    ]
+  }
+}

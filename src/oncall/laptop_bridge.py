@@ -46,6 +46,16 @@ LAPTOP_OPS: frozenset[str] = frozenset({
     "bash", "read_file", "write_file", "glob", "grep",
 })
 
+# Developer control-plane ops (invoke_developer). These ride the same bridge
+# but are NOT part of the `laptop` tool's op enum — they're reachable only via
+# the dedicated invoke_developer / cancel_developer MCP tools and the
+# server-side DeveloperManager. All three are fast (start/cancel return
+# immediately; wait blocks ≤ oncall_developer_wait_seconds, well under the
+# bridge job timeout).
+DEVELOPER_OPS: frozenset[str] = frozenset({
+    "developer_start", "developer_wait", "developer_cancel",
+})
+
 
 @dataclass
 class _Job:
@@ -102,7 +112,7 @@ class LaptopBridge:
         result. Returns the worker's result dict, or an `{"error": ...}` dict
         on offline / timeout — never raises for those expected cases, so the
         executor sees a tool error it can reason about rather than a hang."""
-        if kind not in LAPTOP_OPS:
+        if kind not in (LAPTOP_OPS | DEVELOPER_OPS):
             return {"error": "unknown_laptop_op", "detail": f"unknown op '{kind}'"}
         if not self.is_online():
             return {
