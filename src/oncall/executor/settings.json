@@ -7,6 +7,7 @@
     ],
     "ask": [],
     "deny": [
+      "AskUserQuestion",
       "Bash(rm -rf /*)",
       "Bash(rm -rf ~*)",
       "Bash(rm -rf $HOME*)",

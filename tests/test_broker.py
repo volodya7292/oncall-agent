@@ -163,6 +163,40 @@ async def test_catastrophic_auto_denies(db, events):
 
 
 # ---------------------------------------------------------------------------
+# Unknown tool auto-denies instead of waking the owner
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_unknown_tool_auto_denies_without_escalating(db, events):
+    """A tool the classifier doesn't know must come back to the agent, not go
+    to the human.
+
+    The executor is a Claude CLI with built-ins we never classified, so it
+    reaches for real-to-it tools like AskUserQuestion. Those fell through to
+    the MUTATING default-deny posture and escalated, which asked the owner to
+    approve a call that could not have worked either way (the executor runs
+    --print, so a built-in prompt has no one to prompt).
+    """
+    task = await _make_task(db)
+    # Auto-ALLOW client: if the broker escalated, this would come back
+    # allow. Asserting deny proves the owner was never consulted.
+    broker = Broker(db, AutoAllowApprovalClient(), events)
+    result = await broker.decide(
+        session_id=task.session_id,
+        tool_use_id="tu_unknown",
+        tool_name="AskUserQuestion",
+        tool_input={"questions": [{"question": "proceed?"}]},
+    )
+    assert result.behavior == "deny"
+    msg = (result.message or "").lower()
+    assert "askuserquestion" in msg, "agent must learn which tool was refused"
+    assert "mcp__oncall__ask_user" in msg, "point it at the tool that works"
+    # Counted, so a model that keeps retrying trips the existing halt backstop.
+    refreshed = await db.get_task(task.id)
+    assert refreshed.consecutive_denials == 1
+
+
+# ---------------------------------------------------------------------------
 # Mutating escalates; phrase match coerces decision
 # ---------------------------------------------------------------------------
 
