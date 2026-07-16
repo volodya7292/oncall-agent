@@ -37,6 +37,32 @@ Write tests when they capture:
 
 When in doubt, lean toward fewer, denser tests. A 200-line test file that proves 5 hard properties beats a 1000-line file that re-asserts the source code.
 
+## Operator memory: cosine proposes, the LLM decides
+
+The pipeline is therefore deliberately shaped:
+
+1. **Write time always INSERTs** (`OperatorMemory.store`). Near-duplicates are
+   expected to exist transiently — that is not a bug.
+2. **`dedup_pass()` (periodic, `_memory_dedup_loop` in [api.py](src/oncall/api.py))**
+   builds clusters from the cosine graph at `cluster_threshold=0.80`. Cosine is
+   only a *candidate generator* here; it is never the verdict.
+3. **An LLM arbitrates each cluster**, reading the actual texts and returning
+   merge groups. Its prompt says entities that differ (person, host, version,
+   identifier) MUST NOT merge, and "when in doubt, omit".
+4. **Keep-separate verdicts persist to `memory_dedup_skip_pairs`** so the next
+   pass doesn't re-litigate the same cluster (and doesn't re-burn LLM calls) —
+   which is why a high-cosine pair still sitting in `operator_memories` is
+   usually *evidence the system worked*, not evidence it failed.
+
+Corollary for anyone auditing memory health: a pile of cosine-similar rows
+proves nothing on its own. Check `memory_dedup_skip_pairs` before concluding
+dedup is broken — the pair has probably already been judged.
+
+Retrieval note: memories are injected as `[memory note: ...]` **user-role
+messages**, not into the system prompt (see `Operator._build_system_prompt`),
+so the system-prompt + history prefix stays byte-stable and the provider's KV
+cache keeps hitting across turns.
+
 ## Memory testing
 
 `tests/test_operator_memory.py` includes live integration tests against a local Ollama daemon running `nomic-embed-text:137m-v1.5-fp16`. They skip unless `ONCALL_RUN_EMBEDDING_TESTS=1` is set. To run them locally:
