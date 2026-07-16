@@ -65,11 +65,22 @@ Any `asyncio.create_task`-launched loop in [src/oncall/api.py](src/oncall/api.py
 
 The orchestrator runs SQLite in WAL mode at `~/.oncall/state.db` — which, in the server-primary deployment, lives **on the hosted server** inside the container's `/root/.oncall` volume (`oncall_state`), not on this laptop. Safe inspection while the daemon is live:
 
+The image ships **no `sqlite3` binary** — reach the DB through the stdlib `sqlite3` module via `python`. The container name is compose-generated (`root-oncall-agent-1` at time of writing); confirm with `docker ps --filter name=oncall`. Opening with `mode=ro` keeps inspection non-mutating; WAL allows these reads while the daemon is live.
+
 ```sh
-# On the server, inside the container (WAL allows concurrent reads):
-docker exec oncall sqlite3 /root/.oncall/state.db \
-  "SELECT id, text, last_accessed_at FROM operator_memories ORDER BY last_accessed_at DESC;"
+# On the server, inside the container:
+docker exec root-oncall-agent-1 python -c "
+import sqlite3
+c = sqlite3.connect('file:/root/.oncall/state.db?mode=ro', uri=True)
+for r in c.execute('SELECT id, text, last_accessed_at FROM operator_memories ORDER BY last_accessed_at DESC'):
+    print(r)
+"
 
 # Or a snapshot if you'll be poking around for a while:
-docker exec oncall sqlite3 /root/.oncall/state.db ".backup /tmp/oncall.db"
+docker exec root-oncall-agent-1 python -c "
+import sqlite3
+src = sqlite3.connect('file:/root/.oncall/state.db?mode=ro', uri=True)
+dst = sqlite3.connect('/tmp/oncall.db')
+src.backup(dst)
+"
 ```
