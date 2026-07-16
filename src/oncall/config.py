@@ -259,20 +259,45 @@ class Settings(BaseSettings):
     oncall_memory_hybrid_beta: float = 0.3
     oncall_memory_relevance_floor: float = 0.30
     oncall_memory_max_inject: int = 10
-    # Operator model. Default is gemini-3.5-flash via the native Google AI
-    # Studio API ("gemini" backend). It's a thinking model; the reasoning dial
-    # below trades TTFT against tool-routing quality. Switch models by pairing
-    # ONCALL_OPERATOR_BACKEND with the right id:
-    #   openrouter → an OpenRouter slug ("openai/gpt-oss-120b", "deepseek/deepseek-v4-flash")
+    # Operator model. Default is glm-5.2 via OpenRouter, pinned to Fireworks.
+    # Switch models by pairing ONCALL_OPERATOR_BACKEND with the right id:
+    #   openrouter → an OpenRouter slug ("z-ai/glm-5.2", "x-ai/grok-4.20")
     #   gemini     → a bare AI Studio id ("gemini-3.5-flash")
     #   anthropic  → a hyphenated Claude id ("claude-haiku-4-5")
-    oncall_operator_model: str = "gemini-3.5-flash"
-    # Reasoning level. gemini-3.5-flash maps this to thinking_level (accepts
-    # minimal / low / medium / high). "minimal" is the lowest-footprint,
-    # fastest-TTFT setting — fewest thinking tokens before the first visible
-    # token. Bump to "low"/"medium" if tool-routing quality suffers. None
-    # leaves the dial unset.
-    oncall_operator_reasoning_effort: str | None = "minimal"
+    #
+    # Measured at this operator's real prompt shape (full round-trip, the thing
+    # `timed("operator")` records), glm-5.2 beats the previous gemini-3.5-flash
+    # default on every axis that matters here:
+    #
+    #                     11k ctx   16k ctx   32k ctx   non-halluc   $/M out
+    #   glm-5.2 (no-reas)   1.10s     1.14s     1.81s      0.665       2.89
+    #   gemini-3.5-flash    1.52s     1.89s     7.47s      0.266       9.00
+    #
+    # The 32k column is why: gemini's round-trip explodes with context while
+    # glm stays ~flat, and the operator carries a big rolling history. The
+    # non-halluc column is Artificial Analysis' omniscience non-hallucination
+    # rate — with only 4 operator tools, hallucination hurts more than
+    # tool-routing finesse, and gemini-3.5-flash at minimal thinking scored
+    # worst of every model surveyed (0.266).
+    oncall_operator_model: str = "z-ai/glm-5.2"
+    # Reasoning level. "none" asks for NO thinking pass (the OpenRouter client
+    # sends reasoning.enabled=false); None just omits the dial and takes the
+    # model/provider default. We say "none" explicitly rather than relying on
+    # that default: OpenRouter advertises glm-5.2 as default_enabled=true /
+    # default_effort=high, and while fireworks/fast in practice returns 0
+    # reasoning tokens with the dial unset, the fallback providers below are
+    # not guaranteed to agree. Being explicit is what the latency numbers
+    # above were measured with.
+    #
+    # Thinking is expensive here, not free: grok-4.20 with reasoning on costs
+    # 11s at 16k and 20s+ at 32k, because thinking scales with context (482
+    # thinking tokens at 4k -> 1682 at 16k). glm-5.2 only offers high/xhigh —
+    # there is no cheap middle setting to fall back to.
+    #
+    # Accepted: none/off/disabled, or a level (minimal/low/medium/high) —
+    # levels are forwarded as-is, so an unsupported one surfaces as an API
+    # error rather than silently downgrading.
+    oncall_operator_reasoning_effort: str | None = "none"
     # Which API surface to use for the operator's LLM.
     #   "gemini" → native Google AI Studio API (google-genai SDK). The default.
     #              Required for ack-first behavior on Google models (the
@@ -285,12 +310,25 @@ class Settings(BaseSettings):
     #   "anthropic" → native Anthropic Messages API (anthropic SDK). Kept
     #              available; the only surface with explicit cache_control.
     #   "vercel" → OpenAI-compatible via Vercel AI Gateway.
-    oncall_operator_backend: str = "gemini"
+    oncall_operator_backend: str = "openrouter"
     # OpenRouter provider preference for the operator model, highest priority
-    # first (comma-separated). Fallbacks stay ON, so it drops to the next one if
-    # the top provider rate-limits. For gpt-oss-120b these are the sub-0.5s TTFT
-    # providers measured; retune per model.
-    oncall_operator_provider_order: str = "Groq,Cerebras,BaseTen"
+    # first (comma-separated). Accepts provider names ("Groq") or endpoint tags
+    # ("fireworks/fast"); tags pin a specific variant. Fallbacks stay ON, so it
+    # drops to the next one if the top provider rate-limits.
+    #
+    # Retune per model — provider choice dominates model choice here. Across
+    # glm-5.2's 28 providers, weekly-median TTFT ranges 608ms..4074ms (Z.AI's
+    # own endpoint is the slowest) and tool-call error rate ranges 0.13%..7.25%.
+    # This list is ordered by OpenRouter's weekly stats, gated on tool-call
+    # error rate and quantization:
+    #   fireworks/fast — 0.77% tool err, 81% cache hit, best E2E of the fp8-ish
+    #   fireworks      — same provider, unpinned variant
+    #   together       — 0.89% tool err, 74% cache hit
+    # Deliberately NOT in the list: BaseTen (3.63% tool err), DeepInfra (7.25%,
+    # and fp4), and the other fp4 endpoints — glm-5.2's published quality
+    # scores were not measured at fp4, so a fallback there would silently
+    # degrade the thing we picked this model for.
+    oncall_operator_provider_order: str = "fireworks/fast,fireworks,together"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_api_key: str = ""           # OpenRouter key (oncall_operator_backend=openrouter)
     anthropic_api_key: str = ""            # Claude API key (oncall_operator_backend=anthropic)

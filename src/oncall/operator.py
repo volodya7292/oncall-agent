@@ -56,6 +56,13 @@ class LLMClient(Protocol):
         ...
 
 
+# Values of ONCALL_OPERATOR_REASONING_EFFORT that mean "no thinking pass at
+# all", as distinct from None ("don't send the dial, take the model default").
+# The difference is load-bearing: an unset dial on a default_enabled=true model
+# reasons at its default effort.
+_REASONING_OFF = frozenset({"none", "off", "disabled"})
+
+
 class GenAILLMClient:
     """LLM client backed by Google's native AI Studio / Gemini API
     (`google.genai`). Translates the operator's OpenAI-Chat-style messages
@@ -197,10 +204,15 @@ class GenAILLMClient:
         # so the API error surfaces honestly if it's unsupported, rather
         # than silently downgrading. Anything unrecognized → fall back to
         # MINIMAL (the latency-conservative default).
+        # "none"/"off" → MINIMAL: Gemini 3.x thinking models have no true
+        # off switch, so the floor is the honest translation of "don't think".
         if reasoning_effort:
-            level = reasoning_effort.upper()
-            if level not in {"MINIMAL", "LOW", "MEDIUM", "HIGH"}:
+            if reasoning_effort.lower() in _REASONING_OFF:
                 level = "MINIMAL"
+            else:
+                level = reasoning_effort.upper()
+                if level not in {"MINIMAL", "LOW", "MEDIUM", "HIGH"}:
+                    level = "MINIMAL"
             cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=level)
         if tools:
             decls: list[types.FunctionDeclaration] = []
@@ -371,14 +383,25 @@ class OpenRouterLLMClient:
             "messages": messages,
             "tools": tools or None,
         }
+        extra_body: dict[str, Any] = {}
         if self._provider_order:
-            kwargs["extra_body"] = {
-                "provider": {"order": self._provider_order, "allow_fallbacks": True},
+            extra_body["provider"] = {
+                "order": self._provider_order, "allow_fallbacks": True,
             }
         if max_tokens is not None:
             kwargs["max_completion_tokens"] = max_tokens
+        # "none" means explicitly OFF, which is not the same as unset (take the
+        # provider default). `reasoning_effort` cannot express "off" — only
+        # `reasoning.enabled=false` can — and models differ on what unset means
+        # (OpenRouter advertises glm-5.2 as default_enabled=true), so the
+        # caller gets to say it outright rather than inherit a default.
         if reasoning_effort is not None:
-            kwargs["reasoning_effort"] = reasoning_effort
+            if reasoning_effort.lower() in _REASONING_OFF:
+                extra_body["reasoning"] = {"enabled": False}
+            else:
+                kwargs["reasoning_effort"] = reasoning_effort
+        if extra_body:
+            kwargs["extra_body"] = extra_body
         # OpenAI client rejects tools=None — strip if so.
         if kwargs["tools"] is None:
             kwargs.pop("tools")
