@@ -481,9 +481,18 @@ def _classify_command(node) -> tuple[bool, str | None]:
 
 def _redirect_is_readonly(redirect) -> bool:
     """A redirect node. `.type` is the executor string ('>', '>>', '<', ...).
-    `.output` is the word node for the target."""
+    `.output` is the word node for the target, or an int for fd duplication."""
     op = redirect.type
     if op in ("<", "<<", "<<<", "<<-", "0<"):
+        return True
+    # `2>&1`, `>&2`, `3>&1`: bashlex models fd duplication with an *int*
+    # output — the descriptor number, not a path. Duplicating onto an already
+    # open descriptor opens no file, so it is read-only on its own. If the
+    # command does write a file, that write is a separate redirect node with a
+    # word target and gets classified independently (`>out 2>&1` parses to
+    # two nodes), so this cannot mask it. Note `>&word` and `&>word` DO name a
+    # file and still arrive here as word nodes.
+    if isinstance(redirect.output, int):
         return True
     # Output: only /dev/null-ish targets are safe.
     target = _word_text(redirect.output) if redirect.output else ""

@@ -58,6 +58,18 @@ READONLY_BASH = [
     "echo hello > /dev/null",
     "echo hello 2> /dev/null",
     "cat /etc/hosts < /dev/null",
+    # Bug: `2>&1` escalated every read-only command to the owner for approval.
+    # bashlex models fd duplication with an *int* output (the descriptor), not
+    # a word; reading it as a filename yielded "" -> not a safe target ->
+    # writes_to_file. `2>/dev/null` above has a word target and so never hit
+    # this. See _redirect_is_readonly.
+    "git show --stat abc123 2>&1 | head -50",
+    "cd /srv/app && git show --stat abc123 2>&1 | head -50",
+    "ls 2>&1 | head",
+    "git log >&2",
+    "cat f 3>&1",
+    "ls >/dev/null 2>&1",
+    "ls &>/dev/null",
     "FOO=bar ls",
     "ls && grep root /etc/passwd",
     "pwd; date; whoami",
@@ -122,6 +134,14 @@ MUTATING_BASH = [
     "cp a b",
     "echo hello > /tmp/out.log",
     "echo hello >> /tmp/out.log",
+    # The int-output shortcut in _redirect_is_readonly must not mask a real
+    # file write sitting next to an fd dup: `>out 2>&1` parses to two separate
+    # redirect nodes, and the `>out` one still has to escalate on its own.
+    # `>&word` / `&>word` name a file despite the `&` and arrive as words.
+    "git show abc123 >out 2>&1",
+    "git show abc123 2>&1 >out",
+    "git show abc123 >&out.txt",
+    "git show abc123 &>out.txt",
     "git push origin main",
     "git reset --hard HEAD~1",
     "git checkout main",
