@@ -247,7 +247,7 @@ class _ActiveCall:
 # but kept here so they sit next to _ActiveCall for easy review.
 RING_TIMEOUT_S = 40.0       # outbound call dropped if not picked up by then
 IDLE_TIMEOUT_S = 90.0       # any call torn down after this much silence
-MAX_CALL_DURATION_S = 600.0  # hard cap on any single call (10 min)
+MAX_CALL_DURATION_S = 600.0  # hard cap on non-owner calls (10 min); owner calls are uncapped
 WATCHDOG_TICK_S = 5.0       # how often _call_watchdog re-checks
 # Proactive re-engagement: if the user goes quiet (no real speech) for this
 # long while the bot also has nothing queued to say, the operator is pinged so
@@ -691,9 +691,11 @@ class CallService:
                     continue
                 # Hard cap on call duration — prevents the agent from
                 # being trapped on a runaway call (held line, stalking,
-                # bug). Measured from pickup, not from placement.
+                # bug). Measured from pickup, not from placement. The owner
+                # can hang up whenever they like, so their calls are exempt;
+                # IDLE_TIMEOUT_S still reclaims the slot if the line dies.
                 duration = now - active.connected_at
-                if duration >= MAX_CALL_DURATION_S:
+                if not active.is_owner and duration >= MAX_CALL_DURATION_S:
                     log.info(
                         "voice: max-duration %.0fs reached in call with %s; "
                         "tearing down", duration, active.callee_label,
