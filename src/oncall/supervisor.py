@@ -31,6 +31,7 @@ from .config import (
 from .db import Database
 from .events import EventBus
 from .models import Task, TaskState, TerminalReason, format_utc_now
+from .result_delivery import EXECUTOR_REPLY_BUDGET_CHARS
 
 
 log = logging.getLogger(__name__)
@@ -370,14 +371,21 @@ class Supervisor:
 
     def _render_executor_prompt(self) -> str:
         """Read the executor system prompt and substitute spawn-time
-        placeholders. Currently: `{{current_date}}` → UTC datetime captured
-        at spawn — the executor's headless `--print` session doesn't get a
-        reliable date in its built-in context, so we inject one explicitly.
-        Long-running resumed sessions still see the date refresh on each
-        spawn (one per hand_off)."""
+        placeholders.
+
+        `{{current_date}}` → UTC datetime captured at spawn — the executor's
+        headless `--print` session doesn't get a reliable date in its built-in
+        context, so we inject one explicitly. Long-running resumed sessions
+        still see the date refresh on each spawn (one per hand_off).
+
+        `{{reply_budget_chars}}` → the length the executor is asked to write
+        to. Deliberately BELOW result_delivery.MAX_USER_FACING_CHARS: nothing
+        rewrites the executor now, so the gap is slack that absorbs a mild
+        overrun instead of cutting the user's message mid-word."""
         text = self._paths.executor_prompt.read_text(encoding="utf-8")
         now = format_utc_now()
         text = text.replace("{{current_date}}", now)
+        text = text.replace("{{reply_budget_chars}}", str(EXECUTOR_REPLY_BUDGET_CHARS))
         if self._settings.is_server_role:
             text += (
                 "\n\n# Execution environment (cloud)\n\n"

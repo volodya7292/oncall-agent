@@ -1,8 +1,7 @@
 """Executor → user result delivery.
 
 When a hand_off'd executor task terminates, we pull its final
-assistant text, compress to ≤300 chars (passthrough if already short
-enough; one-shot LLM summary otherwise), and dual-write:
+assistant text and dual-write it verbatim:
 
   1. publish `chat.reply` → telegram bot subscriber sends to the user
   2. append to the operator's chat history as an `assistant` row,
@@ -11,6 +10,18 @@ enough; one-shot LLM summary otherwise), and dual-write:
 
 The operator is intentionally NOT involved in this path. It said
 "Looking…" when it called hand_off; the system delivers the answer.
+
+There is deliberately NO rewrite step here. An LLM compressor used to sit
+on this path, and since any chat digest overruns the budget it ran on
+nearly every real answer rather than as an edge case. It corrupted the
+text it touched: told to "keep first-person voice", it rewrote the
+executor's correct "you (the user) advised him" into "I advised" —
+stealing the user's own words — and its own overruns then got guillotined
+mid-word anyway. The executor is told its budget directly now (see
+prompts/executor_system.md) and writes to fit. `_hard_truncate` remains
+only as a backstop for a disobedient model, and logs when it fires — if
+that warning is anything but rare, fix the executor prompt rather than
+reintroducing a rewriter.
 """
 
 from __future__ import annotations
@@ -27,17 +38,16 @@ from .voice import to_voice_text
 log = logging.getLogger(__name__)
 
 
-MAX_USER_FACING_CHARS = 300
+# Hard ceiling on what reaches the user. Bounded by voice: the reply is
+# TTS'd, and past this it's a monologue.
+MAX_USER_FACING_CHARS = 350
 
-_SUMMARIZE_SYSTEM_PROMPT = (
-    "You compress an on-call worker's reply into a message the operator "
-    "sends to the user on Telegram. Output ONLY the compressed message, "
-    "no preamble. ≤300 chars total. Keep first-person voice ('I checked', "
-    "'looks like…'). Preserve any specific identifiers, numbers, file "
-    "paths, error messages, and ANY challenge phrase or quoted prompt "
-    "verbatim. Drop process noise ('I ran X, then Y, then Z'). Lead with "
-    "the result."
-)
+# What the executor is *asked* to write (injected into its prompt as
+# `{{reply_budget_chars}}`). The 50-char gap is slack, not headroom for
+# more content: models overshoot a stated limit slightly, and since nothing
+# rewrites them anymore, an overshoot lands on the user as a mid-word cut.
+# Absorbing it is cheaper than truncating. Keep this BELOW the ceiling.
+EXECUTOR_REPLY_BUDGET_CHARS = 300
 
 
 def latest_executor_text(events: list[dict[str, Any]]) -> str:
@@ -55,13 +65,11 @@ async def deliver_executor_result(
     *,
     db: Database,
     events: EventBus,
-    llm: Any | None,  # LLMClient — typed loosely to avoid an import cycle
-    model: str,
     task_id: UUID,
     chat_session_id: str,
     terminal_state: str,
 ) -> None:
-    """Read the executor's final text, compress if needed, dual-write."""
+    """Read the executor's final text and dual-write it verbatim."""
     task_events = await db.list_events(task_id)
     raw = latest_executor_text(task_events)
     if not raw:
@@ -83,12 +91,7 @@ async def deliver_executor_result(
         )
         return
 
-    if len(raw) <= MAX_USER_FACING_CHARS:
-        final = raw
-    else:
-        final = await _summarize(llm, model, raw)
-
-    final = (final or "").strip()
+    final = _hard_truncate(raw).strip()
     if not final:
         log.info("result_delivery: empty final text for task %s; skipping", task_id)
         return
@@ -138,41 +141,15 @@ async def _publish_failure_notice(
         log.exception("result_delivery: failed to publish failure notice for %s", task_id)
 
 
-async def _summarize(llm: Any | None, model: str, text: str) -> str:
-    """Compress with the operator's same LLM (cheap flash-lite by default).
-    On any failure, hard-truncate the raw text — fail loud in logs but
-    still deliver something."""
-    if llm is None:
-        log.warning("result_delivery: no llm available; hard-truncating")
-        return _hard_truncate(text)
-    try:
-        resp = await llm.chat(
-            model=model,
-            messages=[
-                {"role": "system", "content": _SUMMARIZE_SYSTEM_PROMPT},
-                {"role": "user", "content": text},
-            ],
-            tools=[],
-            max_tokens=512,
-            # Without this Gemini's default thinking budget eats most of
-            # `max_tokens` and the visible reply gets truncated mid-sentence —
-            # producing fragments like ", PointerEventData.InputButton>`".
-            # Summarization is mechanical compression; no thinking needed.
-            reasoning_effort="minimal",
-        )
-    except Exception:
-        log.exception("result_delivery: summarize call crashed; truncating")
-        return _hard_truncate(text)
-    out = (resp.get("content") or "").strip()
-    if not out:
-        log.warning("result_delivery: summarizer returned empty; truncating")
-        return _hard_truncate(text)
-    if len(out) > MAX_USER_FACING_CHARS:
-        out = _hard_truncate(out)
-    return out
-
-
 def _hard_truncate(text: str) -> str:
+    """Backstop for an executor that blew past EXECUTOR_REPLY_BUDGET_CHARS by
+    more than the slack. Cuts mid-word; that ugliness is the point — it should
+    be visible, and rare."""
     if len(text) <= MAX_USER_FACING_CHARS:
         return text
+    log.warning(
+        "result_delivery: executor returned %d chars, over the %d budget; "
+        "truncating. If this is not rare, fix prompts/executor_system.md.",
+        len(text), MAX_USER_FACING_CHARS,
+    )
     return text[: MAX_USER_FACING_CHARS - 1] + "…"

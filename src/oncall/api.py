@@ -467,8 +467,7 @@ def create_app() -> FastAPI:
         if operator is not None:
             auto_ping_task = asyncio.create_task(
                 _result_delivery_loop(
-                    events=events, db=db, llm=llm,
-                    model=settings.oncall_operator_model,
+                    events=events, db=db,
                     notify_session_id=notify_sid,
                 ),
                 name="result-delivery",
@@ -630,14 +629,12 @@ def _supervise_bg_task(
 
 async def _result_delivery_loop(
     *, events: EventBus, db: Database,
-    llm: Any | None, model: str,
     notify_session_id: str | None = None,
 ) -> None:
     """When a hand_off'd executor task reaches a terminal state, pull
-    its final assistant text, compress to ≤300 chars (passthrough or
-    Gemini Flash-Lite summary), then dual-write: publish chat.reply
-    (telegram subscriber delivers to user) AND append to the operator's
-    chat history so the operator's next turn sees "what I said."
+    its final assistant text, then dual-write it verbatim: publish
+    chat.reply (telegram subscriber delivers to user) AND append to the
+    operator's chat history so the operator's next turn sees "what I said."
 
     Approval requests are NOT relayed through the operator — the
     telegram agent's `_approval_subscriber` sends the challenge-phrase
@@ -666,7 +663,7 @@ async def _result_delivery_loop(
                     continue
                 try:
                     await deliver_executor_result(
-                        db=db, events=events, llm=llm, model=model,
+                        db=db, events=events,
                         task_id=task_uuid,
                         chat_session_id=task.dispatched_by_chat_session,
                         terminal_state=new_state,

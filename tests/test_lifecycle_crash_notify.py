@@ -53,7 +53,7 @@ async def test_failed_task_with_no_text_notifies_user(env):
     task = await _insert_task(db, "tg-agent-42")
     # No assistant.text events recorded → the silent-failure case.
     await deliver_executor_result(
-        db=db, events=events, llm=None, model="m",
+        db=db, events=events,
         task_id=task.id, chat_session_id="tg-agent-42", terminal_state="failed",
     )
     replies = [p for t, p in published if t == "chat.reply"]
@@ -68,7 +68,7 @@ async def test_completed_side_effect_task_stays_silent(env):
     task = await _insert_task(db, "tg-agent-42")
     # e.g. a lone emoji reaction: completed, no assistant text → must NOT spam.
     await deliver_executor_result(
-        db=db, events=events, llm=None, model="m",
+        db=db, events=events,
         task_id=task.id, chat_session_id="tg-agent-42", terminal_state="completed",
     )
     assert not [p for t, p in published if t == "chat.reply"]
