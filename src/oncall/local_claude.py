@@ -42,6 +42,7 @@ class OneShotRunner(Protocol):
         *,
         system_prompt: str | None = None,
         model: str = "sonnet",
+        effort: str | None = None,
         timeout_s: float = 60.0,
     ) -> str | None: ...
 
@@ -58,6 +59,7 @@ class ClaudeCliRunner:
         *,
         system_prompt: str | None = None,
         model: str = "sonnet",
+        effort: str | None = None,
         timeout_s: float = 60.0,
     ) -> str | None:
         argv = [
@@ -78,6 +80,8 @@ class ClaudeCliRunner:
             "--permission-mode", "default",
             "--disallowedTools", _DISALLOWED_TOOLS,
         ]
+        if effort:
+            argv += ["--effort", effort]
         if system_prompt:
             argv += ["--append-system-prompt", system_prompt]
 

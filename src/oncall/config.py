@@ -175,6 +175,12 @@ class Settings(BaseSettings):
     # not participate" instruction more reliably. Runs via the local claude
     # subscription and is infrequent, so the extra cost is negligible.
     oncall_compression_model: str = "opus"
+    # Effort for the compression one-shot (`claude --effort`). Compression is
+    # off the hot path (see Operator._schedule_compression — it runs in the
+    # background after the turn has already replied), so it can afford to think:
+    # the failure mode this guards against is a lazy summary that drops context
+    # or role-plays, not a slow one. Empty string omits the flag.
+    oncall_compression_effort: str = "medium"
     # Executor context guard. The single long-lived `claude` session
     # accumulates context across every hand_off (see supervisor). When a
     # task finishes with the live context window at or above this many

@@ -977,6 +977,12 @@ class Operator:
         # Strong references to in-flight extraction tasks so they aren't
         # garbage-collected while running.
         self._extraction_tasks: set[asyncio.Task[Any]] = set()
+        # Same, for background history compression (see _schedule_compression),
+        # plus the set of session_ids with a compression already in flight —
+        # the over-budget trigger persists until the summary lands, so without
+        # this every turn in between would spawn a duplicate opus one-shot.
+        self._compression_tasks: set[asyncio.Task[Any]] = set()
+        self._compressing: set[str] = set()
         # Per-turn buffer of facts the operator saved via `save_memory`
         # during the in-flight turn. Drained at extraction time so the
         # candidate-suggester can dedup against what's already committed.
@@ -1593,28 +1599,62 @@ class Operator:
         self, session_id: str,
     ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
         """Returns (summary, history). `history` is rows newer than the latest
-        summary's checkpoint. If the loaded window exceeds the configured token
-        budget, compress (older portion → new summary) and re-load."""
+        summary's checkpoint.
+
+        Compression does NOT run inline. If the window is over budget we reply
+        from the uncompressed history and compress in the background, so the
+        turn that happens to cross the threshold pays a slightly larger prefill
+        instead of waiting on an opus one-shot (tens of seconds) before it can
+        say anything. The summary lands before the next turn loads."""
         summary = await self._db.get_latest_chat_summary(session_id)
         since_id = summary["through_message_id"] if summary else 0
         # Big upper bound — compression is what keeps this small, not the limit.
         history = await self._db.load_chat_history(session_id, since_id=since_id, limit=2000)
 
         threshold = self._settings.oncall_compression_threshold_tokens
-        if _estimate_tokens(summary, history) <= threshold:
-            return summary, history
+        if _estimate_tokens(summary, history) > threshold:
+            self._schedule_compression(session_id, summary, history)
+        return summary, history
 
-        new_summary = await self._compress_history(session_id, summary, history)
-        if new_summary is None:
-            # Compression failed (claude not on PATH, timeout, etc). Proceed
-            # with the uncompressed history — the operator may produce a slow
-            # turn but it won't crash. Try again on the next user turn.
-            log.warning("compression failed for session %s; using uncompressed history", session_id)
-            return summary, history
+    def _schedule_compression(
+        self,
+        session_id: str,
+        summary: dict[str, Any] | None,
+        history: list[dict[str, Any]],
+    ) -> None:
+        """Fire-and-forget background compression for `session_id`.
 
-        since_id = new_summary["through_message_id"]
-        history = await self._db.load_chat_history(session_id, since_id=since_id, limit=2000)
-        return new_summary, history
+        At most one in flight per session: the trigger is "history is over
+        budget", which stays true until the summary lands, so every turn in
+        between would otherwise queue another redundant opus one-shot against
+        the same rows."""
+        if session_id in self._compressing:
+            return
+        self._compressing.add(session_id)
+
+        async def _run() -> None:
+            try:
+                new_summary = await self._compress_history(session_id, summary, history)
+                if new_summary is None:
+                    # Already logged by _compress_history/_summarize_older. The
+                    # window stays over budget, so the next turn retries — at
+                    # the cost of a bigger prefill until it succeeds.
+                    log.warning(
+                        "background compression produced no summary (session=%s); "
+                        "history stays uncompressed", session_id,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("background compression crashed (session=%s)", session_id)
+            finally:
+                self._compressing.discard(session_id)
+
+        task = asyncio.create_task(_run())
+        # Strong ref so the task isn't GC'd mid-flight (same reason as
+        # _extraction_tasks).
+        self._compression_tasks.add(task)
+        task.add_done_callback(self._compression_tasks.discard)
 
     async def _summarize_older(
         self,
@@ -1657,6 +1697,7 @@ class Operator:
             prompt,
             system_prompt=COMPRESSION_SYSTEM_PROMPT,
             model=self._settings.oncall_compression_model,
+            effort=self._settings.oncall_compression_effort or None,
             timeout_s=60.0,
         )
         if not text:

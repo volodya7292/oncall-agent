@@ -10,6 +10,7 @@ These tests use a FakeRunner so no `claude` binary is spawned. They cover:
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -51,11 +52,12 @@ class FakeRunner:
         self.calls: list[dict[str, Any]] = []
 
     async def one_shot(
-        self, prompt, *, system_prompt=None, model="sonnet", timeout_s=60.0,
+        self, prompt, *, system_prompt=None, model="sonnet", effort=None,
+        timeout_s=60.0,
     ) -> str | None:
         self.calls.append({
             "prompt": prompt, "system_prompt": system_prompt,
-            "model": model, "timeout_s": timeout_s,
+            "model": model, "effort": effort, "timeout_s": timeout_s,
         })
         return self.output
 
@@ -142,6 +144,20 @@ async def _populate_history(db: Database, session_id: str, n_user_turns: int, pa
         await db.append_chat_message(session_id, "assistant", f"reply {i}")
 
 
+async def _load_settled(operator, session_id):
+    """Load, then drain background compression, then re-load.
+
+    Compression is fire-and-forget (Operator._schedule_compression): the turn
+    that trips the threshold replies from the uncompressed history and the
+    summary lands afterwards. This mirrors what the NEXT turn sees, which is
+    the state most of these tests care about.
+    """
+    await operator._load_and_maybe_compress(session_id)
+    while operator._compression_tasks:
+        await asyncio.gather(*list(operator._compression_tasks))
+    return await operator._load_and_maybe_compress(session_id)
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -169,7 +185,7 @@ async def test_compression_triggers_above_threshold(stack):
     # well above the 200-token threshold.
     await _populate_history(stack["db"], "s1", n_user_turns=10, padding=800)
 
-    summary, history = await operator._load_and_maybe_compress("s1")
+    summary, history = await _load_settled(operator, "s1")
 
     assert summary is not None
     assert summary["summary"] == _LONG_SUMMARY
@@ -187,6 +203,67 @@ async def test_compression_triggers_above_threshold(stack):
 
 
 @pytest.mark.asyncio
+async def test_compression_does_not_block_the_turn(stack):
+    """The turn that trips the threshold must NOT wait on the summarizer.
+
+    Compression is an opus one-shot (tens of seconds); running it inline made
+    one turn in every N stall before the operator could say anything. The load
+    now returns the uncompressed history immediately and the summary lands
+    behind it.
+    """
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingRunner(FakeRunner):
+        async def one_shot(self, prompt, **kw):
+            started.set()
+            await release.wait()          # summarizer "takes forever"
+            return await super().one_shot(prompt, **kw)
+
+    runner = BlockingRunner(output=_LONG_SUMMARY)
+    operator = _make_operator(stack, runner)
+    await _populate_history(stack["db"], "s1", n_user_turns=10, padding=800)
+
+    # Returns while the summarizer is still blocked => it did not await it.
+    summary, history = await asyncio.wait_for(
+        operator._load_and_maybe_compress("s1"), timeout=1.0,
+    )
+    assert summary is None, "must reply from the pre-compression checkpoint"
+    assert len(history) == 20, "uncompressed history is used for this turn"
+
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    release.set()
+    await asyncio.gather(*list(operator._compression_tasks))
+
+    # ...and the summary is there for the NEXT turn.
+    assert await stack["db"].get_latest_chat_summary("s1") is not None
+
+
+@pytest.mark.asyncio
+async def test_compression_not_scheduled_twice_for_one_session(stack):
+    """Over-budget stays true until the summary lands, so back-to-back turns
+    would each queue their own opus one-shot against the same rows without the
+    in-flight guard."""
+    release = asyncio.Event()
+
+    class BlockingRunner(FakeRunner):
+        async def one_shot(self, prompt, **kw):
+            await release.wait()
+            return await super().one_shot(prompt, **kw)
+
+    runner = BlockingRunner(output=_LONG_SUMMARY)
+    operator = _make_operator(stack, runner)
+    await _populate_history(stack["db"], "s1", n_user_turns=10, padding=800)
+
+    for _ in range(3):                      # three turns, none compressed yet
+        await operator._load_and_maybe_compress("s1")
+    release.set()
+    await asyncio.gather(*list(operator._compression_tasks))
+
+    assert len(runner.calls) == 1, f"expected 1 compression, got {len(runner.calls)}"
+
+
+@pytest.mark.asyncio
 async def test_compression_uses_configured_sonnet_model(stack):
     """The runner must be called with the compression_model setting, not the
     operator's regular model."""
@@ -194,7 +271,7 @@ async def test_compression_uses_configured_sonnet_model(stack):
     operator = _make_operator(stack, runner)
     await _populate_history(stack["db"], "s1", n_user_turns=10, padding=800)
 
-    await operator._load_and_maybe_compress("s1")
+    await _load_settled(operator, "s1")
 
     assert runner.calls[0]["model"] == "sonnet"
     # The system prompt is the compression-specific one, not the operator's.
@@ -208,7 +285,7 @@ async def test_compression_fail_soft_returns_uncompressed(stack):
     operator = _make_operator(stack, runner)
     await _populate_history(stack["db"], "s1", n_user_turns=10, padding=800)
 
-    summary, history = await operator._load_and_maybe_compress("s1")
+    summary, history = await _load_settled(operator, "s1")
 
     assert summary is None
     assert len(history) == 20  # all rows retained
@@ -224,7 +301,7 @@ async def test_compression_split_lands_on_user_boundary(stack):
     operator = _make_operator(stack, runner)
     await _populate_history(stack["db"], "s1", n_user_turns=10, padding=800)
 
-    summary, history = await operator._load_and_maybe_compress("s1")
+    summary, history = await _load_settled(operator, "s1")
 
     assert summary is not None
     # First row in the live tail must be a user turn.
@@ -238,7 +315,7 @@ async def test_subsequent_load_uses_existing_summary(stack):
     runner = FakeRunner(output=_LONG_SUMMARY)
     operator = _make_operator(stack, runner)
     await _populate_history(stack["db"], "s1", n_user_turns=10, padding=800)
-    await operator._load_and_maybe_compress("s1")
+    await _load_settled(operator, "s1")
     assert len(runner.calls) == 1
 
     # Add a single short turn — total (summary + new) is still small.
@@ -267,7 +344,7 @@ async def test_clear_session_wipes_messages_and_summaries(stack):
     await _populate_history(stack["db"], "s2", n_user_turns=2, padding=50)
     # Seed a summary checkpoint on s1 by faking a big history and compressing.
     await _populate_history(stack["db"], "s1", n_user_turns=10, padding=800)
-    await operator._load_and_maybe_compress("s1")
+    await _load_settled(operator, "s1")
     s1_summary_before = await stack["db"].get_latest_chat_summary("s1")
     assert s1_summary_before is not None
 
