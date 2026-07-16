@@ -423,8 +423,20 @@ class OperatorMemory:
     ) -> dict[str, Any] | None:
         """One LLM call: decide merge-or-keep for one cluster. Returns the
         parsed JSON dict or None on parse/empty response (caller logs)."""
+        # `recorded_at` is what lets the arbiter tell a paraphrase from a fact
+        # that CHANGED. Without it, "lives in Berlin" and "lives in Munich"
+        # look like a contradiction it must keep both of — and the operator is
+        # left holding two mutually exclusive memories with no way to know
+        # which one is current.
         items = json.dumps(
-            [{"id": int(r["id"]), "text": str(r["text"])} for r in cluster_rows],
+            [
+                {
+                    "id": int(r["id"]),
+                    "text": str(r["text"]),
+                    "recorded_at": str(r["created_at"]),
+                }
+                for r in sorted(cluster_rows, key=lambda r: str(r["created_at"]))
+            ],
             ensure_ascii=False,
         )
         system = (
@@ -436,10 +448,23 @@ class OperatorMemory:
             "    ...\n"
             "  ]}\n"
             "Each entry is a SUBSET of the input memories you want to "
-            "consolidate into one new entry. The members of a group must "
-            "ALL state the SAME fact (paraphrases of one another). "
+            "consolidate into one new entry. Memories are listed oldest-first "
+            "and each carries `recorded_at`.\n"
+            "Merge a group when its members either:\n"
+            "  (a) state the SAME fact (paraphrases of one another), or\n"
+            "  (b) state the same attribute of the SAME entity, but the value "
+            "CHANGED over time — the user moved, renamed something, switched "
+            "tools. Here the NEWEST `recorded_at` wins: write the consolidated "
+            "text as the current fact. Keep the superseded value only if it "
+            "still carries usable signal (e.g. 'uses Postgres, migrated from "
+            "MySQL in 2024'), and never phrase it so the stale value could be "
+            "mistaken for current.\n"
             "Memories that refer to DIFFERENT entities (person, host, "
-            "version, identifier, scope, etc.) MUST NOT share a group. "
+            "version, identifier, scope, etc.) MUST NOT share a group — a "
+            "newer memory about a different entity supersedes nothing.\n"
+            "A preference or opinion that merely differs is NOT automatically "
+            "superseded; people hold several at once. Supersede only when the "
+            "newer memory is genuinely incompatible with the older.\n"
             "Memories not listed in any group are kept as-is.\n"
             "If nothing should be merged, return {\"merge_groups\": []}.\n"
             "When in doubt, omit — losing information is worse than keeping "

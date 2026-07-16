@@ -16,6 +16,8 @@ boundary cases are testable to three decimals.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import math
 import os
 from typing import Sequence
@@ -386,3 +388,63 @@ async def _all_rows(db: Database) -> list[dict]:
 async def _last_accessed_map(db: Database) -> dict[str, str]:
     rows = await _all_rows(db)
     return {r["text"]: r["last_accessed_at"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# dedup_pass: what the LLM arbiter is actually shown
+# ---------------------------------------------------------------------------
+
+
+class _CapturingLLM:
+    """Records the cluster payload; merges nothing."""
+
+    def __init__(self) -> None:
+        self.messages: list[list[dict]] = []
+
+    async def chat(self, *, model, messages, tools, max_tokens=None,
+                   reasoning_effort=None):
+        self.messages.append(messages)
+        return {"role": "assistant", "content": '{"merge_groups": []}',
+                "tool_calls": []}
+
+
+@pytest.mark.asyncio
+async def test_dedup_cluster_payload_carries_timestamps_oldest_first(db):
+    """The arbiter can only tell a paraphrase from a superseded fact if it can
+    see WHEN each memory was recorded, and in what order.
+
+    Regression guard for two easy breaks: `memory_all_rows` not selecting
+    `created_at` (KeyError on every pass), and the payload arriving in id order
+    rather than chronological order — which would invite the LLM to treat the
+    stale value as current.
+    """
+    embedder = StubEmbedder()
+    # Same attribute, value changed → must land in one cluster (cos = 1.0).
+    old, new = "The user lives in Berlin.", "The user lives in Munich."
+    for t in (old, new):
+        embedder.register(t, [1.0, 0.0])
+    mem = make_memory(db, embedder)
+
+    # Insert NEW first so id order and time order disagree; if the payload were
+    # sorted by id the assertion below would catch it.
+    await mem.store([new])
+    await asyncio.sleep(0.01)
+    await mem.store([old])
+    await db.conn.execute(
+        "UPDATE operator_memories SET created_at = ? WHERE text = ?",
+        ("2026-01-01T00:00:00+00:00", old),
+    )
+    await db.conn.execute(
+        "UPDATE operator_memories SET created_at = ? WHERE text = ?",
+        ("2026-07-01T00:00:00+00:00", new),
+    )
+    await db.conn.commit()
+
+    llm = _CapturingLLM()
+    await mem.dedup_pass(llm, model="test-model")
+
+    assert llm.messages, "cluster should have reached the arbiter"
+    payload = json.loads(llm.messages[0][1]["content"].split("Memories:\n", 1)[1])
+    assert [p["text"] for p in payload] == [old, new], "must be oldest-first"
+    assert all("recorded_at" in p for p in payload), "arbiter needs timestamps"
+    assert payload[0]["recorded_at"] < payload[1]["recorded_at"]

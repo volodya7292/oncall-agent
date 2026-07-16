@@ -1406,8 +1406,11 @@ class Database:
         return rowcount > 0
 
     async def memory_all_rows(self, model: str) -> list[dict[str, Any]]:
+        # `created_at` rides along for the dedup arbiter: it distinguishes a
+        # paraphrase from a fact that changed, so the newer value can win
+        # (see OperatorMemory._dedup_decide).
         async with self.conn.execute(
-            "SELECT id, text, embedding, last_accessed_at "
+            "SELECT id, text, embedding, created_at, last_accessed_at "
             "FROM operator_memories WHERE model = ? ORDER BY id",
             (model,),
         ) as cur:
