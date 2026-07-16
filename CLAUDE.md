@@ -18,6 +18,14 @@ Do NOT `kill` the worker PID directly — launchd respawns it from the same whee
 
 Note the `oncall api` daemon loads the operator system prompt **once at startup** (see `Operator.__init__` in [src/oncall/operator.py](src/oncall/operator.py)), so prompt edits also require a container restart on the server.
 
+## Editing prompts
+
+Everything in [src/oncall/prompts/](src/oncall/prompts/) is read by a capable model. State the constraint and stop — the model works out how to satisfy it.
+
+Do NOT add examples, few-shot demonstrations, do/don't pairs, or a fresh rule for each observed failure. When a prompt-caused bug appears, the reflex to append "and don't do <the thing it just did>" is almost always wrong: it fixes one instance, bloats a prompt that's re-read on every spawn, and buries the constraints that carry real weight. Tighten or generalize the sentence that's already there instead.
+
+Minimal and general beats explicit and exhaustive here. If a rule only makes sense alongside an example, the rule isn't yet stated clearly enough.
+
 ## Testing discipline
 
 Write tests for **non-obvious flows only**. A test earns its keep when it locks down behavior that a reader of the code couldn't trivially infer, or that has surprised someone in the past.
