@@ -47,7 +47,7 @@ MAX_USER_FACING_CHARS = 600
 # more content: models overshoot a stated limit slightly, and since nothing
 # rewrites them anymore, an overshoot lands on the user as a mid-word cut.
 # Absorbing it is cheaper than truncating. Keep this BELOW the ceiling.
-EXECUTOR_REPLY_BUDGET_CHARS = 300
+EXECUTOR_REPLY_BUDGET_CHARS = 400
 
 
 def latest_executor_text(events: list[dict[str, Any]]) -> str:
