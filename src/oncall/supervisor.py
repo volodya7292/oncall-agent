@@ -334,7 +334,13 @@ class Supervisor:
             "--setting-sources", "project",  # only our executor/settings.json, not user-level
             "--permission-mode", "default",
             "--permission-prompt-tool", "mcp__oncall__approve",
-            "--effort", "medium",
+            # high, not medium: at medium the executor garbled its own summary
+            # while squeezing into the reply budget (dropped a load-bearing
+            # noun, mutated a quoted word, then re-read its own corruption and
+            # invented a meaning for it). Hand-offs are off the hot path —
+            # the operator has already acked — so the extra thinking is cheap
+            # here in a way it would not be on an operator turn.
+            "--effort", "high",
             "--append-system-prompt", self._render_executor_prompt(),
             # Persistence is REQUIRED in the single-session model: every
             # hand_off after the first uses --resume to pick up the same
