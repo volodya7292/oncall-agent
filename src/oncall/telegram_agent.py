@@ -37,7 +37,7 @@ from .audit import fmt, telegram_log
 from .broker import Broker
 from .db import Database
 from .events import EventBus
-from .metrics import LATENCY
+from .metrics import LATENCY, timed
 from .models import TaskState
 from .operator import Operator
 from .telegram_format import (
@@ -405,24 +405,31 @@ class TelegramAgentService:
             session=self._session_id, len=len(text),
             attachments=len(attachments),
         ))
-        try:
-            result = await self._operator.chat_turn(
-                session_id=self._session_id, user_text=text,
-                attachments=attachments or None,
-            )
-        except Exception:
-            log.exception("operator.chat_turn failed for telegram agent")
-            await self._send("Internal error. Try again in a moment.")
-            return
+        # Rolling "turn" window (surfaced in /status): end-to-end from inbound
+        # message to the reply landing in Telegram — the latency the owner
+        # actually feels. Spans every operator LLM round plus memory retrieval
+        # and the send, so it is always >= the "operator" window, which times
+        # one LLM round-trip in isolation.
+        with timed("turn") as t:
+            try:
+                result = await self._operator.chat_turn(
+                    session_id=self._session_id, user_text=text,
+                    attachments=attachments or None,
+                )
+            except Exception:
+                log.exception("operator.chat_turn failed for telegram agent")
+                t.ok = False
+                await self._send("Internal error. Try again in a moment.")
+                return
 
-        reply = result.user_facing_text()
-        if not reply:
-            telegram_log.info("agent reply suppressed (empty) " + fmt(
-                session=self._session_id,
-                tool_calls=len(result.tool_calls_made),
-            ))
-            return
-        await self._send(reply)
+            reply = result.user_facing_text()
+            if not reply:
+                telegram_log.info("agent reply suppressed (empty) " + fmt(
+                    session=self._session_id,
+                    tool_calls=len(result.tool_calls_made),
+                ))
+                return
+            await self._send(reply)
         telegram_log.info("agent reply " + fmt(
             session=self._session_id, len=len(reply),
             tool_calls=len(result.tool_calls_made),
@@ -699,7 +706,12 @@ class TelegramAgentService:
         lat = LATENCY.snapshot()
         lat_lines = [
             f"- {label}: {_fmt_latency(lat[key])}"
-            for key, label in (("operator", "Operator"), ("tts", "TTS"))
+            for key, label in (
+                ("turn", "Turn (end-to-end)"),
+                ("operator", "Operator LLM"),
+                ("memory", "Memory retrieval"),
+                ("tts", "TTS"),
+            )
             if key in lat and (lat[key]["n"] or lat[key]["errors"])
         ]
         if lat_lines:

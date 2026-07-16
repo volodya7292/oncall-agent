@@ -31,6 +31,7 @@ from .embeddings import (
     hybrid_score,
     unpack,
 )
+from .metrics import timed
 
 
 log = logging.getLogger(__name__)
@@ -151,32 +152,38 @@ class OperatorMemory:
         if not rows:
             return []
 
-        embed_start = time.monotonic()
-        try:
-            qvec_list = (await self._embed.embed([q]))[0]
-        except Exception:
-            log.exception("embedding call failed in retrieve()")
-            return []
-        embed_s = time.monotonic() - embed_start
-        score_start = time.monotonic()
-        qvec = np.asarray(qvec_list, dtype=np.float32)
-        matrix = np.vstack([unpack(r["embedding"]) for r in rows])
-        cosines = cosine_matrix(qvec, matrix)
+        # Rolling "memory" window (surfaced in /status). Scoped to the real
+        # retrieval work — embed + score + LRU bump. The empty-query/no-rows
+        # exits above are deliberately outside it: they return in ~0ms and
+        # would drag the percentiles toward zero.
+        with timed("memory") as t:
+            embed_start = time.monotonic()
+            try:
+                qvec_list = (await self._embed.embed([q]))[0]
+            except Exception:
+                log.exception("embedding call failed in retrieve()")
+                t.ok = False
+                return []
+            embed_s = time.monotonic() - embed_start
+            score_start = time.monotonic()
+            qvec = np.asarray(qvec_list, dtype=np.float32)
+            matrix = np.vstack([unpack(r["embedding"]) for r in rows])
+            cosines = cosine_matrix(qvec, matrix)
 
-        scored: list[tuple[float, float, dict[str, Any]]] = []
-        for r, c in zip(rows, cosines):
-            score = hybrid_score(
-                float(c), q, r["text"],
-                alpha=self._alpha, beta=self._beta,
-            )
-            if score >= self._floor:
-                scored.append((score, float(c), r))
-        scored.sort(key=lambda t: t[0], reverse=True)
-        picked = scored[:lim]
-        score_s = time.monotonic() - score_start
+            scored: list[tuple[float, float, dict[str, Any]]] = []
+            for r, c in zip(rows, cosines):
+                score = hybrid_score(
+                    float(c), q, r["text"],
+                    alpha=self._alpha, beta=self._beta,
+                )
+                if score >= self._floor:
+                    scored.append((score, float(c), r))
+            scored.sort(key=lambda t: t[0], reverse=True)
+            picked = scored[:lim]
+            score_s = time.monotonic() - score_start
 
-        if picked:
-            await self._bump_access(*(int(p[2]["id"]) for p in picked))
+            if picked:
+                await self._bump_access(*(int(p[2]["id"]) for p in picked))
 
         operator_log.info("memory_retrieve " + fmt(
             candidates=len(rows),
