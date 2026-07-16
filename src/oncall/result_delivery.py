@@ -40,7 +40,7 @@ log = logging.getLogger(__name__)
 
 # Hard ceiling on what reaches the user. Bounded by voice: the reply is
 # TTS'd, and past this it's a monologue.
-MAX_USER_FACING_CHARS = 1000
+MAX_USER_FACING_CHARS = 600
 
 # What the executor is *asked* to write (injected into its prompt as
 # `{{reply_budget_chars}}`). The 50-char gap is slack, not headroom for
