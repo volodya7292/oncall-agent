@@ -24,6 +24,16 @@ import sqlglot.expressions as exp
 from .models import ClassifierVerdict, Verdict
 
 
+def _elide(text: str, limit: int) -> str:
+    """Cut `text` to `limit` chars, marking the cut with an ellipsis.
+
+    Canonical strings are what the human reads on the approval card. A silent
+    cut renders a clipped instruction as a complete-looking one, so the ellipsis
+    is load-bearing: it is the only signal that more text exists.
+    """
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 # ---------------------------------------------------------------------------
 # Catastrophic detection — STRUCTURAL (against parsed AST), not raw-text.
 #
@@ -139,7 +149,7 @@ def classify(tool_name: str, tool_input: dict[str, Any]) -> Verdict:
         return _classify_laptop(tool_input)
     if tool_name == "mcp__oncall__invoke_developer":
         folder = str(tool_input.get("folder", ""))
-        task = str(tool_input.get("task", ""))[:120]
+        task = _elide(str(tool_input.get("task", "")), 120)
         return Verdict(
             kind=ClassifierVerdict.MUTATING,
             canonical=f"invoke_developer(folder={folder}, task={task!r})",
@@ -161,7 +171,7 @@ def classify(tool_name: str, tool_input: dict[str, Any]) -> Verdict:
     if tool_name == "mcp__oncall__memory":
         return _classify_memory(tool_input)
     if tool_name == "mcp__oncall__ask_user":
-        q = str(tool_input.get("question", ""))[:80]
+        q = _elide(str(tool_input.get("question", "")), 80)
         return Verdict(
             kind=ClassifierVerdict.READONLY,
             canonical=f"ask_user({q!r})",
@@ -979,14 +989,14 @@ def _classify_memory(tool_input: dict[str, Any]) -> Verdict:
     classified READONLY so the broker auto-allows."""
     op = str(tool_input.get("op", ""))
     if op == "query":
-        q = str(tool_input.get("query", ""))[:60]
+        q = _elide(str(tool_input.get("query", "")), 60)
         return Verdict(
             kind=ClassifierVerdict.READONLY,
             canonical=f"memory.query({q!r})",
             blast_radius="Read-only memory lookup (local SQLite).",
         )
     if op == "save":
-        text = str(tool_input.get("text", ""))[:80]
+        text = _elide(str(tool_input.get("text", "")), 80)
         return Verdict(
             kind=ClassifierVerdict.READONLY,
             canonical=f"memory.save({text!r})",

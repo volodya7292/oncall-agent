@@ -431,3 +431,32 @@ def test_git_commit_with_dangerous_words_is_not_catastrophic(cmd: str) -> None:
     assert v.kind == ClassifierVerdict.MUTATING, (
         f"{cmd[:60]!r}... got {v.kind} reason={v.reason}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical elision — the approval card is the human's only view of the call,
+# so a cut MUST be visible. A silent cut renders a clipped instruction as a
+# complete-looking one (a 5-step invoke_developer task read as a one-liner).
+# ---------------------------------------------------------------------------
+
+# (tool_name, input_key, extra_input, limit)
+ELIDED_FIELDS = [
+    ("mcp__oncall__invoke_developer", "task", {"folder": "/tmp/repo"}, 120),
+    ("mcp__oncall__ask_user", "question", {}, 80),
+    ("mcp__oncall__memory", "query", {"op": "query"}, 60),
+    ("mcp__oncall__memory", "text", {"op": "save"}, 80),
+]
+
+
+@pytest.mark.parametrize("tool_name,key,extra,limit", ELIDED_FIELDS)
+def test_canonical_marks_the_cut(tool_name: str, key: str, extra: dict, limit: int) -> None:
+    v = classify(tool_name, {**extra, key: "x" * (limit + 1)})
+    assert "x" * limit + "…" in v.canonical
+
+
+@pytest.mark.parametrize("tool_name,key,extra,limit", ELIDED_FIELDS)
+def test_canonical_at_limit_is_not_elided(tool_name: str, key: str, extra: dict, limit: int) -> None:
+    # Boundary: exactly `limit` chars fits whole — an ellipsis here would lie.
+    v = classify(tool_name, {**extra, key: "x" * limit})
+    assert "…" not in v.canonical
+    assert "x" * limit in v.canonical
