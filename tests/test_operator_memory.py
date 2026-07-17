@@ -330,6 +330,62 @@ async def test_real_embeddings_rank_semantically_related_first(db):
     assert "staging" in got[0].text.lower()
 
 
+@requires_embedding_tests
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query, expect_token",
+    [
+        # Ukrainian question -> fact stored in English.
+        ("чи можу я позичити комусь гроші?", "lend"),
+        # English question -> fact stored in Ukrainian.
+        ("what kind of noodles do I like?", "локшині"),
+    ],
+)
+async def test_real_embeddings_retrieve_across_languages(db, query, expect_token):
+    """Regression: an English-only embedder (nomic-embed-text, the default
+    until db98ece) encoded LANGUAGE rather than meaning, so a Ukrainian
+    question never reached a fact stored in English. On the real store that
+    put the wanted row at rank 89/95 — below the floor — and the operator
+    correctly reported it knew nothing about a fact it had held for weeks.
+
+    Cross-language recall@10 was 11% while same-language recall stayed 100%,
+    which is exactly why it went unnoticed: nothing errored, memory just
+    quietly stopped working for half the store. The embedder must therefore
+    be multilingual, and this pins that property to the live model rather
+    than to anyone's belief about the model card.
+    """
+    mem = OperatorMemory(
+        db, _real_embedder(),
+        embed_model=EMBED_MODEL,
+        capacity=100,
+        max_inject=3,
+        # Floor 0 on purpose: this pins the cross-language RANKING (right fact
+        # first), not the absolute floor. Floor calibration is store-size
+        # dependent and belongs in config, not here — on this tiny synthetic
+        # store true-positive scores run lower than on the real 95-row store.
+        # Under an English-only embedder the ranking itself broke (the wanted
+        # row sank to rank 89/95), so a top-hit assertion still catches the
+        # regression without coupling to a magic floor number.
+        relevance_floor=0.0,
+        hybrid_alpha=0.7, hybrid_beta=0.3,
+    )
+    # Deliberately mixed-language store, mirroring production: facts are
+    # written in whichever language the user spoke.
+    await mem.store([
+        "the user refuses to lend money to anyone, no exceptions",
+        "the prod database is named pg-prod-1",
+        "користувач віддає перевагу тонкій ручній локшині",
+        "користувач не має водійських прав",
+    ])
+    got = await mem.retrieve(query)
+    assert got, f"cross-language retrieval returned nothing for {query!r} — " \
+                f"is {EMBED_MODEL} multilingual?"
+    assert expect_token in got[0].text.lower(), (
+        f"cross-language retrieval ranked {got[0].text!r} above the intended "
+        f"fact for {query!r} — embedder may have regressed to English-only"
+    )
+
+
 @pytest.mark.asyncio
 async def test_rebuild_when_embed_model_changes(db):
     """Switching `embed_model` should:
