@@ -147,6 +147,18 @@ HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=60.0)
 # anything longer means the call is effectively stuck.
 SEND_FRAME_TIMEOUT_S = 1.0
 
+
+def _is_call_ended(exc: BaseException) -> bool:
+    """True if a send_frame failure just means the call already ended.
+
+    When the far side hangs up mid-utterance there are always a few frames
+    still in flight, so send_frame raises NotInCallError (pytgcalls) or
+    ConnectionNotFound (ntgcalls native). That's expected teardown, not a
+    fault — worth an info line, not an ERROR traceback. Matched by class name
+    so we don't import the native exception types at module load (they're
+    lazy — see the import inside _start)."""
+    return type(exc).__name__ in ("NotInCallError", "ConnectionNotFound")
+
 # Outbound-queue priorities (lower = spoken first). Approvals are
 # safety-critical and jump ahead of everything; hand-off (executor) results
 # are the answer to something the user explicitly asked for, so they jump
@@ -415,8 +427,11 @@ class CallService:
                         )
                     except asyncio.TimeoutError:
                         log.warning("voice: bed send_frame timed out (back-pressure?)")
-                    except Exception:
-                        log.exception("voice: bed send_frame failed")
+                    except Exception as e:
+                        if _is_call_ended(e):
+                            log.info("voice: bed stopped — call ended")
+                        else:
+                            log.exception("voice: bed send_frame failed")
                 await asyncio.sleep(FRAME_MS / 1000)
         except asyncio.CancelledError:
             raise
@@ -1542,8 +1557,14 @@ class CallService:
                     "(ntgcalls back-pressure?)", label, sent,
                 )
                 return "abort", sent
-            except Exception:
-                log.exception("voice: %s send_frame failed at frame %d", label, sent)
+            except Exception as e:
+                if _is_call_ended(e):
+                    log.info(
+                        "voice: %s stopped at frame %d — call ended mid-utterance",
+                        label, sent,
+                    )
+                else:
+                    log.exception("voice: %s send_frame failed at frame %d", label, sent)
                 return "abort", sent
             await asyncio.sleep(FRAME_MS / 1000)
         return "done", sent
