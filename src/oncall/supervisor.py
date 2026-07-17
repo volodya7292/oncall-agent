@@ -387,7 +387,13 @@ class Supervisor:
         `{{reply_budget_chars}}` → the length the executor is asked to write
         to. Deliberately BELOW result_delivery.MAX_USER_FACING_CHARS: nothing
         rewrites the executor now, so the gap is slack that absorbs a mild
-        overrun instead of cutting the user's message mid-word."""
+        overrun instead of cutting the user's message mid-word.
+
+        Then exactly one "# Execution environment" section is appended, per
+        role. It is the ONLY place native tools are named: which tool carries
+        a shell command or reads a file is the one thing that differs between
+        roles, and the base prompt used to answer it too ("use Bash freely")
+        — false on the server, where Bash is denied above."""
         text = self._paths.executor_prompt.read_text(encoding="utf-8")
         now = format_utc_now()
         text = text.replace("{{current_date}}", now)
@@ -431,6 +437,15 @@ class Supervisor:
                 "`{\"error\":\"laptop_timeout\"}`, the laptop is unreachable. "
                 "State this plainly and stop — do NOT retry in a loop or invent "
                 "a result. The work can be redone when the laptop is back."
+            )
+        else:
+            text += (
+                "\n\n# Execution environment (local)\n\n"
+                "You are running on the user's own machine. Your native tools "
+                "act on their filesystem directly: `Bash` carries shell "
+                "commands, `Read`/`Glob`/`Grep` read, `Edit`/`Write` change "
+                "files. Telegram attachments announced as `[file attached: "
+                "<path>]` land on this same machine."
             )
         lang = self._settings.operator_language
         if lang:
