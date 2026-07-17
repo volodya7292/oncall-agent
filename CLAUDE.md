@@ -37,7 +37,7 @@ Skip tests that:
 - Pair with the change ("I added method X, so here's `test_X_returns_what_X_returns`").
 
 Write tests when they capture:
-- A correctness claim that depends on calibration against an external system (e.g. the live-gateway integration tests pinning the 0.88 dedup threshold).
+- A correctness claim that depends on calibration against an external system (e.g. the live-embedding integration tests pinning cross-language retrieval to the model's real behavior).
 - A safety invariant (e.g. the broker refusing to allow a mutating tool call without a matching challenge phrase, even with a fully prompt-injected operator).
 - A multi-step interaction or race (concurrency, ordering, replay, recovery).
 - A boundary or off-by-one case (threshold equality, capacity overflow, empty-input handling, the exact split point of compression).
@@ -52,8 +52,16 @@ The pipeline is therefore deliberately shaped:
 1. **Write time always INSERTs** (`OperatorMemory.store`). Near-duplicates are
    expected to exist transiently — that is not a bug.
 2. **`dedup_pass()` (periodic, `_memory_dedup_loop` in [api.py](src/oncall/api.py))**
-   builds clusters from the cosine graph at `cluster_threshold=0.80`. Cosine is
+   builds clusters from the cosine graph at `cluster_threshold=0.60`. Cosine is
    only a *candidate generator* here; it is never the verdict.
+
+   That threshold is calibrated to `embeddinggemma:300m` and does not survive an
+   embedder swap — re-measure it on real rows if you change models. It also
+   cannot just be lowered to "catch more": edges are transitive (union-find), so
+   a gate below the sparsity point fuses the whole store into one component that
+   `max_cluster_size` then truncates, silently dropping the remainder. Measured
+   on the live 95-row store: gate 0.60 → 11 clusters, largest 11, 3 rows dropped;
+   gate 0.30 → ONE cluster of 93, 85 dropped. Lower is blinder, not safer.
 3. **An LLM arbitrates each cluster**, reading the actual texts and returning
    merge groups. Its prompt says entities that differ (person, host, version,
    identifier) MUST NOT merge, and "when in doubt, omit".
@@ -73,14 +81,25 @@ cache keeps hitting across turns.
 
 ## Memory testing
 
-`tests/test_operator_memory.py` includes live integration tests against a local Ollama daemon running `nomic-embed-text:137m-v1.5-fp16`. They skip unless `ONCALL_RUN_EMBEDDING_TESTS=1` is set. To run them locally:
+`tests/test_operator_memory.py` includes live integration tests against a local Ollama daemon running `embeddinggemma:300m`. They skip unless `ONCALL_RUN_EMBEDDING_TESTS=1` is set. To run them locally:
 
 ```sh
-ollama pull nomic-embed-text:137m-v1.5-fp16   # one-time
+ollama pull embeddinggemma:300m   # one-time
 ONCALL_RUN_EMBEDDING_TESTS=1 uv run pytest tests/test_operator_memory.py -v
 ```
 
-The integration tests pin the dedup threshold (0.88) to the live model's behavior — if `ONCALL_MEMORY_DEDUP_SIM` is retuned or the embedding model changes, those tests will fail loudly with a hint to retune.
+The embedder **must be multilingual** — memories are stored in whichever language
+the user spoke, so the store is bilingual and queries arrive in either language.
+The previous default (`nomic-embed-text`, English-only) encoded *language* rather
+than meaning: measured on the live 95-row store, a Ukrainian query retrieved the
+English fact it asked for at rank 89/95, and identical facts in different
+languages scored *lower* (cos 0.40) than random unrelated same-language pairs
+(0.59). Cross-language recall@10 was 11%; under `embeddinggemma:300m` it is 100%.
+Same 768 dims, so the stored blob format is unchanged.
+
+`relevance_floor` and `cluster_threshold` are both calibrated to the live model's
+score scale and do NOT transfer across embedders — re-measure both on real rows
+before changing the model, and expect nothing about the old numbers to hold.
 
 ## Exception handling
 

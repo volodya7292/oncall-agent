@@ -120,7 +120,7 @@ class OperatorMemory:
         if not cleaned:
             return []
 
-        vecs = await self._embed.embed(cleaned)
+        vecs = await self._embed.embed(cleaned, kind="document")
         out: list[str] = []
         for text, vec in zip(cleaned, vecs):
             qvec = np.asarray(vec, dtype=np.float32)
@@ -159,7 +159,7 @@ class OperatorMemory:
         with timed("memory") as t:
             embed_start = time.monotonic()
             try:
-                qvec_list = (await self._embed.embed([q]))[0]
+                qvec_list = (await self._embed.embed([q], kind="query"))[0]
             except Exception:
                 log.exception("embedding call failed in retrieve()")
                 t.ok = False
@@ -244,7 +244,7 @@ class OperatorMemory:
         *,
         model: str,
         reasoning_effort: str = "medium",
-        cluster_threshold: float = 0.80,
+        cluster_threshold: float = 0.60,
         max_cluster_size: int = 8,
     ) -> dict[str, int]:
         """Background dedup pass. Finds connected components in the cosine
@@ -254,6 +254,21 @@ class OperatorMemory:
         The LLM is the arbiter, not heuristics — write-time dedup catches only
         near-identical phrasing; this pass picks up the harder cases (templates
         that swap one detail) and treats them correctly by reading the texts.
+
+        `cluster_threshold` is calibrated to the embed model's score scale and
+        does NOT transfer across models — re-measure it on real data if you
+        change the embedder. It cannot simply be lowered to catch more: edges
+        here are transitive (union-find), so a gate below the point where the
+        graph goes sparse fuses the whole store into one component, which
+        `max_cluster_size` then truncates — silently dropping the rest. On the
+        real 95-row store under embeddinggemma: gate 0.60 gives 11 clusters,
+        largest 11, 3 rows dropped; gate 0.30 gives ONE cluster of 93 and
+        drops 85. Lower is not safer, it is blinder.
+
+        Cross-language duplicates are out of reach for any gate: the same fact
+        in Ukrainian and English scores ~0.30, below anything that keeps the
+        graph sparse. Merging those would need pairwise candidates instead of
+        connected components.
 
         Returns counts for logging. Failures only log; the pass is idempotent
         so the next run retries."""
@@ -368,7 +383,9 @@ class OperatorMemory:
             else:
                 for gids, text in valid_groups:
                     try:
-                        vec = (await self._embed.embed([text]))[0]
+                        vec = (await self._embed.embed(
+                            [text], kind="document",
+                        ))[0]
                     except Exception:
                         log.exception("memory_dedup: embed failed for merged text")
                         failed_n += 1
@@ -546,7 +563,7 @@ class OperatorMemory:
                 break
             texts = [r["text"] for r in stale]
             try:
-                vecs = await self._embed.embed(texts)
+                vecs = await self._embed.embed(texts, kind="document")
             except Exception:
                 log.exception("rebuild_stale_embeddings: embed call failed (batch of %d)", len(texts))
                 failed += len(texts)

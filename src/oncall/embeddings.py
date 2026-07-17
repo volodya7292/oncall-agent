@@ -1,9 +1,16 @@
 """Embedding client + numeric helpers for operator memory.
 
 Uses a local Ollama daemon for embeddings (default model
-`nomic-embed-text:137m-v1.5-fp16`). We pass `keep_alive: "4h"` on every
-embed call so Ollama keeps the model resident across our daemon restarts
-— first user message after `oncall service start` skips the cold load.
+`embeddinggemma:300m`). We pass `keep_alive: "4h"` on every embed call so
+Ollama keeps the model resident across our daemon restarts — first user
+message after `oncall service start` skips the cold load.
+
+Retrieval here is asymmetric: a question ("what do I think about X?") and the
+stored fact ("the user thinks X") are different kinds of text, and models
+trained for retrieval expect to be told which is which via a task prefix.
+Hence `embed(texts, kind=...)` rather than a bare `embed(texts)` — see
+`TASK_PREFIXES`. Callers must pass the kind that matches the text's role;
+getting it wrong costs accuracy silently, with no error.
 
 Storage format: float32 packed via numpy.tobytes — fixed bytes per row,
 fast unpack with np.frombuffer.
@@ -26,9 +33,26 @@ log = logging.getLogger(__name__)
 # shorter = first embed after a coffee break pays the load again.
 OLLAMA_KEEP_ALIVE = "4h"
 
+# Per-model (query_prefix, document_prefix), keyed by the model name with any
+# `:tag` stripped. A retrieval model is trained with these exact strings and
+# quietly loses accuracy without them — measured on the real bilingual store,
+# EmbeddingGemma's template lifts cross-language recall@10 from 89% to 100%.
+# A model absent from this table gets no prefix, which is the correct default
+# for symmetric models.
+TASK_PREFIXES: dict[str, tuple[str, str]] = {
+    "embeddinggemma": ("task: search result | query: ", "title: none | text: "),
+    "nomic-embed-text": ("search_query: ", "search_document: "),
+}
+
+
+def task_prefixes(model: str) -> tuple[str, str]:
+    return TASK_PREFIXES.get(model.split(":", 1)[0], ("", ""))
+
 
 class EmbeddingClient(Protocol):
-    async def embed(self, texts: list[str]) -> list[list[float]]: ...
+    async def embed(
+        self, texts: list[str], *, kind: str = "document",
+    ) -> list[list[float]]: ...
 
 
 class OllamaEmbeddingClient:
@@ -44,18 +68,22 @@ class OllamaEmbeddingClient:
         import httpx
         self._host = host.rstrip("/")
         self._model = model
+        self._qp, self._dp = task_prefixes(model)
         self._http = httpx.AsyncClient(timeout=timeout)
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
+    async def embed(
+        self, texts: list[str], *, kind: str = "document",
+    ) -> list[list[float]]:
         if not texts:
             return []
+        prefix = self._qp if kind == "query" else self._dp
         # /api/embed accepts `input` as either str or list[str]. We always
         # send a list so the response shape is uniform.
         r = await self._http.post(
             f"{self._host}/api/embed",
             json={
                 "model": self._model,
-                "input": texts,
+                "input": [prefix + t for t in texts],
                 "keep_alive": OLLAMA_KEEP_ALIVE,
             },
         )

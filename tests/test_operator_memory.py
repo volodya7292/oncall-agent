@@ -52,7 +52,9 @@ class StubEmbedder:
     def register(self, text: str, vec: Sequence[float]) -> None:
         self._table[text] = list(vec)
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
+    async def embed(
+        self, texts: list[str], *, kind: str = "document",
+    ) -> list[list[float]]:
         out: list[list[float]] = []
         for t in texts:
             if t not in self._table:
@@ -260,12 +262,13 @@ async def test_retrieval_protects_row_from_eviction(db):
 #   (a) the model produces vectors with consistent dimensionality (sanity),
 #   (b) it scores semantically related text above unrelated text (the
 #       premise of using embeddings here),
-#   (c) it pushes near-duplicate paraphrases over the 0.88 dedup threshold.
+#   (c) it retrieves ACROSS languages — the store is bilingual, and an
+#       English-only embedder silently reduces retrieval to noise.
 # ---------------------------------------------------------------------------
 
 
 EMBED_MODEL = os.environ.get(
-    "ONCALL_MEMORY_EMBED_MODEL", "nomic-embed-text:137m-v1.5-fp16",
+    "ONCALL_MEMORY_EMBED_MODEL", "embeddinggemma:300m",
 )
 OLLAMA_HOST = os.environ.get("ONCALL_OLLAMA_HOST", "http://localhost:11434")
 
@@ -275,7 +278,7 @@ requires_embedding_tests = pytest.mark.skipif(
     reason=(
         "set ONCALL_RUN_EMBEDDING_TESTS=1 to run live embedding tests "
         "(requires a running Ollama daemon with the model pulled: "
-        "`ollama pull nomic-embed-text:137m-v1.5-fp16`)"
+        "`ollama pull embeddinggemma:300m`)"
     ),
 )
 
@@ -343,7 +346,7 @@ async def test_rebuild_when_embed_model_changes(db):
         def __init__(self, flavor: int) -> None:
             self.flavor = flavor
             self._known: dict[str, int] = {}
-        async def embed(self, texts):
+        async def embed(self, texts, *, kind: str = "document"):
             out = []
             for t in texts:
                 idx = self._known.setdefault(t, len(self._known))

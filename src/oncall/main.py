@@ -62,10 +62,10 @@ AI_GATEWAY_BASE_URL=https://ai-gateway.vercel.sh/v1
 AI_GATEWAY_API_KEY=
 
 # Memory embedder runs via a local Ollama daemon. Pull the model first:
-#   ollama pull nomic-embed-text:137m-v1.5-fp16
+#   ollama pull embeddinggemma:300m
 # embed calls send keep_alive=4h so Ollama keeps the model resident
 # across `oncall service start` restarts.
-ONCALL_MEMORY_EMBED_MODEL=nomic-embed-text:137m-v1.5-fp16
+ONCALL_MEMORY_EMBED_MODEL=embeddinggemma:300m
 ONCALL_OLLAMA_HOST=http://localhost:11434
 
 # Executor (Claude CLI) uses whatever auth `claude` already has on this host —

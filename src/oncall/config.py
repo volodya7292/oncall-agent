@@ -251,10 +251,19 @@ class Settings(BaseSettings):
     # OLLAMA_KEEP_ALIVE=4h on the embed calls, the model stays resident in
     # Ollama across our daemon restarts — first user message after
     # `oncall service start` skips the cold load. Pull first:
-    #     ollama pull nomic-embed-text:137m-v1.5-fp16
-    # The 0.88 dedup threshold in tests is calibrated to this model;
-    # swapping it likely requires retuning ONCALL_MEMORY_DEDUP_SIM.
-    oncall_memory_embed_model: str = "nomic-embed-text:137m-v1.5-fp16"
+    #     ollama pull embeddinggemma:300m
+    #
+    # MUST be multilingual: the store is bilingual (facts are written in
+    # whichever language the user spoke) and queries arrive in either. The
+    # previous default, nomic-embed-text, is English-only and encoded language
+    # rather than meaning — measured on the real 95-row store, a Ukrainian
+    # query retrieved the English fact it was asking for at rank 89/95 (11%
+    # cross-language recall@10). Under embeddinggemma the same eval scores
+    # 100%. Same 768 dims, so the stored blob format is unchanged.
+    #
+    # `relevance_floor` and dedup's `cluster_threshold` are calibrated to this
+    # model's score scale and do NOT transfer — re-measure both if you swap it.
+    oncall_memory_embed_model: str = "embeddinggemma:300m"
     # Where to find the Ollama daemon.
     oncall_ollama_host: str = "http://localhost:11434"
     # Cheap conversational model for extracting facts from the user's turn.
@@ -263,7 +272,15 @@ class Settings(BaseSettings):
     oncall_memory_extract_model: str = ""
     oncall_memory_hybrid_alpha: float = 0.7
     oncall_memory_hybrid_beta: float = 0.3
-    oncall_memory_relevance_floor: float = 0.30
+    # Below the worst true-positive score measured on the real store under
+    # embeddinggemma (0.172 across a bilingual query set). The floor is a
+    # garbage guard for when nothing is relevant, not the main filter —
+    # `max_inject` does the real limiting. Raising it back to nomic's 0.30
+    # would silently drop half the true positives, since the two models'
+    # score scales are unrelated. Note the beta term can only ever fire on
+    # same-language pairs (token overlap across scripts is ~0), so it drags
+    # cross-language scores toward 0.7*cosine — hence the low floor.
+    oncall_memory_relevance_floor: float = 0.15
     oncall_memory_max_inject: int = 10
     # Operator model. Default is glm-5.2 via OpenRouter, pinned to Fireworks.
     # Switch models by pairing ONCALL_OPERATOR_BACKEND with the right id:
