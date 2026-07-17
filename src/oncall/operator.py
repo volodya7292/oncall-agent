@@ -999,7 +999,8 @@ class Operator:
         # ONCALL_ROLE=server; None in legacy all-local mode (the executor has
         # native local tools, so there's no "laptop offline" state to surface).
         # Drives the per-turn <laptop-status> line so the operator declines
-        # local-data requests up front instead of handing off a doomed task.
+        # project/development work up front instead of handing off a doomed
+        # task.
         self._laptop_status_provider: Callable[[], bool] | None = None
 
     def set_on_call_provider(self, provider: Callable[[str], bool]) -> None:
@@ -1397,10 +1398,13 @@ class Operator:
 
         # Laptop-status: cloud-primary mode only. Tells the operator, this
         # turn, whether the user's laptop is reachable — i.e. whether a
-        # hand_off that needs local files/shell can succeed. When offline, the
-        # operator should decline local-data requests up front rather than
-        # spawn a task that will only hit `{"error":"laptop_offline"}`. Not
-        # persisted — recomputed each turn. Absent in legacy all-local mode.
+        # hand_off for their project/development work can succeed. When
+        # offline, the operator should decline that work up front rather than
+        # spawn a task that will only hit `{"error":"laptop_offline"}`. The
+        # block says what the laptop is FOR, not just what's broken: the
+        # operator once refused a Telegram lookup as "laptop offline" because
+        # the offline text left its scope open. Not persisted — recomputed each
+        # turn. Absent in legacy all-local mode.
         laptop_online: bool | None = None
         if self._laptop_status_provider is not None:
             laptop_online = False
@@ -1409,12 +1413,16 @@ class Operator:
             except Exception:
                 log.warning("laptop status provider raised; treating as offline", exc_info=True)
             laptop_block = (
-                "<laptop-status>online — local files/shell available via hand_off</laptop-status>"
+                "<laptop-status>online — the user's laptop is reachable, so "
+                "project/development work on their machine can run via hand_off"
+                "</laptop-status>"
                 if laptop_online
-                else "<laptop-status>offline — the user's laptop is unreachable; "
-                "local files/shell are UNAVAILABLE this turn. If the user asks for "
-                "anything needing their local machine, say it's offline and to try "
-                "again when it's back; do not hand_off.</laptop-status>"
+                else "<laptop-status>offline — the user's laptop is unreachable, so "
+                "project/development work on their machine is UNAVAILABLE this turn: "
+                "say it's offline and to try again when it's back, and do not hand_off "
+                "for it. The laptop serves ONLY that work — every other capability runs "
+                "server-side and is unaffected, so hand off for those as normal."
+                "</laptop-status>"
             )
             messages.append({"role": "user", "content": laptop_block})
 

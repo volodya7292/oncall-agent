@@ -50,20 +50,22 @@ def _is_server_role() -> bool:
 
 
 # The `laptop` tool, advertised only in cloud-primary (server) deployments,
-# where the executor has no useful local filesystem and routes shell/file
-# work to the user's laptop worker. Defined separately so list_tools() can
-# conditionally include it.
+# where the executor has no useful local filesystem and routes the user's
+# project/development work to their laptop worker. Defined separately so
+# list_tools() can conditionally include it.
 _LAPTOP_TOOL = Tool(
     name="laptop",
     description=(
         "Run a shell command or touch a file ON THE USER'S LAPTOP. In this "
         "(cloud) deployment you have NO local filesystem of your own — your "
-        "Bash/Read/Edit/Write tools are disabled. Anything that must touch the "
-        "user's real machine (their files, repos, local services) goes through "
-        "this tool, which executes on their laptop and ONLY works while the "
+        "Bash/Read/Edit/Write tools are disabled. The laptop is the user's "
+        "development machine and serves ONLY their project/development work "
+        "(their repos, files, local services); every other capability you have "
+        "runs server-side and never needs it. This tool ONLY works while the "
         "laptop is online. If it returns {\"error\":\"laptop_offline\"}, the "
         "laptop is unreachable — tell the user and stop; do NOT retry in a "
-        "loop. Mutating ops (write_file, mutating bash) require the user's "
+        "loop, and do not treat it as a limit on anything beyond that work. "
+        "Mutating ops (write_file, mutating bash) require the user's "
         "approval, exactly like a local command would.\n"
         "Ops:\n"
         "  bash       — run a shell command; args `command`. Returns "

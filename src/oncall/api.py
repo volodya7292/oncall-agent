@@ -425,7 +425,8 @@ def create_app() -> FastAPI:
         app.state.lifecycle = lifecycle
         app.state.operator = operator
         # Cloud-primary mode: let the operator see laptop presence each turn so
-        # it can decline local-data requests up front when the laptop's offline.
+        # it can decline project/development work up front when the laptop's
+        # offline.
         if operator is not None and settings.is_server_role:
             operator.set_laptop_status_provider(laptop_bridge.is_online)
         app.state.memory = memory
