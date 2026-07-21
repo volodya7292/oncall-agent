@@ -181,6 +181,15 @@ class Settings(BaseSettings):
     # the failure mode this guards against is a lazy summary that drops context
     # or role-plays, not a slow one. Empty string omits the flag.
     oncall_compression_effort: str = "medium"
+    # Wall-clock ceiling for the compression one-shot. Generous because the
+    # call is off the hot path and the cost is dominated by output generation
+    # (~1200 words at the clamp), not prefill. The old 60s ceiling deadlocked
+    # compression entirely: a 61K-token backlog took 72s, timed out, persisted
+    # no checkpoint, so the next turn retried the same — and larger — job. Since
+    # the split retains a fixed threshold//2 and hands everything older to the
+    # summarizer, each failure enlarges the next attempt, so a too-tight ceiling
+    # never recovers on its own.
+    oncall_compression_timeout_seconds: float = 300.0
     # Executor context guard. The single long-lived `claude` session
     # accumulates context across every hand_off (see supervisor). When a
     # task finishes with the live context window at or above this many

@@ -1706,7 +1706,7 @@ class Operator:
             system_prompt=COMPRESSION_SYSTEM_PROMPT,
             model=self._settings.oncall_compression_model,
             effort=self._settings.oncall_compression_effort or None,
-            timeout_s=60.0,
+            timeout_s=self._settings.oncall_compression_timeout_seconds,
         )
         if not text:
             log.warning(
