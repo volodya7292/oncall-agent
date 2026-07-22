@@ -17,6 +17,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable, Protocol
 from uuid import UUID, uuid4
 
@@ -875,6 +876,29 @@ def _fmt_ts(ts: str) -> str:
     if not ts or len(ts) < 16:
         return ""
     return ts[:10] + " " + ts[11:16]
+
+
+# Below this, "time since the user last spoke" is noise: within a single
+# sitting (and every turn of a live voice call) the gap is seconds, and
+# announcing it each turn would train the operator to narrate it.
+LAST_CONTACT_MIN_GAP_S = 10 * 60
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    """Coarse human duration — '45m', '4h 12m', '3d 7h'. Two units is
+    deliberate: the operator uses this to pick a greeting ('been a while'
+    vs. picking up mid-thread), not to do arithmetic."""
+    total = int(max(0.0, seconds))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h" if hours else f"{days}d"
+    if hours:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    return f"{minutes}m"
+
+
 MEMORY_NOTE_PREFIX = "[memory note: "
 
 
@@ -1176,6 +1200,7 @@ class Operator:
         self, session_id: str, note: str, *,
         retrieval_query: str | None = None,
         restricted_to_chat: str | None = None,
+        include_silence_gap: bool = False,
     ) -> OperatorTurnResult:
         """Inject a synthetic '[system note: ...]' turn into a chat session.
         Used by background tasks that re-engage the operator (task terminated,
@@ -1189,12 +1214,18 @@ class Operator:
         Pass the substance the operator should react to (e.g. an inbound DM
         body) so memory entries about the sender / topic / preferences are
         loaded; leave None for purely procedural pings (a task terminating)
-        where no user-meaningful content needs surfacing."""
+        where no user-meaningful content needs surfacing.
+
+        `include_silence_gap`: add a `<time-since-last-message>` block telling
+        the operator how long the user has been silent. For pings that open a
+        conversation with the user (a voice call greeting), not for background
+        ones that merely report machine state."""
         async with self._lock_for(session_id):
             return await self._run_turn(
                 session_id, f"{AUTO_PING_PREFIX}{note}]",
                 retrieval_query=retrieval_query,
                 restricted_to_chat=restricted_to_chat,
+                include_silence_gap=include_silence_gap,
             )
 
     async def append_system_note(self, session_id: str, note: str) -> None:
@@ -1254,8 +1285,15 @@ class Operator:
         retrieval_query: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
         restricted_to_chat: str | None = None,
+        include_silence_gap: bool = False,
     ) -> OperatorTurnResult:
         await self._db.ensure_chat_session(session_id)
+        # Read BEFORE this turn's own rows land below, otherwise the answer
+        # is always "0m". Drives the <time-since-last-message> block.
+        last_contact_at = (
+            await self._db.last_user_message_at(session_id)
+            if include_silence_gap else None
+        )
         # Pick the semantic retrieval key UP FRONT so we can inject a
         # `[memory note: ...]` ahead of the actual user message.
         # `retrieval_query` is caller-supplied for inbox-drain (where
@@ -1395,6 +1433,28 @@ class Operator:
         # of the system prompt.
         time_block = f"<current-time>{format_utc_now()}</current-time>"
         messages.append({"role": "user", "content": time_block})
+
+        # How long the owner has been silent — opt-in per caller, and today
+        # only the voice call-start greeting asks for it. History carries no
+        # per-message timestamps into model context, so opening a call the
+        # operator cannot tell a thread the owner dropped ten minutes ago from
+        # one they dropped three days ago, and picks the open thread back up
+        # as if no time passed. It is NOT wanted on ordinary turns: mid-
+        # conversation the gap is noise, and a clock the operator sees every
+        # turn is a clock it starts narrating. Same transient shape as the
+        # blocks above — recomputed, never persisted. Suppressed under
+        # LAST_CONTACT_MIN_GAP_S so calling right back stays quiet.
+        if last_contact_at:
+            try:
+                gap_s = (utcnow() - datetime.fromisoformat(last_contact_at)).total_seconds()
+            except ValueError:
+                log.warning("unparseable last-contact timestamp %r", last_contact_at)
+                gap_s = 0.0
+            if gap_s >= LAST_CONTACT_MIN_GAP_S:
+                messages.append({"role": "user", "content": (
+                    f"<time-since-last-message>{_fmt_elapsed(gap_s)} since the "
+                    f"user last spoke to you</time-since-last-message>"
+                )})
 
         # Laptop-status: cloud-primary mode only. Tells the operator, this
         # turn, whether the user's laptop is reachable — i.e. whether a

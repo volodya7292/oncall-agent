@@ -615,3 +615,81 @@ def test_anthropic_reasoning_effort_controls_thinking():
                max_tokens=2048, reasoning_effort="high")
     assert hi["thinking"] == {"type": "enabled", "budget_tokens": 8192}
     assert hi["max_tokens"] > hi["thinking"]["budget_tokens"]
+
+
+# ---------------------------------------------------------------------------
+# <time-since-last-message>
+# ---------------------------------------------------------------------------
+
+async def _seed_message(db, session_id: str, role: str, content: str, age_s: float) -> None:
+    """Insert a chat row stamped `age_s` seconds in the past. Direct SQL
+    because append_chat_message always stamps 'now'."""
+    from datetime import timedelta
+
+    from oncall.db import iso
+    from oncall.models import utcnow
+
+    await db.ensure_chat_session(session_id)
+    await db.conn.execute(
+        "INSERT INTO chat_messages (session_id, role, content, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (session_id, role, content, iso(utcnow() - timedelta(seconds=age_s))),
+    )
+    await db.conn.commit()
+
+
+def _tail_tag(llm: ScriptedLLM, tag: str) -> str | None:
+    msgs = llm.calls_made[0]["messages"]
+    return next((m["content"] for m in msgs
+                 if isinstance(m["content"], str) and m["content"].startswith(tag)), None)
+
+
+@pytest.mark.asyncio
+async def test_silence_gap_measures_last_real_user_message(stack):
+    """The gap is measured from the owner's last REAL message. Synthetic
+    user-role rows the daemon writes to itself ([system note: ...] auto-pings,
+    including the one a voice call opens with, and [memory note: ...]
+    injections) must not reset the clock — otherwise every call would greet
+    the owner as if they had just been talking."""
+    db = stack["db"]
+    await _seed_message(db, "s1", "user", "night, talk tomorrow", age_s=5 * 3600 + 12 * 60)
+    await _seed_message(db, "s1", "assistant", "Night.", age_s=5 * 3600 + 11 * 60)
+    await _seed_message(db, "s1", "user", "[memory note: entries about X]", age_s=90)
+
+    llm = ScriptedLLM(["Morning."])
+    await _make_operator(stack, llm).auto_ping(
+        session_id="s1", note="owner voice call started",
+        include_silence_gap=True,
+    )
+
+    assert _tail_tag(llm, "<time-since-last-message>") == (
+        "<time-since-last-message>5h 12m since the user last spoke to you"
+        "</time-since-last-message>"
+    )
+
+
+@pytest.mark.asyncio
+async def test_silence_gap_only_on_turns_that_ask_for_it(stack):
+    """The block is opt-in: ordinary chat turns and background auto-pings must
+    not carry it (a clock on every turn is one the operator starts narrating).
+    Only the call-start greeting opts in — and even then it is suppressed under
+    LAST_CONTACT_MIN_GAP_S, absent entirely rather than reported as "0m"."""
+    from oncall.operator import LAST_CONTACT_MIN_GAP_S
+
+    db = stack["db"]
+    await _seed_message(db, "s1", "user", "night", age_s=5 * 3600)
+
+    llm = ScriptedLLM(["Sure."])
+    await _make_operator(stack, llm).chat_turn(session_id="s1", user_text="hey")
+    assert _tail_tag(llm, "<time-since-last-message>") is None
+
+    llm2 = ScriptedLLM(["Noted."])
+    await _make_operator(stack, llm2).auto_ping(session_id="s1", note="task 7 finished")
+    assert _tail_tag(llm2, "<time-since-last-message>") is None
+
+    await _seed_message(db, "s2", "user", "still here", age_s=LAST_CONTACT_MIN_GAP_S - 1)
+    llm3 = ScriptedLLM(["Hi."])
+    await _make_operator(stack, llm3).auto_ping(
+        session_id="s2", note="owner voice call started", include_silence_gap=True,
+    )
+    assert _tail_tag(llm3, "<time-since-last-message>") is None

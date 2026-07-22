@@ -710,6 +710,26 @@ class Database:
         )
         await self.conn.commit()
 
+    async def last_user_message_at(self, session_id: str) -> str | None:
+        """`created_at` of the most recent message the USER actually sent in
+        this session, or None if they never have. Synthetic user-role rows
+        (`[system note: ...]` auto-pings, `[memory note: ...]` injections) are
+        excluded — they are the daemon talking to itself, not contact, and
+        counting them would reset the clock every time a background loop
+        pinged the operator. Used to tell the operator how long it has been
+        since the owner last spoke, which matters most at the start of a
+        voice call."""
+        async with self.conn.execute(
+            "SELECT created_at FROM chat_messages "
+            "WHERE session_id = ? AND role = 'user' "
+            "AND content NOT LIKE '[system note: %' "
+            "AND content NOT LIKE '[memory note: %' "
+            "ORDER BY id DESC LIMIT 1",
+            (session_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return row["created_at"] if row else None
+
     async def load_chat_history(
         self, session_id: str, *, limit: int = 60, since_id: int = 0,
     ) -> list[dict[str, Any]]:

@@ -1144,6 +1144,9 @@ class CallService:
         try:
             result = await self._operator.auto_ping(
                 session_id=active.session_id, note=note,
+                # Only the owner shares this session's history, so only for
+                # them does "how long since you last spoke" mean anything.
+                include_silence_gap=active.is_owner,
             )
         except Exception:
             log.exception("voice: call-start auto_ping failed")
@@ -1225,6 +1228,7 @@ class CallService:
         try:
             result = await self._operator.auto_ping(
                 session_id=active.session_id, note=note,
+                include_silence_gap=active.is_owner,
             )
         except Exception:
             log.exception("voice: prewarm auto_ping failed")
