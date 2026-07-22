@@ -73,7 +73,10 @@ What NOT to cite:
   - Anything not stated verbatim by the user.
   - Anything already in ALREADY_SAVED.
   - Anything quoted from a third party (a DM the user is forwarding).
-  - Task-specific transient state ("the error was X", "T1 is running").
+  - Anything true only at the moment the user said it: events, activities,
+    whereabouts, in-flight task state. A report of something that happened is
+    not a citation. If it also reveals a standing fact — a preference, an
+    identifier, a convention — cite that fact instead of the occurrence.
   - Questions or speculation. Only assertions.
   - Secrets: passwords, API tokens/keys, OTP codes, full credit-card numbers.
 
