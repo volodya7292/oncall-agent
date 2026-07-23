@@ -290,7 +290,12 @@ class Settings(BaseSettings):
     # same-language pairs (token overlap across scripts is ~0), so it drags
     # cross-language scores toward 0.7*cosine — hence the low floor.
     oncall_memory_relevance_floor: float = 0.15
-    oncall_memory_max_inject: int = 10
+    # Memories injected per turn as a `[memory note: ...]` message. Each is a
+    # one-line fact, so 20 costs a few hundred tokens and is paid once per
+    # memory per context window (the note is appended to history, not rebuilt
+    # every turn), which is cheap next to the operator answering a question
+    # about the user from a fact it was never handed.
+    oncall_memory_max_inject: int = 20
     # Operator model. Default is glm-5.2 via OpenRouter, pinned to Fireworks.
     # Switch models by pairing ONCALL_OPERATOR_BACKEND with the right id:
     #   openrouter → an OpenRouter slug ("z-ai/glm-5.2", "x-ai/grok-4.20")

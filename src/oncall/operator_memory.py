@@ -61,6 +61,7 @@ class MemoryStore(Protocol):
     ) -> list[str]: ...
     async def retrieve(
         self, query: str, *, limit: int | None = None,
+        exclude_ids: set[int] | None = None,
     ) -> list[Memory]: ...
     async def get_by_id(self, memory_id: int) -> Memory | None: ...
     async def delete_by_id(self, memory_id: int) -> bool: ...
@@ -139,16 +140,26 @@ class OperatorMemory:
 
     async def retrieve(
         self, query: str, *, limit: int | None = None,
+        exclude_ids: set[int] | None = None,
     ) -> list[Memory]:
         """Hybrid retrieval. Returns up to `limit` (default `max_inject`)
         memories with score ≥ `relevance_floor`, ordered by score desc.
         Bumps `last_accessed_at` for the returned rows (and only those —
-        below-floor candidates do NOT extend their LRU lifetime)."""
+        below-floor candidates do NOT extend their LRU lifetime).
+
+        `exclude_ids` are dropped BEFORE the top-`limit` cut, so a caller
+        that filters afterwards can't be left with nothing: the callers
+        that exclude (session-injection dedup) want the best `limit`
+        *eligible* memories, not whatever survives of the best `limit`
+        overall. Excluded rows also skip the LRU bump — they were never
+        served."""
         q = (query or "").strip()
         if not q:
             return []
         lim = limit if limit is not None else self._max_inject
         rows = await self._all_rows()
+        if exclude_ids:
+            rows = [r for r in rows if int(r["id"]) not in exclude_ids]
         if not rows:
             return []
 

@@ -1065,27 +1065,30 @@ class Operator:
     async def _inject_session_memory(
         self, session_id: str, query: str,
     ) -> str | None:
-        """Retrieve memories relevant to `query`, drop ones already shown
-        in this session, and return a `[memory note: ...]` chat-message
-        body listing the new ones. Returns None when there's nothing new
-        to surface. Persists the newly-shown ids on success so the next
-        turn in this session won't re-inject them — keeps the history
-        prefix monotonically growing (cache-friendly) and avoids
-        re-spamming the same facts.
+        """Retrieve memories relevant to `query` that this session hasn't
+        been shown yet, and return a `[memory note: ...]` chat-message body
+        listing them. Returns None when there's nothing new to surface.
+        Persists the newly-shown ids on success so the next turn in this
+        session won't re-inject them — keeps the history prefix
+        monotonically growing (cache-friendly) and avoids re-spamming the
+        same facts. Compression clears that tracking for the notes it
+        folds away (see `insert_chat_summary`), so a memory becomes
+        eligible again once its note has left the context window.
 
-        The model is told inline that memory notes appear at most once;
-        if it later wants to look something up, it should use
-        `query_memory` (operator) / `mcp__oncall__memory op=query`
-        (executor)."""
+        The exclusion is pushed INTO retrieval rather than applied to its
+        output: filtering afterwards spends the whole budget on
+        already-shown rows and injects nothing, which is precisely how a
+        long-running session goes memory-blind.
+
+        The model is told inline that a note carries only part of the
+        store; to look anything else up it uses `query_memory` (operator)
+        / `mcp__oncall__memory op=query` (executor)."""
+        shown = await self._db.get_shown_memory_ids(session_id)
         try:
-            hits = await self._memory.retrieve(query, limit=10)
+            fresh = await self._memory.retrieve(query, exclude_ids=shown)
         except Exception:
             log.exception("memory retrieve failed for session %s", session_id)
             return None
-        if not hits:
-            return None
-        shown = await self._db.get_shown_memory_ids(session_id)
-        fresh = [m for m in hits if m.id not in shown]
         if not fresh:
             return None
         await self._db.record_memory_shown(session_id, [m.id for m in fresh])

@@ -79,9 +79,12 @@ class StubMemory:
         self._entries.extend(kept)
         return list(kept)
 
-    async def retrieve(self, query, *, limit=None):
+    async def retrieve(self, query, *, limit=None, exclude_ids=None):
         self.retrieve_calls.append(query)
-        return list(self._canned.get(query, []))
+        hits = self._canned.get(query, [])
+        if exclude_ids:
+            hits = [m for m in hits if m.id not in exclude_ids]
+        return list(hits)
 
     async def get_by_id(self, memory_id):
         return self._by_id.get(memory_id)

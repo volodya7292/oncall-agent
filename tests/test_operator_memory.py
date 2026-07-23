@@ -507,3 +507,34 @@ async def test_dedup_cluster_payload_carries_timestamps_oldest_first(db):
     assert [p["text"] for p in payload] == [old, new], "must be oldest-first"
     assert all("recorded_at" in p for p in payload), "arbiter needs timestamps"
     assert payload[0]["recorded_at"] < payload[1]["recorded_at"]
+
+
+@pytest.mark.asyncio
+async def test_retrieve_excludes_before_applying_the_limit(db):
+    """Regression: `exclude_ids` must shrink the candidate pool, not the
+    result set.
+
+    The session-injection caller excludes memories already shown in this
+    session. It used to take the top-`max_inject` and filter afterwards, so
+    a session that had seen the best matches got NOTHING injected even
+    though plenty of eligible memories scored above the floor — the failure
+    that made a long-running session look amnesiac. Excluding first spends
+    the budget on rows the caller can actually use.
+    """
+    emb = StubEmbedder()
+    # No token overlap with the query, so jaccard is 0 for every row and
+    # score is exactly 0.7 * cos — ranking is purely the registered cosines.
+    emb.register("alpha", unit_vec(1.0))
+    emb.register("beta", unit_vec(0.9))
+    emb.register("gamma", unit_vec(0.8))
+    emb.register("zzz", unit_vec(1.0))
+    mem = make_memory(db, emb, max_inject=2, relevance_floor=0.30)
+    await mem.store(["alpha", "beta", "gamma"])
+
+    ranked = await mem.retrieve("zzz", limit=10)
+    assert [m.text for m in ranked] == ["alpha", "beta", "gamma"]
+    top_two = {m.id for m in ranked[:2]}
+
+    # Budget is 2 and the top 2 are excluded; the third must still surface.
+    got = await mem.retrieve("zzz", exclude_ids=top_two)
+    assert [m.text for m in got] == ["gamma"]

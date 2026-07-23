@@ -151,9 +151,16 @@ CREATE TABLE IF NOT EXISTS memory_dedup_skip_pairs (
 -- `[memory note: ...]` user-role message in a chat session. Used to
 -- dedup memory injection across turns so the system prompt + chat
 -- history prefix stays stable (KV cache hits) and the model doesn't
--- re-read the same memory text every turn. Reset on /clear; survives
--- /compact (compacted history may have lost the verbatim memory text,
--- but the model has been shown the fact at least once).
+-- re-read the same memory text every turn.
+--
+-- A row means "the verbatim text is still in this session's context", so
+-- it is only valid while the note itself is. Compression folds old notes
+-- into prose that does not preserve them, hence `insert_chat_summary`
+-- drops the rows it just summarized away; /clear drops all of them.
+-- Treating a row as permanent starves injection: on the live store,
+-- 92 of 94 memories were marked shown in one long-running session and
+-- retrieval had been returning candidates that were all filtered out
+-- for days.
 CREATE TABLE IF NOT EXISTS session_memory_shown (
     session_id TEXT NOT NULL,
     memory_id INTEGER NOT NULL,
@@ -847,6 +854,22 @@ class Database:
         self, *, session_id: str, summary: str,
         through_message_id: int, estimated_token_count: int,
     ) -> int:
+        """Persist a compression checkpoint, and in the same transaction
+        forget the memory-injection tracking it just invalidated.
+
+        Every `[memory note: ...]` row at or before `through_message_id` is
+        replaced by summary prose that does not carry the memory text, so
+        those memories are no longer in the model's context and must become
+        re-injectable. This is not an optional composition step — a summary
+        without the reset leaves the memory permanently unreachable — so it
+        lives here rather than at the two call sites.
+
+        Rows are matched by timestamp: `shown_at` is written just before the
+        note row, and `created_at` grows with id, so `shown_at` earlier than
+        the checkpoint message's `created_at` implies the note was folded in.
+        The error is one-sided — at worst a note from the still-live tail is
+        cleared and its memory re-injected while already visible, which
+        costs a few tokens; a folded note can never be missed."""
         async with self.conn.execute(
             "INSERT INTO chat_summaries "
             "(session_id, summary, through_message_id, estimated_token_count, created_at) "
@@ -855,6 +878,12 @@ class Database:
              estimated_token_count, iso(utcnow())),
         ) as cur:
             lastrowid = cur.lastrowid
+        await self.conn.execute(
+            "DELETE FROM session_memory_shown "
+            "WHERE session_id = ? AND shown_at < "
+            "(SELECT created_at FROM chat_messages WHERE id = ?)",
+            (session_id, through_message_id),
+        )
         await self.conn.commit()
         return lastrowid or 0
 
