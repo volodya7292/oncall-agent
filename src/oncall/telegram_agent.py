@@ -507,14 +507,20 @@ class TelegramAgentService:
                     await self._send("Failed to export context. Check logs.")
                     return True
                 stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                filename = f"oncall-context-{self._session_id}-{stamp}.md"
+                filename = f"oncall-context-{self._session_id}-{stamp}.txt"
+                # Telethon derives a document's name from the source path, so
+                # a bytes upload needs the name passed as an attribute. There
+                # is no `file_name` parameter — it lands in **kwargs and is
+                # dropped, which is how this arrived as an unnamed,
+                # extensionless blob that Telegram wouldn't preview.
+                from telethon.tl.types import DocumentAttributeFilename
                 try:
                     await self._client.send_file(
                         self._owner_user_id,
                         file=dump.encode("utf-8"),
-                        attributes=None,
+                        attributes=[DocumentAttributeFilename(filename)],
                         force_document=True,
-                        file_name=filename,
+                        mime_type="text/plain",
                         caption="Operator context for this session.",
                     )
                 except Exception:
