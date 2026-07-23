@@ -913,6 +913,7 @@ user asked...", "the operator dispatched...") — even when the transcript is
 casual chit-chat, you narrate it, you do not join it.
 
 Preserve:
+- When things happened. Transcript lines are prefixed with their timestamp; carry those dates into the prose, and never drop a date already present in the summary you are extending.
 - Every task ID (UUID or short form) the operator dispatched, and what the user wanted from each.
 - User preferences, durable decisions, and constraints they stated.
 - Open threads: things the operator owes the user, questions awaiting an answer.
@@ -1749,8 +1750,14 @@ class Operator:
         # conversation, still a large shrink. Handed to the model as a word
         # target (tokens ≈ words × 1.33).
         target_words = max(120, min(1200, int(in_tokens * 0.10 / 1.33)))
+        # Timestamps go in so the summary can say WHEN. Without them the
+        # model has no way to date anything and the prose comes back as an
+        # undated run-on ("he then pivoted to cheese..."), which is useless
+        # for placing an event relative to now.
         formatted = "\n".join(
-            f"[{r['role']}]: {r['content'][:2000]}" for r in older
+            f"[{_fmt_ts(r.get('created_at') or '')}] [{r['role']}]: "
+            f"{r['content'][:2000]}"
+            for r in older
         )
         prompt = (
             "Fold the transcript below into an updated running summary of the "

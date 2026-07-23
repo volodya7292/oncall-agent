@@ -522,7 +522,11 @@ class TelegramAgentService:
                         file=dump.encode("utf-8"),
                         attributes=[DocumentAttributeFilename(filename)],
                         force_document=True,
-                        mime_type="text/plain",
+                        # charset is explicit because the dump is heavily
+                        # non-ASCII (Ukrainian, Czech, em-dashes) and a
+                        # reader that falls back to latin-1 renders the
+                        # whole file as mojibake.
+                        mime_type="text/plain; charset=utf-8",
                         caption="Operator context for this session.",
                     )
                 except Exception:
