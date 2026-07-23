@@ -507,12 +507,14 @@ class TelegramAgentService:
                     await self._send("Failed to export context. Check logs.")
                     return True
                 stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                filename = f"oncall-context-{self._session_id}-{stamp}.txt"
+                filename = f"oncall-context-{self._session_id}-{stamp}.md"
                 # Telethon derives a document's name from the source path, so
                 # a bytes upload needs the name passed as an attribute. There
                 # is no `file_name` parameter — it lands in **kwargs and is
                 # dropped, which is how this arrived as an unnamed,
-                # extensionless blob that Telegram wouldn't preview.
+                # extensionless blob. The mime is deliberately text/plain
+                # rather than text/markdown: Telegram previews the former
+                # in-app, and the .md name is what matters once saved.
                 from telethon.tl.types import DocumentAttributeFilename
                 try:
                     await self._client.send_file(
