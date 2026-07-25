@@ -263,12 +263,20 @@ MAX_CALL_DURATION_S = 600.0  # hard cap on non-owner calls (10 min); owner calls
 WATCHDOG_TICK_S = 5.0       # how often _call_watchdog re-checks
 # Proactive re-engagement: if the user goes quiet (no real speech) for this
 # long while the bot also has nothing queued to say, the operator is pinged so
-# it can check in / move things forward instead of sitting in dead air. Spaced
-# out as the silence grows and capped at MAX_NUDGES so a genuinely-done call
-# still falls through to IDLE_TIMEOUT_S teardown rather than being nudged
-# forever. NUDGE_AFTER_S must be < IDLE_TIMEOUT_S or teardown wins first.
+# it can check in / move things forward instead of sitting in dead air. The
+# window DOUBLES per consecutive nudge (12s, 24s, 48s) — someone who ignored
+# the first check-in wants more room, not a metronome — and is capped at
+# MAX_NUDGES so a genuinely-done call still falls through to IDLE_TIMEOUT_S
+# teardown rather than being nudged forever. The clock restarts at each nudge
+# (the bot speaking bumps last_turn_at), so the LAST window must stay below
+# IDLE_TIMEOUT_S or teardown wins first and the later nudges never fire.
 NUDGE_AFTER_S = 12.0
-MAX_NUDGES = 2
+MAX_NUDGES = 3
+
+
+def _nudge_after_s(nudges_since_user: int) -> float:
+    """Quiet seconds required before nudge number `nudges_since_user + 1`."""
+    return NUDGE_AFTER_S * (2 ** nudges_since_user)
 
 # Amplitude scale applied to the ambient office bed at load time. 0.7 = a
 # 30% reduction from the asset's native level, so the bed sits further
@@ -741,7 +749,7 @@ class CallService:
                     # challenge phrase — re-engaging mid-confirmation is noise.
                     and not active.pending_approvals
                     and active.nudges_since_user < MAX_NUDGES
-                    and quiet_for >= NUDGE_AFTER_S
+                    and quiet_for >= _nudge_after_s(active.nudges_since_user)
                 )
                 # The hand-off check hits the DB, so only run it once the cheap
                 # gates already say we'd nudge. While a hand-off is in flight we
