@@ -15,6 +15,7 @@ capacity.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -41,6 +42,31 @@ log = logging.getLogger(__name__)
 # misbehaving extractor — or the dedup LLM combining several long facts —
 # can't bloat the prompt budget.
 MAX_ENTRY_CHARS = 512
+
+
+def _candidate_pairs(
+    cos: np.ndarray, *, alpha: float, beta: float, threshold: float,
+) -> list[tuple[int, int]]:
+    """Upper-triangle (i, j) index pairs whose hybrid score could reach
+    `threshold`. Everything else is provably below it and needs no scoring.
+
+    hybrid = alpha*cos + beta*jaccard and jaccard ≤ 1, so alpha*cos + beta is
+    an upper bound on what a pair can score. A pair already under the gate
+    there cannot cross it once the real Jaccard is known, so pruning on that
+    bound skips work without ever dropping an edge.
+
+    The Jaccard half is what costs — it tokenizes both texts — and the pair
+    count is quadratic in the store size. At the row capacity, scoring every
+    pair is seconds of CPU blocking the event loop inside the dedup task,
+    while the pairs that can actually cluster are a small fraction.
+    """
+    i, j = np.triu_indices(len(cos), k=1)
+    # float64 so the bound is never tightened by float32 rounding at the
+    # exact threshold — the prune must not decide knife-edge pairs.
+    ceiling = alpha * cos[i, j].astype(np.float64) + beta
+    return [
+        (int(i[k]), int(j[k])) for k in np.flatnonzero(ceiling >= threshold)
+    ]
 
 
 @dataclass
@@ -292,58 +318,73 @@ class OperatorMemory:
         normed = matrix / norms
         cos = normed @ normed.T
 
-        # Hybrid similarity (same formula retrieval uses): alpha*cos + beta*
-        # Jaccard token overlap. Identifier-rich texts that embeddings rank
-        # low get a fuzzy boost; pure-template paraphrases still cluster on
-        # cosine.
-        hybrid = np.zeros_like(cos)
-        for i in range(len(rows)):
-            for j in range(i + 1, len(rows)):
-                h = hybrid_score(
-                    float(cos[i, j]), rows[i]["text"], rows[j]["text"],
-                    alpha=self._alpha, beta=self._beta,
-                )
-                hybrid[i, j] = h
-                hybrid[j, i] = h
-
         # Pairs the LLM has previously reviewed and decided NOT to merge.
         # Skipping these as edges avoids burning LLM calls re-asking every
         # 5 min about the same John-vs-Jane situations. id_a < id_b.
         skip = await self._load_skip_pairs()
 
         n = len(rows)
-        parent = list(range(n))
 
-        def find(x: int) -> int:
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
+        def _build_clusters() -> list[list[int]]:
+            """Connected components of the hybrid-similarity graph. Hybrid
+            (the same formula retrieval uses) is alpha*cos + beta*Jaccard
+            token overlap: identifier-rich texts that embeddings rank low get
+            a fuzzy boost, and pure-template paraphrases still cluster on
+            cosine. Only candidate pairs are scored — see _candidate_pairs."""
+            parent = list(range(n))
 
-        any_edge = False
-        for i in range(n):
-            for j in range(i + 1, n):
-                if hybrid[i, j] < cluster_threshold:
-                    continue
+            def find(x: int) -> int:
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            for i, j in _candidate_pairs(
+                cos, alpha=self._alpha, beta=self._beta,
+                threshold=cluster_threshold,
+            ):
                 a = int(rows[i]["id"])
                 b = int(rows[j]["id"])
                 if (min(a, b), max(a, b)) in skip:
                     continue
+                h = hybrid_score(
+                    float(cos[i, j]), rows[i]["text"], rows[j]["text"],
+                    alpha=self._alpha, beta=self._beta,
+                )
+                if h < cluster_threshold:
+                    continue
                 ra, rb = find(i), find(j)
                 if ra != rb:
                     parent[ra] = rb
-                any_edge = True
-        if not any_edge:
+            groups: dict[int, list[int]] = {}
+            for i in range(n):
+                groups.setdefault(find(i), []).append(i)
+            return [g for g in groups.values() if len(g) >= 2]
+
+        # Off the event loop. Pair count is quadratic in the store size, and
+        # the Jaccard half is pure Python: at capacity this is seconds of CPU
+        # while the same loop is serving chat turns. A thread does not make it
+        # cheaper, only preemptible.
+        clusters = await asyncio.to_thread(_build_clusters)
+        if not clusters:
             return {"clusters_found": 0, "merged": 0, "kept": 0, "failed": 0}
-        groups: dict[int, list[int]] = {}
-        for i in range(n):
-            groups.setdefault(find(i), []).append(i)
-        clusters = [g for g in groups.values() if len(g) >= 2]
 
         merged_n = kept_n = failed_n = 0
         for indices in clusters:
             if len(indices) > max_cluster_size:
-                sub = hybrid[np.ix_(indices, indices)]
+                # Keep the densest members by total in-cluster similarity.
+                # Scored here, over one cluster, rather than read out of a
+                # full pairwise matrix we deliberately never build.
+                m = len(indices)
+                sub = np.zeros((m, m), dtype=np.float64)
+                for a in range(m):
+                    for b in range(a + 1, m):
+                        ia, ib = indices[a], indices[b]
+                        sub[a, b] = sub[b, a] = hybrid_score(
+                            float(cos[ia, ib]),
+                            rows[ia]["text"], rows[ib]["text"],
+                            alpha=self._alpha, beta=self._beta,
+                        )
                 top = np.argsort(-sub.sum(axis=1))[:max_cluster_size]
                 indices = [indices[k] for k in top]
             cluster_rows = [rows[i] for i in indices]
@@ -488,8 +529,14 @@ class OperatorMemory:
             "MySQL in 2024'), and never phrase it so the stale value could be "
             "mistaken for current.\n"
             "Memories that refer to DIFFERENT entities (person, host, "
-            "version, identifier, scope, etc.) MUST NOT share a group — a "
-            "newer memory about a different entity supersedes nothing.\n"
+            "version, identifier, scope, occasion, etc.) MUST NOT share a "
+            "group — a newer memory about a different entity supersedes "
+            "nothing.\n"
+            "(b) covers standing attributes only. A record of something that "
+            "happened is not an attribute that can change — records of two "
+            "different occasions supersede each other never, however alike "
+            "they read. Two records of the SAME occasion are ordinary "
+            "paraphrases and merge under (a).\n"
             "A preference or opinion that merely differs is NOT automatically "
             "superseded; people hold several at once. Supersede only when the "
             "newer memory is genuinely incompatible with the older.\n"

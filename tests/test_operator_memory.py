@@ -538,3 +538,45 @@ async def test_retrieve_excludes_before_applying_the_limit(db):
     # Budget is 2 and the top 2 are excluded; the third must still surface.
     got = await mem.retrieve("zzz", exclude_ids=top_two)
     assert [m.text for m in got] == ["gamma"]
+
+
+def test_dedup_candidate_prune_never_drops_an_edge():
+    """The dedup pass scores only the pairs `_candidate_pairs` returns, so the
+    prune must be exact: alpha*cos + beta is an upper bound on hybrid (jaccard
+    ≤ 1), and anything it excludes provably cannot reach the gate.
+
+    Checked against brute force over every pair, including the knife-edge case
+    where the bound lands exactly ON the threshold — a `>` there instead of
+    `>=` would silently stop merging identical memories.
+    """
+    import numpy as np
+    from oncall.embeddings import hybrid_score
+    from oncall.operator_memory import _candidate_pairs
+
+    alpha, beta, threshold = 0.7, 0.3, 0.60
+    rng = np.random.default_rng(7)
+    texts = [
+        " ".join(f"tok{t}" for t in rng.integers(0, 12, size=6))
+        for _ in range(40)
+    ]
+    cos = rng.uniform(-0.2, 1.0, size=(40, 40)).astype(np.float32)
+    cos = (cos + cos.T) / 2
+    # A pair whose ceiling is EXACTLY the threshold: 0.7*(3/7) + 0.3 = 0.6,
+    # reachable only because the identical texts push jaccard to 1.0.
+    cos[0, 1] = cos[1, 0] = 3 / 7
+    texts[0] = texts[1] = "tok1 tok2 tok3"
+
+    candidates = set(_candidate_pairs(
+        cos, alpha=alpha, beta=beta, threshold=threshold,
+    ))
+    real_edges = {
+        (i, j)
+        for i in range(40) for j in range(i + 1, 40)
+        if hybrid_score(
+            float(cos[i, j]), texts[i], texts[j], alpha=alpha, beta=beta,
+        ) >= threshold
+    }
+    assert real_edges - candidates == set()
+    assert (0, 1) in candidates
+    # And it prunes something, or it isn't buying anything.
+    assert len(candidates) < 40 * 39 // 2

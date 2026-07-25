@@ -254,7 +254,12 @@ class Settings(BaseSettings):
     # exceed it, the least-recently-retrieved rows are dropped. Hybrid score
     # at retrieval time is `alpha * cosine + beta * token_overlap`, candidates
     # below `relevance_floor` are not injected.
-    oncall_memory_capacity: int = 500
+    #
+    # Headroom for the user's own history (what they did, where they were),
+    # which memory now keeps as a record. It accrues faster than standing
+    # facts and is retrieved less often, so it is what LRU comes for first.
+    # Raising the cap buys time; it does not change that order.
+    oncall_memory_capacity: int = 1000
     # Local Ollama embedder. Picked over hosted gateways for ~30× lower
     # latency (~12ms median vs ~1.8s) and no rate limits. With
     # OLLAMA_KEEP_ALIVE=4h on the embed calls, the model stays resident in

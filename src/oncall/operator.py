@@ -782,10 +782,12 @@ OPERATOR_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "save_memory",
             "description": (
-                "Persist a durable fact to your long-term memory. Use this "
+                "Persist a fact to your long-term memory. Use this "
                 "during a turn whenever you notice something worth keeping: "
                 "a person + their context, an identifier, a preference, a "
-                "convention the user states. Resolve deictic references "
+                "convention the user states, or something the user did, "
+                "lived through, or where they were — anchored to when it "
+                "happened. Resolve deictic references and relative times "
                 "first ('same for X' → spell out the full extended fact), "
                 "using only what was actually said. Record, never deduce: "
                 "do not save inferences, and never equate two identities "

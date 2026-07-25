@@ -2,14 +2,18 @@
 
 Looks at the user's latest message and the immediately preceding assistant
 turn (context only — never a source of facts), and asks a cheap LLM for a
-JSON list of durable fact CANDIDATES the operator might want to remember.
-The candidates are NOT auto-saved; the operator is auto-pinged with the
+JSON list of fact CANDIDATES the operator might want to remember. The
+candidates are NOT auto-saved; the operator is auto-pinged with the
 suggestions and decides which (if any) to commit via its `save_memory`
 tool. This keeps the operator authoritative over what enters memory.
 
-The mental model: each candidate, if absent next time, would force a
-clarifying question. So the suggester is asking "what makes this terse
-intent self-contained?" — not "what's interesting?"
+Two things qualify. Standing facts — the ones whose absence next time would
+force a clarifying question, so the suggester asks "what makes this terse
+intent self-contained?" rather than "what's interesting?". And the user's
+own history — what they did, where they were, what happened to them — which
+is kept as a record rather than for its effect on the next turn, and so is
+judged by whether the occasion is identifiable, not by whether it is still
+true.
 
 To avoid re-suggesting things the operator already saved during the same
 turn, callers pass `already_saved` so the suggester can exclude near-
@@ -68,15 +72,16 @@ What to cite (when the user introduces them):
   - Conventions the user states (where staging lives, which DB is prod).
   - Schedules and preferences ("don't ping me 11pm-7am", "I prefer terse
     replies", "always use lowercase").
+  - The user's own history: what they did, where they were, what happened to
+    them. Carry whatever time reference they gave, so the occasion stays
+    identifiable later.
 
 What NOT to cite:
   - Anything not stated verbatim by the user.
   - Anything already in ALREADY_SAVED.
   - Anything quoted from a third party (a DM the user is forwarding).
-  - Anything true only at the moment the user said it: events, activities,
-    whereabouts, in-flight task state. A report of something that happened is
-    not a citation. If it also reveals a standing fact — a preference, an
-    identifier, a convention — cite that fact instead of the occurrence.
+  - Work in flight: what is running, queued, or being worked on right now.
+    The orchestrator tracks that, and it is stale within the hour.
   - Questions or speculation. Only assertions.
   - Secrets: passwords, API tokens/keys, OTP codes, full credit-card numbers.
 
