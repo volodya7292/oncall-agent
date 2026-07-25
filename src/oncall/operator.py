@@ -851,11 +851,14 @@ OPERATOR_TOOLS: list[dict[str, Any]] = [
             "description": (
                 "Search the operator's persistent memory for facts relevant to "
                 "an explicit query. Memory is auto-extracted from user turns "
-                "and the most-relevant entries are already injected into your "
-                "system prompt each turn — use this tool only when you want to "
-                "look up something OUTSIDE the current turn's topic (e.g. "
-                "before asking the user a clarifying question, check whether "
-                "you already know the answer)."
+                "and the most-relevant entries arrive on their own as "
+                "`[memory note: ...]` messages in this conversation — use this "
+                "tool only when you want to look up something OUTSIDE the "
+                "current turn's topic (e.g. before asking the user a "
+                "clarifying question, check whether you already know the "
+                "answer). Anything you were not shown that way and did not "
+                "look up here, you did not retrieve — you are recalling it "
+                "from this conversation."
             ),
             "parameters": {
                 "type": "object",
@@ -965,6 +968,33 @@ def _fmt_elapsed(seconds: float) -> str:
 
 
 MEMORY_NOTE_PREFIX = "[memory note: "
+
+# Retrieval-key window (see Operator._retrieval_key). A user turn read in
+# isolation is often a poor embedding key: voice ASR garbles it, and a
+# deictic reply ("yes", "the second one", "взяв оце") carries no topic at
+# all. Both failures are silent — retrieval returns confidently irrelevant
+# rows rather than nothing. The preceding turns supply the topic the key
+# is missing.
+_RETRIEVAL_WINDOW_MESSAGES = 6
+# Char budget for the borrowed context ONLY; the current turn is always
+# kept whole and is never charged against this.
+_RETRIEVAL_WINDOW_CHARS = 900
+
+# Rows that are the daemon talking to itself, or bookkeeping placeholders.
+# As embedding keys they are worse than nothing — an inbound-attachment
+# path is a hex string, and a memory note echoes rows we just decided to
+# stop showing.
+_RETRIEVAL_SKIP_PREFIXES = (
+    MEMORY_NOTE_PREFIX,
+    "[memory note:",
+    "[system note:",
+    "[attachment:",
+    "[file attached:",
+    "<acting-status>",
+    "<call-status>",
+    "<laptop-status>",
+    "SYSTEM:",
+)
 
 
 COMPRESSION_SYSTEM_PROMPT = """\
@@ -1128,6 +1158,56 @@ class Operator:
             .replace("{{agent_name}}", agent_name)
         )
 
+    async def _retrieval_key(self, session_id: str, user_text: str) -> str:
+        """Build the embedding key for this turn's memory retrieval: the
+        user's message plus the tail of the conversation it lands in.
+
+        The turn alone is frequently not a usable key. On a voice call ASR
+        garbles it, and in text a deictic reply ("yes", "the second one")
+        names nothing at all — in both cases the embedding lands somewhere
+        arbitrary and retrieval returns rows that merely beat the floor,
+        which is indistinguishable from working. The preceding turns carry
+        the topic those messages are about.
+
+        The current turn goes FIRST and is never truncated: it is what the
+        user actually said, and the borrowed context is only there to place
+        it. Context is charged against its own budget and dropped
+        oldest-first, so a long history can't drown the turn.
+
+        Returns at minimum `user_text` — never empty for a non-empty turn,
+        and never raises: a history read that fails degrades to the old
+        turn-only behaviour rather than skipping retrieval."""
+        parts = [user_text.strip()]
+        try:
+            history = await self._db.load_chat_history(
+                session_id, limit=_RETRIEVAL_WINDOW_MESSAGES * 4,
+            )
+        except Exception:
+            log.exception(
+                "retrieval-key history read failed for session %s; "
+                "falling back to the bare user turn", session_id,
+            )
+            return parts[0]
+        context: list[str] = []
+        # Newest-first so the char budget spends itself on the turns
+        # nearest the user's message.
+        for row in reversed(history):
+            if len(context) >= _RETRIEVAL_WINDOW_MESSAGES:
+                break
+            if row.get("role") not in ("user", "assistant"):
+                continue
+            content = (row.get("content") or "").strip()
+            if not content or content.startswith(_RETRIEVAL_SKIP_PREFIXES):
+                continue
+            budget_left = _RETRIEVAL_WINDOW_CHARS - sum(
+                len(c) + 1 for c in context
+            )
+            if budget_left <= 0:
+                break
+            context.append(content[:budget_left])
+        parts.extend(reversed(context))
+        return "\n".join(p for p in parts if p)
+
     async def _inject_session_memory(
         self, session_id: str, query: str,
     ) -> str | None:
@@ -1164,7 +1244,7 @@ class Operator:
         )
         return (
             f"{MEMORY_NOTE_PREFIX}auto-loaded entries from your persistent "
-            f"memory relevant to the next turn."
+            f"memory relevant to the next turn. "
             f"For lookups OUTSIDE what you've already been shown, use "
             f"`query_memory`.\n{bullets}]"
         )
@@ -1367,16 +1447,18 @@ class Operator:
         # `[memory note: ...]` ahead of the actual user message.
         # `retrieval_query` is caller-supplied for inbox-drain (where
         # `user_text` is the synthetic auto-ping note and the real signal
-        # is the DM body); otherwise it's the user's own message, except
-        # for pure system-note auto-pings (task terminated etc.) which
-        # aren't useful retrieval queries.
+        # is the DM body) and is used verbatim — the caller already knows
+        # exactly what to key on. Otherwise the key is the user's own
+        # message widened with the conversation it lands in (see
+        # `_retrieval_key`), except for pure system-note auto-pings (task
+        # terminated etc.) which aren't useful retrieval queries.
         effective_query: str | None
         if retrieval_query is not None:
             effective_query = retrieval_query
+        elif user_text.startswith(AUTO_PING_PREFIX):
+            effective_query = None
         else:
-            effective_query = (
-                None if user_text.startswith(AUTO_PING_PREFIX) else user_text
-            )
+            effective_query = await self._retrieval_key(session_id, user_text)
         if effective_query:
             memory_note = await self._inject_session_memory(
                 session_id, effective_query,

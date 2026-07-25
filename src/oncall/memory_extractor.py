@@ -1,7 +1,8 @@
 """User-turn fact-candidate suggester.
 
 Looks at the user's latest message and the immediately preceding assistant
-turn (context only — never a source of facts), and asks a cheap LLM for a
+turn (context only — never a source of facts, though it may supply the
+identity of something the user referred to), and asks a cheap LLM for a
 JSON list of fact CANDIDATES the operator might want to remember. The
 candidates are NOT auto-saved; the operator is auto-pinged with the
 suggestions and decides which (if any) to commit via its `save_memory`
@@ -48,21 +49,30 @@ A citation is content the user wrote, lifted verbatim. You may:
   - Quote a phrase verbatim and add a minimal lead-in to make it self-contained
     (e.g. user wrote "staging is at api-staging.example.com:8443"
      → citation: 'the user states: "staging is at api-staging.example.com:8443"').
-  - Resolve a pronoun ("he" → the named person) using the PREVIOUS_ASSISTANT
-    block ONLY to disambiguate — never to introduce new content.
+  - Place a reference the user left open — a pronoun, or a deictic standing in
+    for something they pointed at, chose, or acted on — against what
+    PREVIOUS_ASSISTANT was talking about. The citation MUST name that referent
+    — an unresolved "it" is useless a year from now — but only in the lead-in,
+    never inside the quoted words, which stay exactly what the user said. A
+    referent you cannot place from PREVIOUS_ASSISTANT is not citable at all.
 You may NOT:
   - Invent identifiers, handles, URLs, hostnames, IDs, ports, or numbers
     that do not appear in the USER message verbatim.
   - Extrapolate plausible-looking values (e.g. guessing a Telegram handle
     from a person's name — that is a hallucination, not a citation).
-  - Restate or "tidy up" what the assistant said in PREVIOUS_ASSISTANT —
-    only the user is a source.
+  - Restate or "tidy up" what the assistant said in PREVIOUS_ASSISTANT. It is
+    never the one asserting: it can say what a reference points at, it can
+    never contribute a fact the user did not assert.
+  - Describe the contents of an attachment. A `[file attached: ...]` line tells
+    you the user sent something, nothing more — what is in it is not available
+    to you, and guessing is a hallucination even when the previous turn makes
+    it obvious.
 
 You receive three pieces:
   - PREVIOUS_ASSISTANT (may be empty): the assistant's prior reply. CONTEXT
-    ONLY for pronoun resolution. Nothing from it may appear in a citation
-    unless it is also in the user message.
-  - USER: the user's latest message. The ONLY source.
+    ONLY, for placing references. Nothing from it may appear in a citation
+    except the identity of something the user referred to.
+  - USER: the user's latest message. The ONLY source of assertions.
   - ALREADY_SAVED (may be empty): citations the operator already committed
     during this turn. Do NOT re-suggest near-duplicates.
 
@@ -77,7 +87,8 @@ What to cite (when the user introduces them):
     identifiable later.
 
 What NOT to cite:
-  - Anything not stated verbatim by the user.
+  - Anything the user did not assert. A lead-in may place a reference they
+    left open; it may not add a claim of its own.
   - Anything already in ALREADY_SAVED.
   - Anything quoted from a third party (a DM the user is forwarding).
   - Work in flight: what is running, queued, or being worked on right now.
