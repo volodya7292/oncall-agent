@@ -43,6 +43,69 @@ log = logging.getLogger(__name__)
 # gateway; tests inject a stub.
 # ---------------------------------------------------------------------------
 
+_ERR_MAX_CHARS = 300
+
+
+def _deepest_message(payload: Any, depth: int = 0) -> str | None:
+    """Dig the human-readable sentence out of a provider error payload.
+
+    Providers nest it arbitrarily: google-genai hands us
+    `{'message': '{"error": {"code": 429, "message": "<the sentence>"}}'}` —
+    a JSON document re-encoded as the value of an outer key.
+    """
+    if depth > 4:
+        return None
+    if isinstance(payload, str):
+        s = payload.strip()
+        if s.startswith("{"):
+            try:
+                return _deepest_message(json.loads(s), depth + 1)
+            except ValueError:
+                pass  # not JSON after all — the string itself is the message
+        return s or None
+    if isinstance(payload, dict):
+        for key in ("error", "message", "detail"):
+            if key in payload:
+                found = _deepest_message(payload[key], depth + 1)
+                if found:
+                    return found
+    return None
+
+
+def summarize_llm_error(exc: BaseException) -> str:
+    """One line describing why an LLM call failed, fit to show a user.
+
+    SDK errors stringify to a status line with the entire JSON error body
+    glued on. Neither half alone is usable: the body is unreadable in a chat
+    window, and the status line ("429 Too Many Requests") hides the one
+    sentence that says what to do about it ("exceeded its monthly spending
+    cap"). So we pair the status code with the deepest message in the payload.
+    """
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "the model did not respond in time"
+
+    msg = _deepest_message(getattr(exc, "details", None))
+    if not msg:
+        msg = _deepest_message(getattr(exc, "message", None))
+    if not msg:
+        # No structured payload. Take the first line, and drop a trailing
+        # JSON body only when the line opens with an HTTP status — otherwise
+        # the braces belong to a plain error message we shouldn't truncate.
+        line = str(exc).splitlines()[0] if str(exc) else ""
+        brace = line.find("{")
+        if brace > 0 and re.match(r"\s*\d{3}\b", line):
+            line = line[:brace]
+        msg = line.rstrip(" .:,-")
+    msg = " ".join(msg.split())
+    if len(msg) > _ERR_MAX_CHARS:
+        msg = msg[: _ERR_MAX_CHARS - 1] + "…"
+
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return f"{code}: {msg}" if msg else f"HTTP {code}"
+    return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+
+
 class LLMClient(Protocol):
     async def chat(
         self,
@@ -2150,17 +2213,7 @@ class Operator:
                 already_saved=already_saved,
             )
         except Exception as e:
-            # Don't paste the upstream's full error body into the user's chat —
-            # SDK errors like google-genai's ClientError stringify to
-            # `429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': ...}}`
-            # and the dict is huge. Keep just the human-readable prefix.
-            msg = str(e).splitlines()[0]
-            brace = msg.find("{")
-            if brace > 0:
-                msg = msg[:brace].rstrip(" .:,-")
-            if len(msg) > 160:
-                msg = msg[:157] + "…"
-            text = f"SYSTEM: Memory extraction failed: {type(e).__name__}: {msg}"
+            text = f"SYSTEM: Memory extraction failed: {summarize_llm_error(e)}"
             operator_log.exception("memory extraction failed for session %s", session_id)
             await self._emit_breadcrumb(session_id, text)
             return

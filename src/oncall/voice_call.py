@@ -85,7 +85,7 @@ from .config import Paths
 from .events import EventBus
 from .metrics import timed
 from .models import TaskState
-from .operator import Operator
+from .operator import Operator, summarize_llm_error
 from .telegram_agent import agent_session_id
 from .voice import strip_expression_tag_backticks, to_voice_text
 
@@ -1353,9 +1353,14 @@ class CallService:
             result = await self._operator.chat_turn(
                 session_id=active.session_id, user_text=user_text,
             )
-        except Exception:
+        except Exception as e:
             log.exception("voice: operator.chat_turn failed")
-            await self._enqueue_text(active, "Sorry — I hit an error.")
+            # Say which error. On a call the owner has no log to check, and
+            # `to_voice_text` already renders the URLs these messages carry
+            # as "link" before TTS sees them.
+            await self._enqueue_text(
+                active, f"Sorry — I hit an error. {summarize_llm_error(e)}",
+            )
             return
         ack = result.user_facing_text()
         if ack:

@@ -39,7 +39,7 @@ from .db import Database
 from .events import EventBus
 from .metrics import LATENCY, timed
 from .models import TaskState
-from .operator import Operator
+from .operator import Operator, summarize_llm_error
 from .telegram_format import (
     age,
     chunk_message,
@@ -416,10 +416,20 @@ class TelegramAgentService:
                     session_id=self._session_id, user_text=text,
                     attachments=attachments or None,
                 )
-            except Exception:
+            except Exception as e:
                 log.exception("operator.chat_turn failed for telegram agent")
                 t.ok = False
-                await self._send("Internal error. Try again in a moment.")
+                # Show the reason, not just "internal error" — the common
+                # failures here (quota exhausted, upstream rate limit, model
+                # timeout) are ones the owner can act on, and a generic
+                # message sends them to the logs to find out which it was.
+                detail = summarize_llm_error(e)
+                await self._send(f"⚠️ Couldn't answer — {detail}")
+                # Speak it too. Only the success path used to publish, so a
+                # failed turn during an active call was pure silence on the
+                # line — the worst failure mode there, since the caller just
+                # keeps waiting. Emoji stays out of the spoken copy.
+                await self._publish_for_voice(f"Couldn't answer. {detail}")
                 return
 
             reply = result.user_facing_text()
@@ -434,16 +444,20 @@ class TelegramAgentService:
             session=self._session_id, len=len(reply),
             tool_calls=len(result.tool_calls_made),
         ))
-        # If an owner voice call is active for this same session, the voice
-        # subscriber TTSes any `chat.reply` event with non-empty `voice_text`.
-        # We publish with `text=""` so the telegram-side chat.reply subscriber
-        # (which filters empty text) doesn't double-send what we already sent
-        # above. No call active → no voice subscriber → harmless no-op.
+        await self._publish_for_voice(reply)
+
+    async def _publish_for_voice(self, text: str) -> None:
+        """If an owner voice call is active for this same session, the voice
+        subscriber TTSes any `chat.reply` event with non-empty `voice_text`.
+        We publish with `text=""` so the telegram-side chat.reply subscriber
+        (which filters empty text) doesn't double-send what we already sent
+        over Telegram. No call active → no voice subscriber → harmless
+        no-op."""
         try:
             await self._events.publish_global("chat.reply", {
                 "session_id": self._session_id,
                 "text": "",
-                "voice_text": reply,
+                "voice_text": text,
                 "trigger": "agent.chat_turn",
                 "task_id": None,
             })

@@ -11,6 +11,7 @@ gone — those tools no longer exist.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,12 @@ from oncall.config import Paths, Settings
 from oncall.db import Database
 from oncall.events import EventBus
 from oncall.lifecycle import Lifecycle
-from oncall.operator import OPERATOR_TOOLS, AnthropicLLMClient, Operator
+from oncall.operator import (
+    OPERATOR_TOOLS,
+    AnthropicLLMClient,
+    Operator,
+    summarize_llm_error,
+)
 from oncall.operator_memory import Memory
 
 
@@ -696,3 +702,34 @@ async def test_silence_gap_only_on_turns_that_ask_for_it(stack):
         session_id="s2", note="owner voice call started", include_silence_gap=True,
     )
     assert _tail_tag(llm3, "<time-since-last-message>") is None
+
+
+def test_llm_error_summary_digs_out_the_nested_provider_message():
+    """google-genai re-encodes the upstream error document as a STRING inside
+    its own `details` dict, so the actionable sentence sits two JSON levels
+    down while `str(exc)` shows only "429 Too Many Requests" plus an unreadable
+    body. Both halves are useless alone — the summary must reach the sentence.
+
+    Non-API exceptions have no such payload and must keep their type name,
+    which is the only informative part of e.g. `KeyError('session')`."""
+    body = json.dumps({"error": {
+        "code": 429,
+        "message": "Your project has exceeded its monthly spending cap. ",
+        "status": "RESOURCE_EXHAUSTED",
+    }})
+
+    class FakeClientError(Exception):
+        code = 429
+        details = {"message": body, "status": "Too Many Requests"}
+
+    assert summarize_llm_error(FakeClientError(f"429 Too Many Requests. {body}")) == (
+        "429: Your project has exceeded its monthly spending cap."
+    )
+    assert summarize_llm_error(asyncio.TimeoutError()) == (
+        "the model did not respond in time"
+    )
+    assert summarize_llm_error(KeyError("session")) == "KeyError: 'session'"
+    # A brace in a plain error message is not a JSON body to be cut away.
+    assert summarize_llm_error(
+        RuntimeError('bad tool args {"path": null}')
+    ) == 'RuntimeError: bad tool args {"path": null}'
