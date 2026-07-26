@@ -291,6 +291,33 @@ def test_mcp_messenger_unknown_op_mutating() -> None:
     assert v.reason == "unknown_op"
 
 
+# --- schedule (create / list / cancel) classification ---
+
+@pytest.mark.parametrize("extra", [
+    {"op": "create", "prompt": "re-check incident X", "delay_seconds": 3600},
+    {"op": "list"},
+    {"op": "cancel", "schedule_id": "abc"},
+])
+def test_mcp_schedule_ops_readonly(extra: dict) -> None:
+    v = classify("mcp__oncall__schedule", extra)
+    assert v.kind == ClassifierVerdict.READONLY
+
+
+def test_mcp_schedule_create_canonical_carries_prompt() -> None:
+    v = classify(
+        "mcp__oncall__schedule",
+        {"op": "create", "prompt": "re-check incident X", "fire_at": "2026-07-27T09:00:00Z"},
+    )
+    assert "re-check incident X" in v.canonical
+    assert "2026-07-27T09:00:00Z" in v.canonical
+
+
+def test_mcp_schedule_unknown_op_mutating() -> None:
+    v = classify("mcp__oncall__schedule", {"op": "delete_all"})
+    assert v.kind == ClassifierVerdict.MUTATING
+    assert v.reason == "unknown_op"
+
+
 # --- SQL classification via Bash (psql -c '...') ---
 
 def test_bash_psql_select_readonly() -> None:
@@ -445,6 +472,7 @@ ELIDED_FIELDS = [
     ("mcp__oncall__ask_user", "question", {}, 80),
     ("mcp__oncall__memory", "query", {"op": "query"}, 60),
     ("mcp__oncall__memory", "text", {"op": "save"}, 80),
+    ("mcp__oncall__schedule", "prompt", {"op": "create", "delay_seconds": 60}, 80),
 ]
 
 

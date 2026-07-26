@@ -170,6 +170,8 @@ def classify(tool_name: str, tool_input: dict[str, Any]) -> Verdict:
         return _classify_messenger(tool_input)
     if tool_name == "mcp__oncall__memory":
         return _classify_memory(tool_input)
+    if tool_name == "mcp__oncall__schedule":
+        return _classify_schedule(tool_input)
     if tool_name == "mcp__oncall__ask_user":
         q = _elide(str(tool_input.get("question", "")), 80)
         return Verdict(
@@ -1006,6 +1008,51 @@ def _classify_memory(tool_input: dict[str, Any]) -> Verdict:
         kind=ClassifierVerdict.MUTATING,
         canonical=f"memory.{op}",
         blast_radius=f"Unknown memory op '{op}'.",
+        reason="unknown_op",
+    )
+
+
+def _classify_schedule(tool_input: dict[str, Any]) -> Verdict:
+    """Executor's `schedule` tool (create / list / cancel future re-runs).
+
+    `create` writes one local-DB row describing a future executor session. When
+    that session eventually fires it runs through this exact broker/classifier
+    gating like any other executor — it is NOT an auto-approval context — so the
+    act of scheduling has no more un-gated blast radius than `memory.save` or
+    `ask_user`. All three ops are therefore READONLY so the broker auto-allows;
+    `list` and `cancel` touch only the caller's own chat (server-side ownership
+    check), and `cancel` is reversible with no external side effect."""
+    op = str(tool_input.get("op", ""))
+    if op == "create":
+        prompt = _elide(str(tool_input.get("prompt", "")), 80)
+        when = str(tool_input.get("fire_at") or tool_input.get("delay_seconds") or "?")
+        interval = tool_input.get("interval_seconds")
+        return Verdict(
+            kind=ClassifierVerdict.READONLY,
+            canonical=f"schedule.create(prompt={prompt!r}, fire_at={when}, interval={interval})",
+            blast_radius=(
+                "Writes one local-DB row scheduling a future executor session; "
+                "no external effect now. The scheduled session runs through the "
+                "same broker gating when it fires."
+            ),
+        )
+    if op == "list":
+        return Verdict(
+            kind=ClassifierVerdict.READONLY,
+            canonical="schedule.list",
+            blast_radius="Read-only: returns the caller's own pending schedules.",
+        )
+    if op == "cancel":
+        sched_id = str(tool_input.get("schedule_id", "?"))
+        return Verdict(
+            kind=ClassifierVerdict.READONLY,
+            canonical=f"schedule.cancel({sched_id})",
+            blast_radius="Stops a future scheduled re-invocation for the caller's own chat.",
+        )
+    return Verdict(
+        kind=ClassifierVerdict.MUTATING,
+        canonical=f"schedule.{op}",
+        blast_radius=f"Unknown schedule op '{op}'.",
         reason="unknown_op",
     )
 
