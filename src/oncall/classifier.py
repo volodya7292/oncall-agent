@@ -775,8 +775,8 @@ def _docker_readonly(args: list[str]) -> tuple[bool, str | None]:
 def _gh_readonly(args: list[str]) -> tuple[bool, str | None]:
     """`gh <noun> <verb>` (GitHub CLI). Default-deny: only the read verbs in
     `_GH_READONLY_SUB` auto-allow. `gh api` is special (defaults to GET; a
-    non-GET `-X`/`--method` makes it mutating), and `repo clone` writes to disk
-    so it is NOT read-only."""
+    non-GET `-X`/`--method` or any field-parameter flag makes it mutating), and
+    `repo clone` writes to disk so it is NOT read-only."""
     positionals = [a for a in args if not a.startswith("-")]
     if not positionals:
         return False, "gh_no_subcommand"
@@ -789,12 +789,29 @@ def _gh_readonly(args: list[str]) -> tuple[bool, str | None]:
     return False, f"gh_subcommand:{noun}:{verb}"
 
 
+# `gh api` field-parameter flags. Each consumes the next token as its value
+# (`-f VALUE`/`-f=VALUE`/`--field VALUE`/`--field=VALUE` forms), same
+# value-flag convention as `-X`/`--method` above and `_SSH_FLAG_TAKES_ARG` /
+# `_XARGS_VALUE_FLAGS` elsewhere. Their mere presence makes `gh api`
+# auto-switch the request method from GET to POST (per `gh api --help`).
+_GH_API_FIELD_FLAGS: frozenset[str] = frozenset({
+    "-f", "--raw-field", "-F", "--field", "--input",
+})
+
+
 def _gh_api_readonly(args: list[str]) -> tuple[bool, str | None]:
-    """`gh api` issues an HTTP GET by default. `-X`/`--method` overrides the
-    method (both `-X VALUE` and `-X=VALUE`/`--method=VALUE` forms). Read-only
-    only when no method flag is present, or when its value is GET."""
+    """`gh api` issues an HTTP GET by default, but auto-switches to POST when any
+    field-parameter flag (`-f`/`--raw-field`/`-F`/`--field`/`--input`) is
+    present — even with no `-X` flag at all. `-X`/`--method` overrides the method
+    (both `-X VALUE` and `-X=VALUE`/`--method=VALUE` forms).
+
+    Per `gh api --help`, an explicit `--method GET` sends field params as a GET
+    query string, so it overrides the auto-POST. Read-only therefore only when
+    the effective method is GET: an explicit `-X GET`/`--method GET`, or no
+    method flag AND no field flag."""
     has_method = False
     method: str | None = None
+    field_flag: str | None = None
     i = 0
     while i < len(args):
         a = args[i]
@@ -808,12 +825,23 @@ def _gh_api_readonly(args: list[str]) -> tuple[bool, str | None]:
             method = a.split("=", 1)[1]
             i += 1
             continue
+        if a in _GH_API_FIELD_FLAGS:
+            field_flag = field_flag or a
+            i += 2  # flag consumes the next token as its value
+            continue
+        if "=" in a and a.split("=", 1)[0] in _GH_API_FIELD_FLAGS:
+            field_flag = field_flag or a.split("=", 1)[0]
+            i += 1
+            continue
         i += 1
-    if not has_method:
-        return True, None
-    if method is not None and method.upper() == "GET":
-        return True, None
-    return False, f"gh_api_method:{method}"
+    method_is_get = method is not None and method.upper() == "GET"
+    # An explicit non-GET method is mutating regardless of field flags.
+    if has_method and not method_is_get:
+        return False, f"gh_api_method:{method}"
+    # A field flag forces POST unless an explicit GET method overrides it.
+    if field_flag is not None and not method_is_get:
+        return False, f"gh_api_field_flag:{field_flag}"
+    return True, None
 
 
 def _aws_readonly(args: list[str]) -> tuple[bool, str | None]:

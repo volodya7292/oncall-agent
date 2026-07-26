@@ -135,6 +135,10 @@ READONLY_BASH = [
     "gh api -X GET search/issues -f q=foo",
     "gh api --method GET repos/cli/cli/issues",
     "gh api --method=GET repos/cli/cli/issues",
+    # An explicit GET overrides gh's auto-POST-when-field-present, so field
+    # flags alongside `-X GET`/`--method GET` stay read-only.
+    "gh api repos/cli/cli/issues/1 -f body=x -X GET",
+    "gh api --method GET search/issues -F count=1",
 ]
 
 
@@ -225,6 +229,13 @@ MUTATING_BASH = [
     "gh api -X POST repos/cli/cli/issues/1/comments -f body=hi",
     "gh api --method DELETE repos/cli/cli/issues/1",
     "gh api --method=PATCH repos/cli/cli/issues/1",
+    # Field-parameter flags auto-switch gh's method to POST even with no `-X`,
+    # so they must NOT auto-allow as read-only.
+    "gh api repos/cli/cli/issues/123/comments -f body=pwned",
+    "gh api repos/cli/cli/issues/123/comments --field body=pwned",
+    "gh api repos/cli/cli/issues/123/reactions -F count=1",
+    "gh api repos/cli/cli/issues --raw-field title=x",
+    "gh api repos/cli/cli/issues --input payload.json",
 ]
 
 
@@ -423,6 +434,9 @@ def test_bash_ssh_recurses_into_remote_command(
     ("gh secret set FOO", "gh_subcommand:secret:set"),  # noun not in the table at all
     # A non-GET api method names the offending method.
     ("gh api -X POST repos/cli/cli/issues/1/comments", "gh_api_method:POST"),
+    # A field flag with no `-X` still forces POST; reason names the flag.
+    ("gh api repos/cli/cli/issues/1/comments -f body=x", "gh_api_field_flag:-f"),
+    ("gh api repos/cli/cli/issues -F count=1", "gh_api_field_flag:-F"),
 ])
 def test_bash_gh_mutating_reason(cmd: str, reason_prefix: str) -> None:
     v = classify("Bash", {"command": cmd})
