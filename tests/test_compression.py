@@ -18,6 +18,8 @@ import pytest
 
 from oncall.approval_client import HttpLongPollApprovalClient
 from oncall.broker import Broker
+
+from tests.support import stub_classifier
 from oncall.config import Paths, Settings
 from oncall.db import Database
 from oncall.events import EventBus
@@ -105,7 +107,7 @@ async def stack(settings, tmp_path, monkeypatch):
     await db.connect()
     events = EventBus(db)
     approval_client = HttpLongPollApprovalClient()
-    broker = Broker(db, approval_client, events.publish)
+    broker = Broker(db, approval_client, events.publish, classifier=stub_classifier())
     lifecycle = Lifecycle(
         db=db, broker=broker, approval_client=approval_client,
         events=events, settings=settings, paths=Paths(),

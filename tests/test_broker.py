@@ -28,6 +28,8 @@ from oncall.approval_client import (
     phrases_match,
 )
 from oncall.broker import Broker, MAX_CONSECUTIVE_DENIALS
+
+from tests.support import stub_classifier
 from oncall.db import Database
 from oncall.models import Task, TaskState
 
@@ -127,7 +129,7 @@ def test_kill_phrase_detection() -> None:
 @pytest.mark.asyncio
 async def test_readonly_auto_allows(db, events):
     task = await _make_task(db)
-    broker = Broker(db, AutoDenyApprovalClient(), events)  # deny would fail if escalated
+    broker = Broker(db, AutoDenyApprovalClient(), events, classifier=stub_classifier("ls "))  # deny would fail if escalated
     result = await broker.decide(
         session_id=task.session_id,
         tool_use_id="tu_1",
@@ -151,7 +153,7 @@ async def test_readonly_auto_allows(db, events):
 @pytest.mark.asyncio
 async def test_catastrophic_auto_denies(db, events):
     task = await _make_task(db)
-    broker = Broker(db, AutoAllowApprovalClient(), events)  # allow would fail if escalated
+    broker = Broker(db, AutoAllowApprovalClient(), events, classifier=stub_classifier("ls "))  # allow would fail if escalated
     result = await broker.decide(
         session_id=task.session_id,
         tool_use_id="tu_x",
@@ -180,7 +182,7 @@ async def test_unknown_tool_auto_denies_without_escalating(db, events):
     task = await _make_task(db)
     # Auto-ALLOW client: if the broker escalated, this would come back
     # allow. Asserting deny proves the owner was never consulted.
-    broker = Broker(db, AutoAllowApprovalClient(), events)
+    broker = Broker(db, AutoAllowApprovalClient(), events, classifier=stub_classifier("ls "))
     result = await broker.decide(
         session_id=task.session_id,
         tool_use_id="tu_unknown",
@@ -204,7 +206,7 @@ async def test_unknown_tool_auto_denies_without_escalating(db, events):
 async def test_mutating_escalates_and_phrase_matches(db, events):
     task = await _make_task(db)
     client = HttpLongPollApprovalClient()
-    broker = Broker(db, client, events)
+    broker = Broker(db, client, events, classifier=stub_classifier("ls "))
 
     async def respond_when_ready():
         # Poll for a pending approval and resolve via submit_response (the API path).
@@ -236,7 +238,7 @@ async def test_mutating_escalates_and_phrase_matches(db, events):
 async def test_phrase_mismatch_coerces_deny(db, events):
     task = await _make_task(db)
     client = HttpLongPollApprovalClient()
-    broker = Broker(db, client, events)
+    broker = Broker(db, client, events, classifier=stub_classifier("ls "))
 
     async def respond_when_ready():
         for _ in range(200):
@@ -270,7 +272,7 @@ async def test_explicit_user_deny_names_user_as_source(db, events):
     deny reason returned to the executor must name the user as the source."""
     task = await _make_task(db)
     client = HttpLongPollApprovalClient()
-    broker = Broker(db, client, events)
+    broker = Broker(db, client, events, classifier=stub_classifier("ls "))
 
     async def respond_when_ready():
         for _ in range(200):
@@ -305,7 +307,7 @@ async def test_explicit_user_deny_names_user_as_source(db, events):
 @pytest.mark.asyncio
 async def test_resume_dedup_returns_cached(db, events):
     task = await _make_task(db)
-    broker = Broker(db, AutoAllowApprovalClient(), events)
+    broker = Broker(db, AutoAllowApprovalClient(), events, classifier=stub_classifier("ls "))
     first = await broker.decide(
         session_id=task.session_id,
         tool_use_id="tu_dup",
@@ -333,7 +335,7 @@ async def test_resume_dedup_returns_cached(db, events):
 @pytest.mark.asyncio
 async def test_consecutive_denial_backstop(db, events):
     task = await _make_task(db)
-    broker = Broker(db, AutoDenyApprovalClient(), events, max_consecutive_denials=2)
+    broker = Broker(db, AutoDenyApprovalClient(), events, classifier=stub_classifier("ls "), max_consecutive_denials=2)
 
     async def do_one(tu_id: str):
         return await broker.decide(

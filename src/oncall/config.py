@@ -284,6 +284,16 @@ class Settings(BaseSettings):
     # Empty string disables auto-extraction (operator memory still works for
     # retrieval, just never grows). Defaults to the operator model.
     oncall_memory_extract_model: str = ""
+    # Model that judges readonly-vs-mutating for every shell command the
+    # executor runs (see classifier.py). It sits on the hot path of each Bash
+    # call, so a cheap fast model is the intent — judgment, not knowledge, is
+    # what it needs. Empty falls back to the extract model, then the operator
+    # model. Whatever is set here must be valid for ONCALL_OPERATOR_BACKEND:
+    # the classifier shares the operator's LLM client, not a separate one.
+    #
+    # Unreachable or misconfigured means every shell command escalates to an
+    # approval prompt rather than auto-allowing — noisy, never unsafe.
+    oncall_classifier_model: str = ""
     oncall_memory_hybrid_alpha: float = 0.7
     oncall_memory_hybrid_beta: float = 0.3
     # Below the worst true-positive score measured on the real store under

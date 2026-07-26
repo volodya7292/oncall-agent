@@ -83,16 +83,14 @@ class ClassifierVerdict(StrEnum):
 
 
 class Verdict(BaseModel):
-    """Output of the deterministic classifier."""
+    """Output of the classifier. `blast_radius` is human-facing — it is what
+    the owner reads on the approval card — while `reason` is a short tag for
+    logs and for the broker's unknown-tool branch."""
 
     kind: ClassifierVerdict
     canonical: str
     blast_radius: str
     reason: str | None = None
-    # If the command embeds a script (e.g. `python -c '...'` or `python << EOF`),
-    # we extract it here so the operator can summarize the script before reading
-    # the approval to the user. {"language": "python", "source": "..."}.
-    embedded_code: dict[str, str] | None = None
 
 
 class ApprovalRequest(BaseModel):

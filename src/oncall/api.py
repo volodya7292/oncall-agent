@@ -31,6 +31,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from .approval_client import HttpLongPollApprovalClient, is_kill_phrase
 from .broker import Broker
+from .classifier import Classifier
 from .config import get_paths, get_settings
 from .db import Database
 from .developer_manager import DeveloperManager
@@ -278,15 +279,6 @@ def create_app() -> FastAPI:
                 return f"@{username}"
             return None
 
-        broker = Broker(
-            db, approval_client, events.publish,
-            approval_timeout_seconds=settings.oncall_approval_timeout_seconds,
-            chat_label_resolver=_resolve_chat_label,
-        )
-        lifecycle = Lifecycle(
-            db=db, broker=broker, approval_client=approval_client,
-            events=events, settings=settings, paths=paths,
-        )
         # Operator LLM backend choice. "gemini" uses the native AI Studio
         # API and is the default — it preserves ack-first (text + tool_call
         # in the same response) which the Vercel gateway's gemma routing
@@ -360,6 +352,35 @@ def create_app() -> FastAPI:
                 "falling back to vercel gateway",
                 settings.oncall_operator_backend,
             )
+
+        # The classifier shares the operator's LLM client — one backend, one
+        # set of credentials. With no client at all it still classifies the
+        # MCP/native tool surface, and fails every shell command closed to an
+        # approval prompt; that is loud rather than dangerous, and a daemon
+        # with no LLM has no working operator either.
+        classifier_model = (
+            settings.oncall_classifier_model
+            or settings.oncall_memory_extract_model
+            or settings.oncall_operator_model
+        )
+        if llm is None:
+            log.warning(
+                "no LLM backend configured — every shell command will require "
+                "manual approval (catastrophic ones are still auto-denied)",
+            )
+        else:
+            log.info("classifier model: %s", classifier_model)
+        broker = Broker(
+            db, approval_client, events.publish,
+            classifier=Classifier(llm, classifier_model),
+            approval_timeout_seconds=settings.oncall_approval_timeout_seconds,
+            chat_label_resolver=_resolve_chat_label,
+        )
+        lifecycle = Lifecycle(
+            db=db, broker=broker, approval_client=approval_client,
+            events=events, settings=settings, paths=paths,
+        )
+
         # Primary Telegram userbot — runs on the owner's account. Inbound
         # gating happens at the DM allowlist (/allowdm); on top of that the
         # agent account's own chat is dropped unconditionally so its replies

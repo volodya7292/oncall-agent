@@ -15,11 +15,9 @@ import asyncio
 
 import pytest
 
-from oncall.classifier import classify
 from oncall.config import Settings
 from oncall.developer_manager import DeveloperJob, DeveloperManager
 from oncall.developer_runner import _MAX_REGISTRY, DeveloperRunner, _DevJob
-from oncall.models import ClassifierVerdict
 
 
 def _settings(**over) -> Settings:
@@ -120,20 +118,6 @@ def test_registry_eviction_keeps_running():
     r._register(running)
     assert len(r._jobs) == _MAX_REGISTRY
     assert "live" in r._jobs  # running is never evicted
-
-
-# --------------------------------------------------------------------------
-# classifier gating
-# --------------------------------------------------------------------------
-
-def test_classify_invoke_developer_mutating():
-    v = classify("mcp__oncall__invoke_developer", {"folder": "/repo", "task": "fix bug"})
-    assert v.kind == ClassifierVerdict.MUTATING
-
-
-def test_classify_cancel_developer_readonly():
-    v = classify("mcp__oncall__cancel_developer", {"developer_id": "d1"})
-    assert v.kind == ClassifierVerdict.READONLY
 
 
 # --------------------------------------------------------------------------

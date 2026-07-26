@@ -27,10 +27,9 @@ from typing import Any
 
 import httpx
 
-from .classifier import classify
+from .classifier import catastrophic_reason
 from .config import Settings
 from .developer_runner import DeveloperRunner
-from .models import ClassifierVerdict
 
 
 log = logging.getLogger(__name__)
@@ -53,9 +52,11 @@ def _truncate(s: str, limit: int = _MAX_OUTPUT_BYTES) -> str:
 
 async def _run_bash(command: str) -> dict[str, Any]:
     # Backstop: refuse catastrophic shapes regardless of upstream gating.
-    verdict = classify("mcp__oncall__laptop", {"op": "bash", "command": command})
-    if verdict.kind == ClassifierVerdict.CATASTROPHIC:
-        return {"error": "blocked_catastrophic", "detail": verdict.reason or "refused"}
+    # This is the deterministic half of the classifier only — no model call,
+    # so the worker keeps working with no credentials and no reachable LLM.
+    reason = catastrophic_reason(command)
+    if reason:
+        return {"error": "blocked_catastrophic", "detail": reason}
     try:
         proc = await asyncio.create_subprocess_shell(
             command,

@@ -9,7 +9,7 @@ name, an input dict, and the CLI's per-call `tool_use_id`. The broker:
 
   1. Deduplicates on `(session_id, tool_use_id)` so `--resume` after an
      orchestrator crash doesn't re-prompt the user.
-  2. Runs the deterministic classifier.
+  2. Runs the classifier (deterministic catastrophic scan + LLM shell judgment).
   3. Auto-allows read-only; auto-denies catastrophic (defense in depth).
   4. For mutating: persists a pending approval row, publishes an event, and
      awaits the `ApprovalClient` (which is either a test stub or the
@@ -30,7 +30,7 @@ from .approval_client import (
     phrases_match,
 )
 from .audit import broker_log, fmt
-from .classifier import classify, enrich_canonical_with_chat_label
+from .classifier import Classifier, enrich_canonical_with_chat_label
 from .db import Database
 from .models import (
     ApprovalRequest,
@@ -58,6 +58,7 @@ class Broker:
         approval_client: ApprovalClient,
         publish_event: EventPublisher,
         *,
+        classifier: Classifier,
         max_consecutive_denials: int = MAX_CONSECUTIVE_DENIALS,
         approval_timeout_seconds: int | None = None,
         chat_label_resolver: ChatLabelResolver | None = None,
@@ -65,6 +66,7 @@ class Broker:
         self._db = db
         self._client = approval_client
         self._publish = publish_event
+        self._classifier = classifier
         self._max_denials = max_consecutive_denials
         # None → use the ApprovalRequest model's own default. In production
         # api.py passes settings.oncall_approval_timeout_seconds.
@@ -118,8 +120,9 @@ class Broker:
             ))
             return await self._await_pending_resolution(pending, tool_input)
 
-        # 2. Classify (deterministic, model-free).
-        verdict = classify(tool_name, tool_input)
+        # 2. Classify. Catastrophic is decided deterministically; readonly vs
+        # mutating for shell commands is an LLM judgment that fails closed.
+        verdict = await self._classifier.classify(tool_name, tool_input)
         # Enrich messenger-op canonicals with a human-readable chat label
         # ("Rostislav (1756925023)" instead of bare digits) so approval
         # prompts read naturally. Pure cosmetics — the verdict.kind and

@@ -9,9 +9,7 @@ from __future__ import annotations
 
 import asyncio
 
-from oncall.classifier import classify
 from oncall.laptop_bridge import LaptopBridge
-from oncall.models import ClassifierVerdict
 
 
 def _bridge(*, presence=60.0, poll=0.2, job=0.3) -> LaptopBridge:
@@ -93,21 +91,3 @@ async def test_unknown_op_rejected():
     assert result["error"] == "unknown_laptop_op"
 
 
-# ---- classifier gating: the broker gates laptop ops via these verdicts ----
-
-def test_laptop_bash_inherits_full_bash_classification():
-    ro = classify("mcp__oncall__laptop", {"op": "bash", "command": "ls -la"})
-    assert ro.kind == ClassifierVerdict.READONLY
-
-    mut = classify("mcp__oncall__laptop", {"op": "bash", "command": "rm foo.txt"})
-    assert mut.kind == ClassifierVerdict.MUTATING
-
-    cat = classify("mcp__oncall__laptop", {"op": "bash", "command": "rm -rf /*"})
-    assert cat.kind == ClassifierVerdict.CATASTROPHIC
-
-
-def test_laptop_file_ops_classification():
-    assert classify("mcp__oncall__laptop", {"op": "read_file", "path": "/x"}).kind == ClassifierVerdict.READONLY
-    assert classify("mcp__oncall__laptop", {"op": "glob", "pattern": "*.py"}).kind == ClassifierVerdict.READONLY
-    assert classify("mcp__oncall__laptop", {"op": "grep", "pattern": "TODO"}).kind == ClassifierVerdict.READONLY
-    assert classify("mcp__oncall__laptop", {"op": "write_file", "path": "/x"}).kind == ClassifierVerdict.MUTATING
