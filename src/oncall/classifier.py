@@ -108,6 +108,18 @@ _DOCKER_READONLY_SUB: frozenset[str] = frozenset({
     "ps", "inspect", "logs", "images", "version", "info", "history",
     "stats", "port",
 })
+# `gh <noun> <verb>` — the read-only verbs per noun. Any noun/verb not listed
+# here is default-denied (mutating). `api` and `repo clone` are special-cased in
+# `_gh_readonly`. Note `run download` / `release download` are deliberately
+# absent: they write files to disk.
+_GH_READONLY_SUB: dict[str, frozenset[str]] = {
+    "run": frozenset({"list", "view", "watch"}),
+    "pr": frozenset({"list", "view", "diff", "checks", "status"}),
+    "issue": frozenset({"list", "view"}),
+    "repo": frozenset({"view"}),
+    "workflow": frozenset({"list", "view"}),
+    "auth": frozenset({"status"}),
+}
 _REDIS_READONLY_CMDS: frozenset[str] = frozenset({
     "GET", "MGET", "HGET", "HGETALL", "HKEYS", "HVALS", "KEYS", "SCAN",
     "HSCAN", "SSCAN", "ZSCAN", "DBSIZE", "INFO", "TYPE", "EXISTS", "TTL",
@@ -543,6 +555,8 @@ def _program_is_readonly(program: str, args: list[str]) -> tuple[bool, str | Non
         return _kubectl_readonly(args)
     if program == "docker":
         return _docker_readonly(args)
+    if program == "gh":
+        return _gh_readonly(args)
     if program == "ssh":
         return _ssh_readonly(args)
     if program == "aws":
@@ -756,6 +770,50 @@ def _docker_readonly(args: list[str]) -> tuple[bool, str | None]:
     if sub not in _DOCKER_READONLY_SUB:
         return False, f"docker_subcommand:{sub}"
     return True, None
+
+
+def _gh_readonly(args: list[str]) -> tuple[bool, str | None]:
+    """`gh <noun> <verb>` (GitHub CLI). Default-deny: only the read verbs in
+    `_GH_READONLY_SUB` auto-allow. `gh api` is special (defaults to GET; a
+    non-GET `-X`/`--method` makes it mutating), and `repo clone` writes to disk
+    so it is NOT read-only."""
+    positionals = [a for a in args if not a.startswith("-")]
+    if not positionals:
+        return False, "gh_no_subcommand"
+    noun = positionals[0]
+    if noun == "api":
+        return _gh_api_readonly(args)
+    verb = positionals[1] if len(positionals) >= 2 else ""
+    if verb in _GH_READONLY_SUB.get(noun, frozenset()):
+        return True, None
+    return False, f"gh_subcommand:{noun}:{verb}"
+
+
+def _gh_api_readonly(args: list[str]) -> tuple[bool, str | None]:
+    """`gh api` issues an HTTP GET by default. `-X`/`--method` overrides the
+    method (both `-X VALUE` and `-X=VALUE`/`--method=VALUE` forms). Read-only
+    only when no method flag is present, or when its value is GET."""
+    has_method = False
+    method: str | None = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-X", "--method"):
+            has_method = True
+            method = args[i + 1] if i + 1 < len(args) else None
+            i += 2
+            continue
+        if a.startswith("-X=") or a.startswith("--method="):
+            has_method = True
+            method = a.split("=", 1)[1]
+            i += 1
+            continue
+        i += 1
+    if not has_method:
+        return True, None
+    if method is not None and method.upper() == "GET":
+        return True, None
+    return False, f"gh_api_method:{method}"
 
 
 def _aws_readonly(args: list[str]) -> tuple[bool, str | None]:

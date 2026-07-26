@@ -113,6 +113,28 @@ READONLY_BASH = [
 
     # awk pure-text processing (no system/redirect)
     "ps aux | awk '{print $1}'",
+
+    # gh (GitHub CLI) — read-only noun/verb surface.
+    "gh run list",
+    "gh run list --branch main",
+    "gh run view 123",
+    "gh run watch 456 --exit-status",
+    "gh pr list",
+    "gh pr view 12",
+    "gh pr diff 12",
+    "gh pr checks 12",
+    "gh pr status",
+    "gh issue list",
+    "gh issue view 7",
+    "gh repo view cli/cli",
+    "gh workflow list",
+    "gh workflow view deploy.yml",
+    "gh auth status",
+    # `gh api` defaults to GET; no method flag and explicit GET are read-only.
+    "gh api repos/cli/cli/releases",
+    "gh api -X GET search/issues -f q=foo",
+    "gh api --method GET repos/cli/cli/issues",
+    "gh api --method=GET repos/cli/cli/issues",
 ]
 
 
@@ -191,6 +213,18 @@ MUTATING_BASH = [
     # python invocations — model can't tell us what they do without summarization
     "python3 /tmp/clone_popups.py",
     "uv run /tmp/spectral_analysis.py 'arg with spaces'",
+
+    # gh — mutating verbs and the disk-writing / non-GET cases.
+    "gh repo clone cli/cli",  # writes a working tree to disk
+    "gh run download 123",  # writes artifacts to disk
+    "gh pr create --fill",
+    "gh pr merge 12",
+    "gh issue create --title x",
+    "gh workflow run deploy.yml",
+    "gh release download v1.0",
+    "gh api -X POST repos/cli/cli/issues/1/comments -f body=hi",
+    "gh api --method DELETE repos/cli/cli/issues/1",
+    "gh api --method=PATCH repos/cli/cli/issues/1",
 ]
 
 
@@ -375,6 +409,25 @@ def test_bash_ssh_recurses_into_remote_command(
     assert v.kind == expected_kind, (cmd, v.reason)
     if reason_marker is not None:
         assert v.reason and reason_marker in v.reason, v.reason
+
+
+# ---------------------------------------------------------------------------
+# gh (GitHub CLI) — reason-string contract for the default-deny fallthrough.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cmd, reason_prefix", [
+    # Uncovered noun/verb falls through to the informative default-deny reason.
+    ("gh issue create --title x", "gh_subcommand:issue:create"),
+    ("gh repo clone cli/cli", "gh_subcommand:repo:clone"),
+    ("gh secret set FOO", "gh_subcommand:secret:set"),  # noun not in the table at all
+    # A non-GET api method names the offending method.
+    ("gh api -X POST repos/cli/cli/issues/1/comments", "gh_api_method:POST"),
+])
+def test_bash_gh_mutating_reason(cmd: str, reason_prefix: str) -> None:
+    v = classify("Bash", {"command": cmd})
+    assert v.kind == ClassifierVerdict.MUTATING, (cmd, v.reason)
+    assert v.reason and v.reason.startswith(reason_prefix), v.reason
 
 
 # ---------------------------------------------------------------------------
