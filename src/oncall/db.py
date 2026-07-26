@@ -261,6 +261,28 @@ CREATE TABLE IF NOT EXISTS ask_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_ask_requests_chat_state
   ON ask_requests(chat_session_id, state);
+
+-- Executor-scheduled future re-invocations (the `schedule` MCP tool). When
+-- `fire_at` comes due, the scheduling loop spawns a fresh executor task with
+-- `prompt` and delivers its result back to `chat_session_id` via the normal
+-- result-delivery path. `interval_seconds` NULL ⇒ one-off (marked done after
+-- firing); non-null ⇒ recurring (fire_at is bumped forward by the interval).
+-- `consecutive_failures` counts back-to-back firing failures for one check so
+-- a permanently-broken schedule can be auto-cancelled instead of retried every
+-- poll.
+CREATE TABLE IF NOT EXISTS scheduled_checks (
+    id TEXT PRIMARY KEY,
+    chat_session_id TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    fire_at TEXT NOT NULL,
+    interval_seconds INTEGER,
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending | done | cancelled
+    created_at TEXT NOT NULL,
+    last_fired_at TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_checks_due
+  ON scheduled_checks(status, fire_at);
 """
 
 
@@ -1371,6 +1393,122 @@ class Database:
         await self.conn.commit()
         return rowcount
 
+    # ---- scheduled checks (executor `schedule` tool) ----
+
+    async def create_scheduled_check(
+        self, *,
+        check_id: str,
+        chat_session_id: str,
+        prompt: str,
+        fire_at: datetime,
+        interval_seconds: int | None,
+    ) -> None:
+        await self.conn.execute(
+            "INSERT INTO scheduled_checks "
+            "(id, chat_session_id, prompt, fire_at, interval_seconds, "
+            " status, created_at, last_fired_at, consecutive_failures) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?, NULL, 0)",
+            (check_id, chat_session_id, prompt, iso(fire_at),
+             interval_seconds, iso(utcnow())),
+        )
+        await self.conn.commit()
+
+    async def list_due_scheduled_checks(self, now: datetime) -> list[dict[str, Any]]:
+        """Pending checks whose `fire_at` is at or before `now`, oldest-due
+        first. `fire_at` is stored via `iso()` (always the same UTC `+00:00`
+        format), so lexicographic comparison matches chronological order."""
+        async with self.conn.execute(
+            "SELECT * FROM scheduled_checks "
+            "WHERE status = 'pending' AND fire_at <= ? ORDER BY fire_at ASC",
+            (iso(now),),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_scheduled_check(r) for r in rows]
+
+    async def list_pending_scheduled_checks_for_chat(
+        self, chat_session_id: str,
+    ) -> list[dict[str, Any]]:
+        async with self.conn.execute(
+            "SELECT * FROM scheduled_checks "
+            "WHERE chat_session_id = ? AND status = 'pending' "
+            "ORDER BY fire_at ASC",
+            (chat_session_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_scheduled_check(r) for r in rows]
+
+    async def get_scheduled_check(self, check_id: str) -> dict[str, Any] | None:
+        async with self.conn.execute(
+            "SELECT * FROM scheduled_checks WHERE id = ?", (check_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_scheduled_check(row) if row else None
+
+    async def reschedule_scheduled_check(
+        self, check_id: str, *, next_fire_at: datetime, fired_at: datetime,
+    ) -> None:
+        """A recurring check fired: bump `fire_at` forward, stamp
+        `last_fired_at`, and clear the failure counter (this firing succeeded)."""
+        await self.conn.execute(
+            "UPDATE scheduled_checks SET fire_at = ?, last_fired_at = ?, "
+            "consecutive_failures = 0 WHERE id = ?",
+            (iso(next_fire_at), iso(fired_at), check_id),
+        )
+        await self.conn.commit()
+
+    async def mark_scheduled_check_done(
+        self, check_id: str, *, fired_at: datetime,
+    ) -> None:
+        """A one-off check fired: mark it done so it never fires again."""
+        await self.conn.execute(
+            "UPDATE scheduled_checks SET status = 'done', last_fired_at = ?, "
+            "consecutive_failures = 0 WHERE id = ?",
+            (iso(fired_at), check_id),
+        )
+        await self.conn.commit()
+
+    async def record_scheduled_check_failure(self, check_id: str) -> int:
+        """Increment the check's consecutive-failure counter and return the
+        new value. The scheduling loop uses this to auto-cancel a check that
+        keeps failing to fire rather than retrying it every poll forever."""
+        await self.conn.execute(
+            "UPDATE scheduled_checks "
+            "SET consecutive_failures = consecutive_failures + 1 WHERE id = ?",
+            (check_id,),
+        )
+        async with self.conn.execute(
+            "SELECT consecutive_failures FROM scheduled_checks WHERE id = ?",
+            (check_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        await self.conn.commit()
+        return int(row["consecutive_failures"]) if row else 0
+
+    async def cancel_scheduled_check(
+        self, check_id: str, *, chat_session_id: str | None = None,
+    ) -> bool:
+        """Cancel a still-pending check. When `chat_session_id` is given the
+        cancel only applies to that chat's own checks (so the `schedule` tool
+        can't cancel another session's schedule). Returns True if a pending
+        row was actually cancelled, False otherwise (already fired/cancelled,
+        wrong chat, or unknown id)."""
+        if chat_session_id is not None:
+            sql = (
+                "UPDATE scheduled_checks SET status = 'cancelled' "
+                "WHERE id = ? AND chat_session_id = ? AND status = 'pending'"
+            )
+            params: tuple[Any, ...] = (check_id, chat_session_id)
+        else:
+            sql = (
+                "UPDATE scheduled_checks SET status = 'cancelled' "
+                "WHERE id = ? AND status = 'pending'"
+            )
+            params = (check_id,)
+        async with self.conn.execute(sql, params) as cur:
+            rowcount = cur.rowcount or 0
+        await self.conn.commit()
+        return rowcount > 0
+
     async def get_inbox_message(self, inbox_id: str) -> dict[str, Any] | None:
         async with self.conn.execute(
             "SELECT * FROM messenger_inbox WHERE id = ?", (inbox_id,),
@@ -1624,6 +1762,20 @@ def _row_to_inbox(row: aiosqlite.Row) -> dict[str, Any]:
         "received_at": row["received_at"],
         "read_at": row["read_at"],
         "replied_message_id": row["replied_message_id"],
+    }
+
+
+def _row_to_scheduled_check(row: aiosqlite.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "chat_session_id": row["chat_session_id"],
+        "prompt": row["prompt"],
+        "fire_at": row["fire_at"],
+        "interval_seconds": row["interval_seconds"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "last_fired_at": row["last_fired_at"],
+        "consecutive_failures": row["consecutive_failures"],
     }
 
 

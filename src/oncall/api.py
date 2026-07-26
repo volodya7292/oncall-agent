@@ -19,7 +19,7 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from typing import Any, Literal
@@ -39,6 +39,7 @@ from .events import EventBus
 from .laptop_bridge import LaptopBridge
 from .lifecycle import Lifecycle
 from .local_claude import ClaudeCliRunner
+from .models import utcnow
 from .operator import (
     AnthropicLLMClient,
     GatewayLLMClient,
@@ -178,6 +179,21 @@ class DeveloperDispatchBody(BaseModel):
     session_id: str | None = None
     op: str  # developer_start | developer_cancel
     input: dict[str, Any] = {}
+
+
+class ScheduleOpBody(BaseModel):
+    op: Literal["create", "list", "cancel"]
+    # Calling executor's session id (forwarded by the MCP proxy) — resolved to
+    # the task's chat session so the scheduled check notifies the right user
+    # and a session can only see/cancel its own schedules.
+    session_id: str | None = None
+    # create:
+    prompt: str | None = None
+    delay_seconds: float | None = None
+    fire_at: str | None = None          # ISO 8601; alternative to delay_seconds
+    interval_seconds: int | None = None  # null = one-off, non-null = recurring
+    # cancel:
+    schedule_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +522,21 @@ def create_app() -> FastAPI:
                 name="memory-dedup",
             )
             _supervise_bg_task(memory_dedup_task, events, notify_sid, "memory-dedup")
+        # Scheduling: fire due `scheduled_checks` rows (the executor's
+        # `schedule` tool). Firing spawns a fresh executor task per check whose
+        # result is delivered by the result-delivery loop — so it's gated on
+        # the operator being up (no operator ⇒ no result delivery ⇒ the check
+        # would run but its answer couldn't reach the user).
+        scheduling_task: asyncio.Task | None = None
+        if operator is not None:
+            scheduling_task = asyncio.create_task(
+                _scheduling_loop(
+                    db=db, lifecycle=lifecycle,
+                    events=events, notify_session_id=notify_sid,
+                ),
+                name="scheduling",
+            )
+            _supervise_bg_task(scheduling_task, events, notify_sid, "scheduling")
         # Memory-embedding rebuild: if the configured embed model differs
         # from what stored rows were last embedded with, kick off a
         # background re-embed pass. Retrieval is already filtering stale
@@ -546,7 +577,10 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
-            for bg_task in (auto_ping_task, inbox_drain_task, memory_dedup_task):
+            for bg_task in (
+                auto_ping_task, inbox_drain_task, memory_dedup_task,
+                scheduling_task,
+            ):
                 if bg_task is None:
                     continue
                 bg_task.cancel()
@@ -1028,6 +1062,114 @@ async def _memory_dedup_loop(
                 if events is not None:
                     await _notify_system_error(
                         events, notify_session_id, "memory-dedup",
+                        RuntimeError(f"giving up after {consecutive_crashes} consecutive crashes — fix and restart"),
+                    )
+                raise
+
+
+# How often the scheduling loop checks for due scheduled_checks rows. Firing
+# is cheap (it just enqueues an executor task), so a tight-ish poll keeps a
+# one-off "in 90 seconds" check roughly on time without busy-waiting.
+_SCHEDULING_POLL_INTERVAL_SECONDS = 30.0
+# Floor on a recurring check's period. Each fire spawns a real executor
+# (LLM + tool calls); anything tighter than a minute would let the model
+# schedule a self-inflicted busy loop.
+_SCHEDULED_CHECK_MIN_INTERVAL_SECONDS = 60
+# A scheduled check that fails to even ENQUEUE its executor this many times in
+# a row is auto-cancelled instead of retried every poll forever (a stuck row
+# would otherwise notify the owner on each poll). Firing failures are rare —
+# enqueue is a local DB insert + queue put — so this only trips on a real bug.
+_SCHEDULED_CHECK_MAX_FIRE_FAILURES = 5
+
+
+async def _fire_scheduled_check(
+    *, db: Database, lifecycle: Lifecycle, check: dict[str, Any], now: datetime,
+) -> None:
+    """Spawn a fresh executor task for one due check, then advance its
+    schedule. The executor re-does the actual work (re-search, re-read, …)
+    from `prompt`; its result reaches the user through the normal
+    result-delivery loop because the task is dispatched with the check's
+    chat session. A recurring check's `fire_at` is bumped to `now + interval`
+    (not old_fire_at + interval) so a stretch of daemon downtime fires once on
+    recovery rather than storming through every missed slot."""
+    await lifecycle.submit_task(
+        prompt=check["prompt"],
+        chat_session_id=check["chat_session_id"],
+    )
+    interval = check["interval_seconds"]
+    if interval:
+        await db.reschedule_scheduled_check(
+            check["id"],
+            next_fire_at=now + timedelta(seconds=int(interval)),
+            fired_at=now,
+        )
+    else:
+        await db.mark_scheduled_check_done(check["id"], fired_at=now)
+
+
+async def _scheduling_poll(*, db: Database, lifecycle: Lifecycle) -> int:
+    """One poll tick: fire every due check. A single check's failure is
+    isolated (logged + failure-counted, and auto-cancelled after too many)
+    so one bad row can't stall the others or crash the loop. Only an
+    unexpected failure of the due-query itself propagates — that's the
+    loop-level crash the circuit breaker guards. Returns the number fired."""
+    now = utcnow()
+    due = await db.list_due_scheduled_checks(now)
+    fired = 0
+    for check in due:
+        try:
+            await _fire_scheduled_check(db=db, lifecycle=lifecycle, check=check, now=now)
+            fired += 1
+        except Exception:
+            log.exception("scheduling: failed to fire check %s", check.get("id"))
+            try:
+                fails = await db.record_scheduled_check_failure(check["id"])
+                if fails >= _SCHEDULED_CHECK_MAX_FIRE_FAILURES:
+                    await db.cancel_scheduled_check(check["id"])
+                    log.error(
+                        "scheduling: check %s failed to fire %d times in a row "
+                        "— auto-cancelled",
+                        check["id"], fails,
+                    )
+            except Exception:
+                log.exception(
+                    "scheduling: bookkeeping after fire failure of %s crashed",
+                    check.get("id"),
+                )
+    return fired
+
+
+async def _scheduling_loop(
+    *, db: Database, lifecycle: Lifecycle,
+    poll_interval_seconds: float = _SCHEDULING_POLL_INTERVAL_SECONDS,
+    events: "EventBus | None" = None,
+    notify_session_id: str | None = None,
+) -> None:
+    """Periodically fire due scheduled checks. Single-tick failures log +
+    notify and the next tick retries; 3 consecutive failures trip the circuit
+    breaker and the task exits (the supervise callback fires the final
+    notification). Mirrors `_memory_dedup_loop`."""
+    consecutive_crashes = 0
+    while True:
+        await asyncio.sleep(poll_interval_seconds)
+        try:
+            await _scheduling_poll(db=db, lifecycle=lifecycle)
+            consecutive_crashes = 0
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            consecutive_crashes += 1
+            log.exception(
+                "scheduling: poll crashed (%d/%d consecutive)",
+                consecutive_crashes, _BG_LOOP_MAX_CONSECUTIVE_CRASHES,
+            )
+            if events is not None:
+                await _notify_system_error(events, notify_session_id, "scheduling", exc)
+            if consecutive_crashes >= _BG_LOOP_MAX_CONSECUTIVE_CRASHES:
+                log.error("scheduling: %d consecutive crashes — giving up", consecutive_crashes)
+                if events is not None:
+                    await _notify_system_error(
+                        events, notify_session_id, "scheduling",
                         RuntimeError(f"giving up after {consecutive_crashes} consecutive crashes — fix and restart"),
                     )
                 raise
@@ -1791,6 +1933,84 @@ def _register_routes(app: FastAPI) -> None:
         finally:
             ask_futures.pop(ask_id, None)
         return {"ask_id": ask_id, "answer": answer}
+
+    @app.post("/internal/schedule", dependencies=[Depends(verify_loopback)])
+    async def schedule_op(body: ScheduleOpBody, request: Request) -> dict[str, Any]:
+        """Executor's `schedule` tool: create / list / cancel a future
+        re-invocation of a prompt, notified back to the calling chat."""
+        db = _db(request)
+        if not body.session_id:
+            raise HTTPException(400, "session_id required")
+        task = await db.get_task_by_session(body.session_id)
+        if task is None:
+            raise HTTPException(404, "task not found for session_id")
+        chat_session_id = task.dispatched_by_chat_session
+        if not chat_session_id:
+            raise HTTPException(409, "task has no chat_session_id; cannot schedule")
+
+        if body.op == "create":
+            prompt = (body.prompt or "").strip()
+            if not prompt:
+                raise HTTPException(400, "prompt required")
+            # fire_at (absolute) takes precedence over delay_seconds (relative).
+            if body.fire_at:
+                try:
+                    fire_at = datetime.fromisoformat(body.fire_at)
+                except ValueError:
+                    raise HTTPException(422, f"invalid fire_at timestamp: {body.fire_at!r}")
+                if fire_at.tzinfo is None:
+                    fire_at = fire_at.replace(tzinfo=timezone.utc)
+            elif body.delay_seconds is not None:
+                if body.delay_seconds < 0:
+                    raise HTTPException(422, "delay_seconds must be >= 0")
+                fire_at = utcnow() + timedelta(seconds=body.delay_seconds)
+            else:
+                raise HTTPException(400, "one of delay_seconds or fire_at is required")
+            interval = body.interval_seconds
+            if interval is not None and interval < _SCHEDULED_CHECK_MIN_INTERVAL_SECONDS:
+                raise HTTPException(
+                    422,
+                    f"interval_seconds must be >= {_SCHEDULED_CHECK_MIN_INTERVAL_SECONDS} "
+                    f"(got {interval})",
+                )
+            check_id = str(uuid4())
+            await db.create_scheduled_check(
+                check_id=check_id, chat_session_id=chat_session_id,
+                prompt=prompt, fire_at=fire_at, interval_seconds=interval,
+            )
+            log.info(
+                "schedule: created %s for chat=%s fire_at=%s interval=%s",
+                check_id, chat_session_id, fire_at.isoformat(), interval,
+            )
+            return {
+                "schedule_id": check_id,
+                "fire_at": fire_at.isoformat(),
+                "interval_seconds": interval,
+            }
+
+        if body.op == "list":
+            rows = await db.list_pending_scheduled_checks_for_chat(chat_session_id)
+            return {
+                "schedules": [
+                    {
+                        "schedule_id": r["id"],
+                        "prompt": r["prompt"],
+                        "fire_at": r["fire_at"],
+                        "interval_seconds": r["interval_seconds"],
+                    }
+                    for r in rows
+                ]
+            }
+
+        if body.op == "cancel":
+            if not body.schedule_id:
+                raise HTTPException(400, "schedule_id required")
+            ok = await db.cancel_scheduled_check(
+                body.schedule_id, chat_session_id=chat_session_id,
+            )
+            return {"cancelled": ok}
+
+        raise HTTPException(400, f"unknown op {body.op!r}")
 
     # ---- Operator / chat ----
 

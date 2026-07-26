@@ -150,6 +150,51 @@ _CANCEL_DEVELOPER_TOOL = Tool(
 )
 
 
+# Scheduling tool, advertised only in cloud-primary (server) mode alongside
+# laptop / invoke_developer. Lets the executor arrange for ITS OWN prompt to be
+# re-run later and the result delivered back to the user — the mechanism behind
+# "check X in an hour and tell me if it changed" without the user re-asking.
+_SCHEDULE_TOOL = Tool(
+    name="schedule",
+    description=(
+        "Schedule a FUTURE re-run of a check and have its result delivered to "
+        "the user on Telegram — so they don't have to keep the chat open and "
+        "ask again. This re-invokes YOU (a fresh executor session) with the "
+        "`prompt` you give, at the time you set; that session actually does the "
+        "work again (re-search the web, re-read the file, re-poll the API) and "
+        "its answer is sent to the user. It is NOT a cron for arbitrary shell "
+        "commands, and NOT for 'remind me' text you already know now — the "
+        "point is to re-check something whose answer may have changed.\n"
+        "Write `prompt` as a self-contained instruction to a future you with no "
+        "memory of this conversation: state what to check and what's worth "
+        "telling the user (e.g. 'Check the latest status of incident X at "
+        "<url>; if it has changed since it was investigating, summarize the "
+        "change for the user, otherwise stay silent').\n"
+        "Ops:\n"
+        "  create — args: `prompt` (required); `delay_seconds` (fire this many "
+        "seconds from now) OR `fire_at` (absolute ISO 8601, e.g. "
+        "\"2026-07-27T09:00:00Z\"); optional `interval_seconds` to make it "
+        "RECURRING (must be >= 60; omit for a one-off). Returns "
+        "`{schedule_id}`.\n"
+        "  list   — your chat's pending schedules. Returns `{schedules: "
+        "[{schedule_id, prompt, fire_at, interval_seconds}]}`.\n"
+        "  cancel — args: `schedule_id`. Returns `{cancelled: bool}`."
+    ),
+    inputSchema={
+        "type": "object",
+        "required": ["op"],
+        "properties": {
+            "op": {"type": "string", "enum": ["create", "list", "cancel"]},
+            "prompt": {"type": "string", "description": "For op=create: what a future executor session should check/do."},
+            "delay_seconds": {"type": "number", "description": "For op=create: fire this many seconds from now."},
+            "fire_at": {"type": "string", "description": "For op=create: absolute ISO 8601 fire time (alternative to delay_seconds)."},
+            "interval_seconds": {"type": "integer", "description": "For op=create: repeat every N seconds (>= 60). Omit for one-off."},
+            "schedule_id": {"type": "string", "description": "For op=cancel."},
+        },
+    },
+)
+
+
 @app.list_tools()
 async def list_tools() -> list[Tool]:
     tools = [
@@ -316,6 +361,7 @@ async def list_tools() -> list[Tool]:
         tools.append(_LAPTOP_TOOL)
         tools.append(_INVOKE_DEVELOPER_TOOL)
         tools.append(_CANCEL_DEVELOPER_TOOL)
+        tools.append(_SCHEDULE_TOOL)
     return tools
 
 
@@ -337,6 +383,8 @@ async def call_tool(
         result = await _proxy_developer("developer_start", arguments)
     elif name == "cancel_developer":
         result = await _proxy_developer("developer_cancel", arguments)
+    elif name == "schedule":
+        result = await _proxy_schedule(arguments)
     else:
         result = {"error": f"unknown tool '{name}'"}
     # messenger_inbox.read_image returns image bytes inline. Strip the
@@ -497,6 +545,35 @@ async def _proxy_developer(op: str, args: dict[str, Any]) -> dict[str, Any]:
         return {"error": detail, "status": e.response.status_code}
     except Exception as e:
         log.exception("developer proxy failed")
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+async def _proxy_schedule(args: dict[str, Any]) -> dict[str, Any]:
+    """Dispatch a schedule create/list/cancel to the orchestrator (loopback).
+    The executor's session_id is forwarded so the server resolves which chat
+    the scheduled check should notify and scopes list/cancel to that chat."""
+    payload = {k: v for k, v in args.items() if v is not None}
+    sid = _session_id()
+    if sid:
+        payload.setdefault("session_id", sid)
+    headers = {"X-Oncall-Token": _token(), "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{_orchestrator_url()}/internal/schedule",
+                json=payload,
+                headers=headers,
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as e:
+        try:
+            detail = e.response.json().get("detail", str(e))
+        except Exception:
+            detail = str(e)
+        return {"error": detail, "status": e.response.status_code}
+    except Exception as e:
+        log.exception("schedule proxy failed")
         return {"error": f"{type(e).__name__}: {e}"}
 
 
