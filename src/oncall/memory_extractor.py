@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 
@@ -96,8 +97,15 @@ What NOT to cite:
   - Questions or speculation. Only assertions.
   - Secrets: passwords, API tokens/keys, OTP codes, full credit-card numbers.
 
+Mark each citation `behavioral` or not. Behavioral means the user is
+directing how the agent itself should act — its manner, timing, defaults,
+what it may do unasked. Everything else is not behavioral, including facts
+about the user, their world, and their history, however durable those are.
+A citation is behavioral because of what it governs, not because it sounds
+like a preference or is phrased as an imperative.
+
 Output format — JSON ONLY:
-  {"candidates": ["...", "..."]}
+  {"candidates": [{"text": "...", "behavioral": false}]}
 
 Each citation:
   - ≤200 chars.
@@ -122,6 +130,16 @@ class LLMChat(Protocol):
     ) -> dict[str, Any]: ...
 
 
+@dataclass(frozen=True)
+class Candidate:
+    """One suggested citation. `behavioral` means it directs how the agent
+    should act, which is what the operator turns into a standing memory —
+    injected every session instead of retrieved by relevance."""
+
+    text: str
+    behavioral: bool = False
+
+
 async def extract_candidates(
     llm: LLMChat,
     *,
@@ -129,7 +147,7 @@ async def extract_candidates(
     user_text: str,
     prev_assistant_text: str | None,
     already_saved: list[str] | None = None,
-) -> list[str]:
+) -> list[Candidate]:
     """Run the suggester LLM, parse the JSON response, return zero-or-more
     candidate facts the operator may want to save. Raises on LLM transport
     failure (so the caller can surface the failure to the user); a
@@ -179,7 +197,22 @@ async def extract_candidates(
         raw = data.get("facts")
     if not isinstance(raw, list):
         return []
-    return [s.strip() for s in raw if isinstance(s, str) and s.strip()]
+    # Bare strings are still accepted: models drift back to the older
+    # flat-list shape, and a citation whose flag is missing is worth keeping
+    # as a plain (non-behavioral) one. Defaulting the other way would let a
+    # formatting slip pin an ordinary fact into every context window.
+    out: list[Candidate] = []
+    for item in raw:
+        if isinstance(item, str):
+            text, behavioral = item.strip(), False
+        elif isinstance(item, dict):
+            text = str(item.get("text") or "").strip()
+            behavioral = bool(item.get("behavioral"))
+        else:
+            continue
+        if text:
+            out.append(Candidate(text=text, behavioral=behavioral))
+    return out
 
 
 # ---- helpers ---------------------------------------------------------------

@@ -84,11 +84,13 @@ class MemoryStore(Protocol):
 
     async def store(
         self, facts: list[str], *, source_turn: str | None = None,
+        standing: bool = False,
     ) -> list[str]: ...
     async def retrieve(
         self, query: str, *, limit: int | None = None,
         exclude_ids: set[int] | None = None,
     ) -> list[Memory]: ...
+    async def standing_rows(self) -> list[Memory]: ...
     async def get_by_id(self, memory_id: int) -> Memory | None: ...
     async def delete_by_id(self, memory_id: int) -> bool: ...
     async def for_prompt(self, query: str | None) -> str: ...
@@ -108,9 +110,14 @@ class OperatorMemory:
         hybrid_alpha: float,
         hybrid_beta: float,
         relative_gate: float = 0.6,
+        standing_cap: int = 30,
     ) -> None:
         self._db = db
         self._embed = embedder
+        # Standing rows enter EVERY session's context, so they are bounded
+        # independently of `capacity` (which governs the retrieved pool) and
+        # by a much smaller number.
+        self._standing_cap = standing_cap
         # Name tag written to each row's `model` column. Retrieval filters
         # to rows whose model matches this; rows from older models are
         # invisible until `rebuild_stale_embeddings()` re-embeds them.
@@ -128,9 +135,18 @@ class OperatorMemory:
 
     async def store(
         self, facts: list[str], *, source_turn: str | None = None,
+        standing: bool = False,
     ) -> list[str]:
         """Embed each fact and INSERT it as a new row; evict by LRU until
         count ≤ capacity.
+
+        `standing=True` marks the row as an instruction about how the agent
+        should behave, which is injected into every session rather than
+        retrieved by relevance. Standing writes past `_standing_cap` are
+        refused (and logged) rather than silently dropping the oldest: these
+        rows are in every context window, so unbounded growth is a prompt-size
+        problem, and an instruction the owner gave should not disappear
+        without a trace.
 
         No write-time dedup — clusters of near-duplicates are reconciled by
         the periodic `dedup_pass()` background job, which uses the LLM to
@@ -149,18 +165,29 @@ class OperatorMemory:
         if not cleaned:
             return []
 
+        if standing:
+            room = self._standing_cap - await self._db.memory_standing_count()
+            if room < len(cleaned):
+                operator_log.info("memory_standing_full " + fmt(
+                    cap=self._standing_cap, refused=len(cleaned) - max(room, 0),
+                ))
+                cleaned = cleaned[:max(room, 0)]
+                if not cleaned:
+                    return []
+
         vecs = await self._embed.embed(cleaned, kind="document")
         out: list[str] = []
         for text, vec in zip(cleaned, vecs):
             qvec = np.asarray(vec, dtype=np.float32)
             await self._insert_row(
                 text=text, embedding=qvec, source_turn=source_turn,
+                standing=standing,
             )
             out.append(text)
             await self._maybe_evict()
 
         operator_log.info("memory_store " + fmt(
-            stored=len(out), capacity=self._capacity,
+            stored=len(out), capacity=self._capacity, standing=standing,
         ))
         return out
 
@@ -203,7 +230,11 @@ class OperatorMemory:
         if not q:
             return []
         lim = limit if limit is not None else self._max_inject
-        rows = await self._all_rows()
+        # Standing rows are injected wholesale every session, so scoring them
+        # here would only let a topic-matching instruction be injected twice —
+        # and worse, a standing row landing at the peak would drag the
+        # relative gate up and squeeze out the facts this query was for.
+        rows = [r for r in await self._all_rows() if not r["standing"]]
         if not rows:
             return []
 
@@ -263,6 +294,24 @@ class OperatorMemory:
                 last_accessed_at=r["last_accessed_at"],
             )
             for score, cos_val, r in picked
+        ]
+
+    async def standing_rows(self) -> list[Memory]:
+        """The agent's standing behavioral instructions, in insertion order.
+
+        No query, no scoring, no LRU bump: these are selected by flag, so
+        they are returned whole and identically on every call — which is what
+        lets the injected note stay byte-stable across turns."""
+        rows = await self._db.memory_standing_rows(self._standing_cap)
+        return [
+            Memory(
+                id=int(r["id"]),
+                text=str(r["text"]),
+                score=0.0,
+                cosine=0.0,
+                last_accessed_at=str(r["last_accessed_at"]),
+            )
+            for r in rows
         ]
 
     async def for_prompt(self, query: str | None) -> str:
@@ -467,10 +516,19 @@ class OperatorMemory:
                         log.exception("memory_dedup: embed failed for merged text")
                         failed_n += 1
                         continue
+                    # The survivor inherits standing from ANY member of the
+                    # group. A behavioral instruction merged with a plain
+                    # paraphrase of itself must not come back as a
+                    # relevance-gated row — that would silently un-pin an
+                    # instruction the owner never withdrew.
                     await self._insert_row(
                         text=text,
                         embedding=np.asarray(vec, dtype=np.float32),
                         source_turn="dedup",
+                        standing=any(
+                            bool(r["standing"]) for r in cluster_rows
+                            if int(r["id"]) in set(gids)
+                        ),
                     )
                     for rid in gids:
                         await self.delete_by_id(rid)
@@ -615,12 +673,14 @@ class OperatorMemory:
         text: str,
         embedding: np.ndarray,
         source_turn: str | None,
+        standing: bool = False,
     ) -> int:
         return await self._db.memory_insert(
             text=text,
             embedding=embedding.tobytes(),
             model=self._embed_model,
             source_turn=source_turn,
+            standing=standing,
         )
 
     # ---- rebuild on model change ------------------------------------------

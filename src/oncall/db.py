@@ -129,6 +129,15 @@ CREATE TABLE IF NOT EXISTS operator_memories (
     -- invisible to retrieval until a background rebuild re-embeds them.
     -- See OperatorMemory.rebuild_stale_embeddings().
     model TEXT NOT NULL DEFAULT '',
+    -- 1 = a standing instruction about how the agent should BEHAVE, injected
+    -- into every session regardless of topic. 0 = an ordinary fact, surfaced
+    -- only when it scores against the turn. Behavioral vs non-behavioral is
+    -- the whole distinction; see OperatorMemory.standing_rows().
+    --
+    -- Standing rows are exempt from LRU eviction: they are never "retrieved",
+    -- so their last_accessed_at never advances and capacity pressure would
+    -- otherwise delete the instructions first.
+    standing INTEGER NOT NULL DEFAULT 0,
     source_turn TEXT,
     created_at TEXT NOT NULL,
     last_accessed_at TEXT NOT NULL,
@@ -136,6 +145,10 @@ CREATE TABLE IF NOT EXISTS operator_memories (
 );
 CREATE INDEX IF NOT EXISTS idx_operator_memories_lru
     ON operator_memories(last_accessed_at);
+-- No index on `standing`: this whole script runs BEFORE the migrations
+-- below, so indexing a migrated-in column would fail to start the daemon on
+-- any pre-upgrade database. The store is a few hundred rows behind a cap of
+-- 30 standing ones — a scan is not the bottleneck and never will be.
 
 -- Pairs of memory ids the periodic dedup LLM looked at and decided NOT to
 -- merge. The next dedup pass skips edges between recorded pairs so we don't
@@ -337,6 +350,11 @@ class Database:
         await self._migrate_add_column("tasks", "pre_approved_send_chat", "TEXT")
         await self._migrate_add_column(
             "operator_memories", "model", "TEXT NOT NULL DEFAULT ''",
+        )
+        # Existing rows are all contextual — the default is the correct
+        # backfill, so no data migration is needed alongside it.
+        await self._migrate_add_column(
+            "operator_memories", "standing", "INTEGER NOT NULL DEFAULT 0",
         )
         # Per-message snapshot of the transient turn statuses (call/acting/
         # laptop) that were in effect when the row was written. Debug-only:
@@ -1577,11 +1595,39 @@ class Database:
 
     async def memory_get(self, memory_id: int, model: str) -> aiosqlite.Row | None:
         async with self.conn.execute(
-            "SELECT id, text, last_accessed_at FROM operator_memories "
+            "SELECT id, text, standing, last_accessed_at FROM operator_memories "
             "WHERE id = ? AND model = ?",
             (memory_id, model),
         ) as cur:
             return await cur.fetchone()
+
+    async def memory_standing_rows(self, limit: int) -> list[dict[str, Any]]:
+        """Every standing (behavioral) row, oldest first, capped at `limit`.
+
+        Deliberately NOT filtered by embedding model: these are selected by
+        flag, never scored, so an embedder swap must not make the agent's own
+        instructions go dark while the background rebuild catches up."""
+        async with self.conn.execute(
+            "SELECT id, text, last_accessed_at FROM operator_memories "
+            "WHERE standing = 1 ORDER BY id ASC LIMIT ?",
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def memory_standing_count(self) -> int:
+        async with self.conn.execute(
+            "SELECT COUNT(*) AS n FROM operator_memories WHERE standing = 1"
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row["n"]) if row else 0
+
+    async def memory_mark_standing(self, memory_id: int, standing: bool) -> None:
+        await self.conn.execute(
+            "UPDATE operator_memories SET standing = ? WHERE id = ?",
+            (1 if standing else 0, memory_id),
+        )
+        await self.conn.commit()
 
     async def memory_delete(self, memory_id: int, model: str) -> bool:
         async with self.conn.execute(
@@ -1597,7 +1643,7 @@ class Database:
         # paraphrase from a fact that changed, so the newer value can win
         # (see OperatorMemory._dedup_decide).
         async with self.conn.execute(
-            "SELECT id, text, embedding, created_at, last_accessed_at "
+            "SELECT id, text, embedding, standing, created_at, last_accessed_at "
             "FROM operator_memories WHERE model = ? ORDER BY id",
             (model,),
         ) as cur:
@@ -1606,13 +1652,15 @@ class Database:
 
     async def memory_insert(
         self, *, text: str, embedding: bytes, model: str, source_turn: str | None,
+        standing: bool = False,
     ) -> int:
         now = iso(utcnow())
         async with self.conn.execute(
             "INSERT INTO operator_memories "
-            "(text, embedding, model, source_turn, created_at, last_accessed_at, access_count) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0)",
-            (text, embedding, model, source_turn, now, now),
+            "(text, embedding, model, standing, source_turn, created_at, "
+            " last_accessed_at, access_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+            (text, embedding, model, 1 if standing else 0, source_turn, now, now),
         ) as cur:
             lastrowid = cur.lastrowid
         await self.conn.commit()
@@ -1674,9 +1722,17 @@ class Database:
     async def memory_evict_over_capacity(self, capacity: int, model: str) -> int:
         """If the model's row count exceeds `capacity`, hard-delete the oldest
         (by last_accessed_at) overflow rows. Count + delete in one locked
-        transaction. Returns how many rows were evicted."""
+        transaction. Returns how many rows were evicted.
+
+        Standing rows are invisible to both halves — they are never retrieved,
+        so their last_accessed_at never advances and an LRU sweep would delete
+        the agent's own instructions before any fact. They are bounded by their
+        own cap instead (OperatorMemory._standing_cap). Counting and deleting
+        must agree on that exclusion, or the overflow figure would be inflated
+        by rows the DELETE cannot touch and it would over-evict real facts."""
         async with self.conn.execute(
-            "SELECT COUNT(*) AS n FROM operator_memories WHERE model = ?",
+            "SELECT COUNT(*) AS n FROM operator_memories "
+            "WHERE model = ? AND standing = 0",
             (model,),
         ) as cur:
             row = await cur.fetchone()
@@ -1686,7 +1742,7 @@ class Database:
         overflow = n - capacity
         await self.conn.execute(
             "DELETE FROM operator_memories WHERE id IN ("
-            "  SELECT id FROM operator_memories "
+            "  SELECT id FROM operator_memories WHERE standing = 0 "
             "  ORDER BY last_accessed_at ASC, id ASC LIMIT ?"
             ")",
             (overflow,),

@@ -121,8 +121,9 @@ async def stack(settings, tmp_path, monkeypatch):
 
 class _NullMemory:
     """Tiny stand-in for tests that don't exercise memory."""
-    async def store(self, facts, *, source_turn=None): return []
+    async def store(self, facts, *, source_turn=None, standing=False): return []
     async def retrieve(self, query, *, limit=None, exclude_ids=None): return []
+    async def standing_rows(self): return []
     async def for_prompt(self, query): return "(no relevant entries this turn)"
     async def entries_count(self): return 0
 

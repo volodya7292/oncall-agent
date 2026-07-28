@@ -90,6 +90,7 @@ def make_memory(
     # Off by default so the floor/LRU/exclude cases below stay about the
     # thing they test. Production defaults to 0.6; the gate has its own test.
     relative_gate: float = 0.0,
+    standing_cap: int = 30,
 ) -> OperatorMemory:
     return OperatorMemory(
         db, embedder,
@@ -100,6 +101,7 @@ def make_memory(
         hybrid_alpha=hybrid_alpha,
         hybrid_beta=hybrid_beta,
         relative_gate=relative_gate,
+        standing_cap=standing_cap,
     )
 
 
@@ -252,6 +254,104 @@ async def test_retrieval_protects_row_from_eviction(db):
     texts = {r["text"] for r in await _all_rows(db)}
     assert "f0" in texts, "retrieval should have protected f0 from eviction"
     assert "f1" not in texts, "untouched f1 should be the evicted row"
+
+
+# ---------------------------------------------------------------------------
+# Standing (behavioral) memories
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_standing_rows_survive_lru_eviction(db):
+    """A standing row is never retrieved, so its last_accessed_at never
+    advances — under a plain LRU sweep it would be the FIRST thing deleted,
+    silently un-instructing the agent. Capacity pressure must fall entirely
+    on the contextual rows."""
+    emb = StubEmbedder()
+    for i, ang in enumerate([0.0, math.pi / 2, math.pi, -math.pi / 2]):
+        emb.register(f"f{i}", [math.cos(ang), math.sin(ang)])
+    emb.register("always reply in one line", unit_vec(0.5, sign=-1))
+    mem = make_memory(db, emb, capacity=3)
+    # Oldest row in the store, and never touched again.
+    await mem.store(["always reply in one line"], standing=True)
+    for i in range(4):
+        await mem.store([f"f{i}"])
+
+    rows = await _all_rows(db)
+    texts = {r["text"] for r in rows}
+    assert "always reply in one line" in texts
+    # Capacity counts only the contextual rows, so the standing one is not
+    # occupying a slot either.
+    assert len([r for r in rows if not r["standing"]]) == 3
+
+
+@pytest.mark.asyncio
+async def test_standing_rows_are_not_returned_by_retrieve(db):
+    """Standing rows are injected wholesale every session. If retrieval also
+    scored them, a topic-matching instruction would be injected twice — and
+    a standing row at the peak would drag the relative gate up and squeeze
+    out the facts the query was actually for."""
+    emb = StubEmbedder()
+    emb.register("always reply in one line", unit_vec(1.0))
+    emb.register("the deploy host is build-01", unit_vec(0.9))
+    emb.register("how do you reply", unit_vec(1.0))
+    mem = make_memory(db, emb, relative_gate=0.0)
+    await mem.store(["always reply in one line"], standing=True)
+    await mem.store(["the deploy host is build-01"])
+
+    hits = await mem.retrieve("how do you reply")
+    assert [m.text for m in hits] == ["the deploy host is build-01"]
+    assert [m.text for m in await mem.standing_rows()] == [
+        "always reply in one line",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_standing_cap_refuses_rather_than_evicting(db):
+    """Standing rows sit in every context window, so the cap is a hard
+    refusal — not an LRU drop. Over-cap writes must not silently displace
+    an instruction the owner never withdrew."""
+    emb = StubEmbedder()
+    for i in range(3):
+        emb.register(f"rule {i}", unit_vec(1.0 - i * 0.1))
+    mem = make_memory(db, emb, standing_cap=2)
+    assert await mem.store(["rule 0"], standing=True) == ["rule 0"]
+    assert await mem.store(["rule 1"], standing=True) == ["rule 1"]
+    assert await mem.store(["rule 2"], standing=True) == []
+    assert [m.text for m in await mem.standing_rows()] == ["rule 0", "rule 1"]
+
+
+@pytest.mark.asyncio
+async def test_dedup_merge_inherits_standing(db):
+    """Merging a standing row with a paraphrase of itself must keep the
+    survivor standing. Otherwise dedup — a background job the owner never
+    sees — quietly demotes an instruction to a relevance-gated fact."""
+    emb = StubEmbedder()
+    emb.register("always reply in one line", unit_vec(1.0))
+    emb.register("keep replies to one line", unit_vec(0.99))
+    emb.register("reply in one line only", unit_vec(1.0))
+    mem = make_memory(db, emb)
+    await mem.store(["always reply in one line"], standing=True)
+    await mem.store(["keep replies to one line"])
+
+    rows = await _all_rows(db)
+    ids = [r["id"] for r in rows]
+
+    class _MergeLLM:
+        async def chat(self, *, model, messages, tools, max_tokens=None,
+                       reasoning_effort=None):
+            return {"content": json.dumps({
+                "merge_groups": [{"ids": ids, "text": "reply in one line only"}],
+            })}
+
+    await mem.dedup_pass(
+        _MergeLLM(), model="test", reasoning_effort="low",
+        cluster_threshold=0.5,
+    )
+
+    survivors = await _all_rows(db)
+    assert [r["text"] for r in survivors] == ["reply in one line only"]
+    assert survivors[0]["standing"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +543,8 @@ async def test_rebuild_when_embed_model_changes(db):
 
 async def _all_rows(db: Database) -> list[dict]:
     cur = await db.conn.execute(
-        "SELECT id, text, created_at, last_accessed_at FROM operator_memories ORDER BY id"
+        "SELECT id, text, standing, created_at, last_accessed_at "
+        "FROM operator_memories ORDER BY id"
     )
     return [dict(r) for r in await cur.fetchall()]
 

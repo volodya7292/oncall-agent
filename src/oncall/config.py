@@ -325,6 +325,16 @@ class Settings(BaseSettings):
     # every turn), which is cheap next to the operator answering a question
     # about the user from a fact it was never handed.
     oncall_memory_max_inject: int = 20
+    # Cap on STANDING memories — the behavioral instructions injected into
+    # every session regardless of topic. Separate from `capacity` (which
+    # bounds the retrieved pool) and far smaller, because these are paid for
+    # in every context window rather than only when they match the turn.
+    #
+    # It is a hard refusal, not an eviction: over-cap writes are rejected and
+    # reported to the model. LRU cannot arbitrate here — a standing row is
+    # never retrieved, so its access time never advances and "least recently
+    # used" would just mean "oldest instruction", which is backwards.
+    oncall_memory_standing_cap: int = 30
     # Operator model. Default is glm-5.2 via OpenRouter, pinned to Fireworks.
     # Switch models by pairing ONCALL_OPERATOR_BACKEND with the right id:
     #   openrouter → an OpenRouter slug ("z-ai/glm-5.2", "x-ai/grok-4.20")

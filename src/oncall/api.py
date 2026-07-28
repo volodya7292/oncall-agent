@@ -423,6 +423,7 @@ def create_app() -> FastAPI:
                 hybrid_alpha=settings.oncall_memory_hybrid_alpha,
                 hybrid_beta=settings.oncall_memory_hybrid_beta,
                 relative_gate=settings.oncall_memory_relative_gate,
+                standing_cap=settings.oncall_memory_standing_cap,
             )
             ask_futures: dict[str, asyncio.Future[str]] = {}
             operator = Operator(

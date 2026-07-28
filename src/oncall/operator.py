@@ -812,6 +812,20 @@ OPERATOR_TOOLS: list[dict[str, Any]] = [
                             "self-contained."
                         ),
                     },
+                    "standing": {
+                        "type": "boolean",
+                        "description": (
+                            "True only when the fact directs how YOU should "
+                            "behave — your manner, timing, defaults, what you "
+                            "may do unasked. Such a memory is loaded into "
+                            "every conversation instead of being surfaced when "
+                            "it matches the topic, so it costs context "
+                            "permanently and displaces other instructions once "
+                            "the cap is reached. Anything about the user or "
+                            "their world is not standing, however durable. "
+                            "Defaults to false."
+                        ),
+                    },
                 },
                 "required": ["text"],
             },
@@ -1209,11 +1223,15 @@ class Operator:
         return "\n".join(p for p in parts if p)
 
     async def _inject_session_memory(
-        self, session_id: str, query: str,
+        self, session_id: str, query: str | None,
     ) -> str | None:
         """Retrieve memories relevant to `query` that this session hasn't
         been shown yet, and return a `[memory note: ...]` chat-message body
         listing them. Returns None when there's nothing new to surface.
+
+        A falsy `query` (system-note auto-pings, which are not meaningful
+        retrieval keys) skips the relevance half only — standing
+        instructions are selected by flag and still go in.
         Persists the newly-shown ids on success so the next turn in this
         session won't re-inject them — keeps the history prefix
         monotonically growing (cache-friendly) and avoids re-spamming the
@@ -1230,25 +1248,58 @@ class Operator:
         store; to look anything else up it uses `query_memory` (operator)
         / `mcp__oncall__memory op=query` (executor)."""
         shown = await self._db.get_shown_memory_ids(session_id)
+        fresh: list[Memory] = []
+        if query:
+            try:
+                fresh = await self._memory.retrieve(query, exclude_ids=shown)
+            except Exception:
+                log.exception("memory retrieve failed for session %s", session_id)
+
+        # Standing rows ride the same shown-tracking, so they land once per
+        # session and again after compression drops the note — but they get
+        # their own note, because the contextual wording below ("candidates
+        # … ignore any that don't apply") is the opposite of what an
+        # instruction the owner gave means.
         try:
-            fresh = await self._memory.retrieve(query, exclude_ids=shown)
+            standing = [
+                m for m in await self._memory.standing_rows()
+                if m.id not in shown
+            ]
         except Exception:
-            log.exception("memory retrieve failed for session %s", session_id)
+            log.exception("standing memory read failed for session %s", session_id)
+            standing = []
+
+        if not fresh and not standing:
             return None
-        if not fresh:
-            return None
-        await self._db.record_memory_shown(session_id, [m.id for m in fresh])
-        bullets = "\n".join(
-            f"- [id={m.id}] {m.text.replace(chr(10), ' ').strip()}"
-            for m in fresh
+        await self._db.record_memory_shown(
+            session_id, [m.id for m in fresh] + [m.id for m in standing],
         )
-        return (
-            f"{MEMORY_NOTE_PREFIX}entries auto-loaded from your persistent "
-            f"memory because they scored close to this turn's topic. They are "
-            f"candidates, not established context — ignore any that don't "
-            f"apply. For lookups OUTSIDE what you've already been shown, use "
-            f"`query_memory`.\n{bullets}]"
-        )
+
+        sections: list[str] = []
+        if standing:
+            bullets = "\n".join(
+                f"- [id={m.id}] {m.text.replace(chr(10), ' ').strip()}"
+                for m in standing
+            )
+            sections.append(
+                f"{MEMORY_NOTE_PREFIX}standing instructions from your owner "
+                f"about how you are to behave. They apply to every turn, "
+                f"whatever the topic, until the owner withdraws them.\n"
+                f"{bullets}]"
+            )
+        if fresh:
+            bullets = "\n".join(
+                f"- [id={m.id}] {m.text.replace(chr(10), ' ').strip()}"
+                for m in fresh
+            )
+            sections.append(
+                f"{MEMORY_NOTE_PREFIX}entries auto-loaded from your persistent "
+                f"memory because they scored close to this turn's topic. They are "
+                f"candidates, not established context — ignore any that don't "
+                f"apply. For lookups OUTSIDE what you've already been shown, use "
+                f"`query_memory`.\n{bullets}]"
+            )
+        return "\n".join(sections)
 
     async def chat_turn(
         self, session_id: str, user_text: str, *,
@@ -1470,14 +1521,16 @@ class Operator:
             effective_query = None
         else:
             effective_query = await self._retrieval_key(session_id, user_text)
-        if effective_query:
-            memory_note = await self._inject_session_memory(
-                session_id, effective_query,
+        # Called even when there's no usable retrieval key: a system-note
+        # auto-ping still has to carry the owner's standing instructions,
+        # which are selected by flag rather than by query.
+        memory_note = await self._inject_session_memory(
+            session_id, effective_query,
+        )
+        if memory_note:
+            await self._db.append_chat_message(
+                session_id, "user", memory_note,
             )
-            if memory_note:
-                await self._db.append_chat_message(
-                    session_id, "user", memory_note,
-                )
         await self._db.append_chat_message(session_id, "user", user_text)
         # Attachments (e.g. a photo the user sent to the Telegram bot) are
         # persisted to history as short TEXT placeholders so reloads stay
@@ -2322,7 +2375,13 @@ class Operator:
         # this turn — only `save_memory` calls (which emit their own
         # breadcrumbs via the tool handler) reach the user. The operator
         # prompt has a matching rule telling it to emit empty content.
-        bullets = "\n".join(f"  • {c}" for c in candidates)
+        # The `behavioral` marker is the extractor's read, not a verdict —
+        # it rides along as a suggestion so the operator can weigh it while
+        # choosing `standing`, which stays the operator's call.
+        bullets = "\n".join(
+            f"  • {c.text}" + (" [reads as behavioral]" if c.behavioral else "")
+            for c in candidates
+        )
         note = (
             f"{self._CITATIONS_NOTE_PREFIX}. These are RAW QUOTES, not "
             f"memory text. For any worth keeping, derive a clean, specific, "
@@ -2529,15 +2588,23 @@ class Operator:
             text = str(args.get("text") or "").strip()
             if not text:
                 return {"error": "text required"}
+            standing = bool(args.get("standing"))
             written = await self._memory.store(
-                [text], source_turn=chat_session_id,
+                [text], source_turn=chat_session_id, standing=standing,
             )
             # Track for the extractor pass so it doesn't re-suggest a
             # near-duplicate of what we just wrote.
             self._turn_saves.setdefault(chat_session_id, []).extend(written)
             operator_log.info("save_memory " + fmt(
                 chat=chat_session_id, written=len(written), text=text,
+                standing=standing,
             ))
+            # A standing write can be refused when the cap is full — `store`
+            # returns [] and the breadcrumb below is skipped, so tell the
+            # model outright rather than letting an empty result read as a
+            # successful save.
+            if standing and not written:
+                return {"saved": [], "error": "standing memory cap reached"}
             # Breadcrumb. We're inside _execute_tool, which runs under the
             # session lock — so we append + publish directly instead of
             # going through _emit_breadcrumb (which re-acquires the lock

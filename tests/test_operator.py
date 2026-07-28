@@ -27,6 +27,7 @@ from oncall.db import Database
 from oncall.events import EventBus
 from oncall.lifecycle import Lifecycle
 from oncall.operator import (
+    MEMORY_NOTE_PREFIX,
     OPERATOR_TOOLS,
     AnthropicLLMClient,
     Operator,
@@ -71,21 +72,33 @@ class StubMemory:
 
     def __init__(self) -> None:
         self.stored_batches: list[list[str]] = []
+        self.standing_batches: list[list[str]] = []
         self.retrieve_calls: list[str] = []
         self._entries: list[str] = []
         self._canned: dict[str, list[Memory]] = {}
         self._by_id: dict[int, Memory] = {}
+        self._standing: list[Memory] = []
 
     def set_retrieval(self, query: str, memories: list[Memory]) -> None:
         self._canned[query] = list(memories)
         for m in memories:
             self._by_id[m.id] = m
 
-    async def store(self, facts, *, source_turn=None):
+    def set_standing(self, memories: list[Memory]) -> None:
+        self._standing = list(memories)
+        for m in memories:
+            self._by_id[m.id] = m
+
+    async def store(self, facts, *, source_turn=None, standing=False):
         kept = [f.strip() for f in facts if f and f.strip()]
         self.stored_batches.append(kept)
+        if standing:
+            self.standing_batches.append(kept)
         self._entries.extend(kept)
         return list(kept)
+
+    async def standing_rows(self):
+        return list(self._standing)
 
     async def retrieve(self, query, *, limit=None, exclude_ids=None):
         self.retrieve_calls.append(query)
@@ -486,6 +499,58 @@ async def test_query_memory_returns_canned_results(stack):
     payload = json.loads(tool_msgs[0]["content"])
     assert payload["query"] == "staging"
     assert payload["memories"][0]["text"] == "staging is at host42"
+
+
+@pytest.mark.asyncio
+async def test_standing_memories_reach_turns_with_no_retrieval_query(stack):
+    """Standing instructions are selected by flag, not by relevance, so they
+    must survive the path where there IS no retrieval key.
+
+    Auto-ping turns (task terminated, inbox drain) short-circuit retrieval —
+    if standing injection hung off the same query gate, the agent would drop
+    its owner's instructions on exactly the turns it acts most autonomously.
+    They also get their own note: the contextual wording tells the model the
+    entries are ignorable candidates, which inverts an instruction."""
+    stack["memory"].set_standing([
+        Memory(id=3, text="never ping before 9am", score=0.0, cosine=0.0,
+               last_accessed_at="x"),
+    ])
+    llm = ScriptedLLM(script=["ok"])
+    operator = _make_operator(stack, llm)
+    await operator.auto_ping(
+        session_id="s1", note="task T1 finished", retrieval_query=None,
+    )
+
+    notes = [
+        m["content"] for m in llm.calls_made[0]["messages"]
+        if m["role"] == "user" and m["content"].startswith(MEMORY_NOTE_PREFIX)
+    ]
+    assert len(notes) == 1, "standing instructions must be injected here"
+    assert "never ping before 9am" in notes[0]
+    assert "standing instructions" in notes[0]
+    assert "ignore any that don't apply" not in notes[0]
+
+
+@pytest.mark.asyncio
+async def test_standing_memories_are_not_reinjected_next_turn(stack):
+    """They ride the same shown-tracking as contextual rows: injected once
+    per session, not re-appended every turn. Re-injecting would grow the
+    history prefix without bound and break the byte-stable prefix the
+    provider's KV cache depends on."""
+    stack["memory"].set_standing([
+        Memory(id=3, text="never ping before 9am", score=0.0, cosine=0.0,
+               last_accessed_at="x"),
+    ])
+    llm = ScriptedLLM(script=["one", "two"])
+    operator = _make_operator(stack, llm)
+    await operator.chat_turn(session_id="s1", user_text="hello")
+    await operator.chat_turn(session_id="s1", user_text="hello again")
+
+    notes = [
+        m["content"] for m in llm.calls_made[-1]["messages"]
+        if m["role"] == "user" and m["content"].startswith(MEMORY_NOTE_PREFIX)
+    ]
+    assert len(notes) == 1
 
 
 @pytest.mark.asyncio
