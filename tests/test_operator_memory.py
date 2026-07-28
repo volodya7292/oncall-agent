@@ -87,6 +87,9 @@ def make_memory(
     relevance_floor: float = 0.30,
     hybrid_alpha: float = 0.7,
     hybrid_beta: float = 0.3,
+    # Off by default so the floor/LRU/exclude cases below stay about the
+    # thing they test. Production defaults to 0.6; the gate has its own test.
+    relative_gate: float = 0.0,
 ) -> OperatorMemory:
     return OperatorMemory(
         db, embedder,
@@ -96,6 +99,7 @@ def make_memory(
         relevance_floor=relevance_floor,
         hybrid_alpha=hybrid_alpha,
         hybrid_beta=hybrid_beta,
+        relative_gate=relative_gate,
     )
 
 
@@ -538,6 +542,40 @@ async def test_retrieve_excludes_before_applying_the_limit(db):
     # Budget is 2 and the top 2 are excluded; the third must still surface.
     got = await mem.retrieve("zzz", exclude_ids=top_two)
     assert [m.text for m in got] == ["gamma"]
+
+
+@pytest.mark.asyncio
+async def test_relative_gate_scales_against_all_rows_not_the_eligible_pool(db):
+    """Regression: a session that has been shown the good matches must not
+    then be fed the best of the leftovers.
+
+    `relative_gate` keeps candidates scoring within a fraction of the BEST
+    score for the query. If that peak were taken after `exclude_ids` were
+    removed, the top *remaining* row would define the scale and always pass —
+    so a long-lived session would inject steadily worse memories, which is
+    exactly what the live store did once 108 of 109 rows had been shown (a
+    request to re-read a chat pulled in an unrelated third party's chat id).
+
+    Measured against the full row set, the leftovers are judged against the
+    query's real peak and correctly dropped.
+    """
+    emb = StubEmbedder()
+    # Scores are 0.7 * cos (no token overlap with the query): alpha 0.70,
+    # beta 0.63, gamma 0.28 — gamma is well under 0.6 * 0.70 = 0.42.
+    emb.register("alpha", unit_vec(1.0))
+    emb.register("beta", unit_vec(0.9))
+    emb.register("gamma", unit_vec(0.4))
+    emb.register("zzz", unit_vec(1.0))
+    mem = make_memory(db, emb, relevance_floor=0.10, relative_gate=0.6)
+    await mem.store(["alpha", "beta", "gamma"])
+
+    ranked = await mem.retrieve("zzz", limit=10)
+    assert [m.text for m in ranked] == ["alpha", "beta"], "gamma is off-topic"
+
+    # Exclude both survivors. gamma is now the best *eligible* row and clears
+    # the floor — a pool-relative peak would inject it. It must stay out.
+    got = await mem.retrieve("zzz", exclude_ids={m.id for m in ranked})
+    assert got == []
 
 
 def test_dedup_candidate_prune_never_drops_an_edge():

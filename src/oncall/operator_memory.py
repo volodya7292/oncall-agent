@@ -107,6 +107,7 @@ class OperatorMemory:
         relevance_floor: float,
         hybrid_alpha: float,
         hybrid_beta: float,
+        relative_gate: float = 0.6,
     ) -> None:
         self._db = db
         self._embed = embedder
@@ -121,6 +122,7 @@ class OperatorMemory:
         self._floor = relevance_floor
         self._alpha = hybrid_alpha
         self._beta = hybrid_beta
+        self._relative_gate = relative_gate
 
     # ---- writes ------------------------------------------------------------
 
@@ -178,14 +180,30 @@ class OperatorMemory:
         that exclude (session-injection dedup) want the best `limit`
         *eligible* memories, not whatever survives of the best `limit`
         overall. Excluded rows also skip the LRU bump — they were never
-        served."""
+        served.
+
+        Two gates, and they do different jobs. `relevance_floor` is an
+        absolute garbage guard. `relative_gate` is the one that decides
+        relevance: a candidate must score within that fraction of the BEST
+        score this query achieved. Measured on the live 109-row store, an
+        answerable query is spiky — its answer lands at rank 1 with the
+        runner-up far below (0.390 / 0.223 / 0.159 …) — so scaling against
+        the peak separates the answer from the tail without knowing the
+        model's absolute score scale. Across ten known-answer bilingual
+        queries the true positive scored ≥0.98 of the peak, so a 0.6 gate
+        cost nothing while cutting injected counts like 24→5, 31→2, 37→10.
+
+        The peak is taken over ALL rows, deliberately including excluded
+        ones. That is what stops a long-lived session from going blind in
+        reverse: once it has been shown the good matches, the leftovers
+        would otherwise be scaled against each other and the best remaining
+        noise row would always look like a hit. Judged against the query's
+        real peak, it is correctly dropped."""
         q = (query or "").strip()
         if not q:
             return []
         lim = limit if limit is not None else self._max_inject
         rows = await self._all_rows()
-        if exclude_ids:
-            rows = [r for r in rows if int(r["id"]) not in exclude_ids]
         if not rows:
             return []
 
@@ -207,14 +225,21 @@ class OperatorMemory:
             matrix = np.vstack([unpack(r["embedding"]) for r in rows])
             cosines = cosine_matrix(qvec, matrix)
 
-            scored: list[tuple[float, float, dict[str, Any]]] = []
+            all_scored: list[tuple[float, float, dict[str, Any]]] = []
             for r, c in zip(rows, cosines):
                 score = hybrid_score(
                     float(c), q, r["text"],
                     alpha=self._alpha, beta=self._beta,
                 )
-                if score >= self._floor:
-                    scored.append((score, float(c), r))
+                all_scored.append((score, float(c), r))
+            # Peak over everything, excluded rows included — see docstring.
+            peak = max((s for s, _, _ in all_scored), default=0.0)
+            cut = max(self._floor, self._relative_gate * peak)
+            scored = [
+                t for t in all_scored
+                if t[0] >= cut
+                and not (exclude_ids and int(t[2]["id"]) in exclude_ids)
+            ]
             scored.sort(key=lambda t: t[0], reverse=True)
             picked = scored[:lim]
             score_s = time.monotonic() - score_start

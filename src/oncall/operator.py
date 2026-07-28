@@ -1243,9 +1243,10 @@ class Operator:
             for m in fresh
         )
         return (
-            f"{MEMORY_NOTE_PREFIX}auto-loaded entries from your persistent "
-            f"memory relevant to the next turn. "
-            f"For lookups OUTSIDE what you've already been shown, use "
+            f"{MEMORY_NOTE_PREFIX}entries auto-loaded from your persistent "
+            f"memory because they scored close to this turn's topic. They are "
+            f"candidates, not established context — ignore any that don't "
+            f"apply. For lookups OUTSIDE what you've already been shown, use "
             f"`query_memory`.\n{bullets}]"
         )
 
@@ -1350,6 +1351,7 @@ class Operator:
         retrieval_query: str | None = None,
         restricted_to_chat: str | None = None,
         include_silence_gap: bool = False,
+        allow_hand_off: bool = True,
     ) -> OperatorTurnResult:
         """Inject a synthetic '[system note: ...]' turn into a chat session.
         Used by background tasks that re-engage the operator (task terminated,
@@ -1368,13 +1370,21 @@ class Operator:
         `include_silence_gap`: add a `<time-since-last-message>` block telling
         the operator how long the user has been silent. For pings that open a
         conversation with the user (a voice call greeting), not for background
-        ones that merely report machine state."""
+        ones that merely report machine state.
+
+        `allow_hand_off=False` blocks the hand_off tool FOR THIS TURN ONLY.
+        Used by the ping that reports a failed hand_off: without it the
+        operator answers the failure by handing off again, which fails again,
+        which pings again — a loop costing a task and a turn per cycle. It is
+        deliberately not persisted anywhere; the next user message hands off
+        as normal, because the next attempt may well succeed."""
         async with self._lock_for(session_id):
             return await self._run_turn(
                 session_id, f"{AUTO_PING_PREFIX}{note}]",
                 retrieval_query=retrieval_query,
                 restricted_to_chat=restricted_to_chat,
                 include_silence_gap=include_silence_gap,
+                allow_hand_off=allow_hand_off,
             )
 
     async def append_system_note(self, session_id: str, note: str) -> None:
@@ -1435,6 +1445,7 @@ class Operator:
         attachments: list[dict[str, Any]] | None = None,
         restricted_to_chat: str | None = None,
         include_silence_gap: bool = False,
+        allow_hand_off: bool = True,
     ) -> OperatorTurnResult:
         await self._db.ensure_chat_session(session_id)
         # Read BEFORE this turn's own rows land below, otherwise the answer
@@ -1719,6 +1730,7 @@ class Operator:
                         restricted_to_chat=restricted_to_chat,
                         tool_calls_made=tool_calls_made,
                         user_text=user_text,
+                        allow_hand_off=allow_hand_off,
                     )
                 except Exception as e:
                     log.exception("operator tool %s failed", tc["name"])
@@ -2442,9 +2454,21 @@ class Operator:
         *, restricted_to_chat: str | None = None,
         tool_calls_made: list[dict[str, Any]] | None = None,
         user_text: str = "",
+        allow_hand_off: bool = True,
     ) -> dict[str, Any]:
         del tool_calls_made  # vestigial; kept for compat
         if name == "hand_off":
+            if not allow_hand_off:
+                # This turn IS the report of a hand_off that just failed —
+                # see auto_ping(allow_hand_off=...). Scoped to the turn; the
+                # user's next message can hand off again.
+                return {
+                    "error": (
+                        "the acting layer just failed on this exact request — "
+                        "handing off again now would fail the same way. Answer "
+                        "the user yourself in this turn."
+                    ),
+                }
             text = (user_text or "").strip()
             if not text:
                 return {

@@ -422,6 +422,7 @@ def create_app() -> FastAPI:
                 relevance_floor=settings.oncall_memory_relevance_floor,
                 hybrid_alpha=settings.oncall_memory_hybrid_alpha,
                 hybrid_beta=settings.oncall_memory_hybrid_beta,
+                relative_gate=settings.oncall_memory_relative_gate,
             )
             ask_futures: dict[str, asyncio.Future[str]] = {}
             operator = Operator(
@@ -506,6 +507,7 @@ def create_app() -> FastAPI:
             auto_ping_task = asyncio.create_task(
                 _result_delivery_loop(
                     events=events, db=db,
+                    operator=operator, voice_call=voice_call,
                     notify_session_id=notify_sid,
                 ),
                 name="result-delivery",
@@ -685,6 +687,8 @@ def _supervise_bg_task(
 
 async def _result_delivery_loop(
     *, events: EventBus, db: Database,
+    operator: Operator,
+    voice_call: CallService | None = None,
     notify_session_id: str | None = None,
 ) -> None:
     """When a hand_off'd executor task reaches a terminal state, pull
@@ -695,8 +699,23 @@ async def _result_delivery_loop(
     Approval requests are NOT relayed through the operator — the
     telegram agent's `_approval_subscriber` sends the challenge-phrase
     prompt directly. The operator stays out of the executor's loop
-    entirely after hand_off."""
+    entirely after a hand_off that SUCCEEDS.
+
+    A hand_off that FAILS comes back to it: `_on_handoff_failed` re-invokes
+    the operator so it answers the user itself instead of the system emitting
+    a canned banner. That turn cannot hand off again (it would just fail
+    again), but nothing is remembered past it."""
     from uuid import UUID
+
+    async def _on_handoff_failed(chat_session_id: str, note: str) -> None:
+        await operator.auto_ping(
+            chat_session_id, note,
+            # The note is machine bookkeeping, not a topic — retrieving
+            # memories against it would key on the failure prose.
+            retrieval_query=None,
+            allow_hand_off=False,
+        )
+
     consecutive_crashes = 0
     while True:
         try:
@@ -723,6 +742,13 @@ async def _result_delivery_loop(
                         task_id=task_uuid,
                         chat_session_id=task.dispatched_by_chat_session,
                         terminal_state=new_state,
+                        spoken=bool(
+                            voice_call is not None
+                            and voice_call.is_on_call(
+                                task.dispatched_by_chat_session,
+                            )
+                        ),
+                        on_failure=_on_handoff_failed,
                     )
                 except Exception:
                     log.exception(

@@ -9,7 +9,11 @@ from __future__ import annotations
 import re
 
 from oncall.config import Paths, Settings
-from oncall.result_delivery import EXECUTOR_REPLY_BUDGET_CHARS, MAX_USER_FACING_CHARS
+from oncall.result_delivery import (
+    EXECUTOR_REPLY_BUDGET_CHARS,
+    MAX_TEXT_CHARS,
+    MAX_VOICE_CHARS,
+)
 from oncall.supervisor import Supervisor
 
 
@@ -36,12 +40,13 @@ def test_executor_budget_stays_under_the_delivery_ceiling(tmp_path) -> None:
 
     Nothing rewrites the executor's reply anymore (an LLM compressor used to,
     and corrupted attribution doing it — see result_delivery's docstring), so
-    `MAX_USER_FACING_CHARS` is now a guillotine, not a compressor: whatever
-    the executor overshoots by gets cut off the user's message mid-word. The
-    gap is the slack that absorbs a mild overshoot. Raise the budget to meet
-    the ceiling and every overshoot becomes user-visible again.
+    the delivery ceilings are guillotines, not compressors: whatever the
+    executor overshoots by gets cut off the user's message mid-word. The gap
+    is the slack that absorbs a mild overshoot. Raise the budget to meet a
+    ceiling and every overshoot becomes user-visible again — including on the
+    tighter voice one, which is the binding constraint of the two.
     """
-    assert EXECUTOR_REPLY_BUDGET_CHARS < MAX_USER_FACING_CHARS
+    assert EXECUTOR_REPLY_BUDGET_CHARS < MAX_VOICE_CHARS < MAX_TEXT_CHARS
     # Wording-agnostic on purpose: the prompt gets reworded often, and a test
     # that pins its phrasing just breaks on every edit. Only the number needs
     # to reach the model.

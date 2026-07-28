@@ -385,9 +385,10 @@ class Supervisor:
         still see the date refresh on each spawn (one per hand_off).
 
         `{{reply_budget_chars}}` → the length the executor is asked to write
-        to. Deliberately BELOW result_delivery.MAX_USER_FACING_CHARS: nothing
-        rewrites the executor now, so the gap is slack that absorbs a mild
-        overrun instead of cutting the user's message mid-word.
+        to. Deliberately BELOW both result_delivery ceilings (voice is the
+        tighter one): nothing rewrites the executor now, so the gap is slack
+        that absorbs a mild overrun instead of cutting the user's message
+        mid-word.
 
         Then exactly one "# Execution environment" section is appended, per
         role. It is the ONLY place native tools are named: which tool carries

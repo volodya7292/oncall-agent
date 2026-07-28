@@ -224,6 +224,50 @@ async def test_hand_off_enqueues_user_message_verbatim(stack):
 
 
 @pytest.mark.asyncio
+async def test_failure_ping_cannot_hand_off_again(stack):
+    """Safety invariant: the turn that REPORTS a failed hand_off must not be
+    able to start another one.
+
+    That ping exists because the executor just died, so a fresh hand_off
+    fails the same way — which pings again, which hands off again. Each cycle
+    burns a task and an operator turn, and the user watches acks pile up with
+    no answer. The block is scoped to this one turn: the tool is refused with
+    an error the operator can act on, and the next real user message (below)
+    hands off normally, because by then the executor may well be back.
+    """
+    enqueued: list[dict[str, Any]] = []
+    original = stack["lifecycle"].enqueue_executor
+
+    async def spy(**kwargs):
+        enqueued.append(kwargs)
+        return await original(**kwargs)
+
+    stack["lifecycle"].enqueue_executor = spy  # type: ignore[method-assign]
+
+    # The operator tries to hand off anyway; the refusal must steer it to
+    # answer directly on the retry round.
+    llm = ScriptedLLM(script=[
+        [("hand_off", {"ack_msg": "One sec."})],
+        "Can't reach my tools right now — quota resets at 2am.",
+    ])
+    operator = _make_operator(stack, llm)
+    result = await operator.auto_ping(
+        session_id="s1", note="the job you handed off failed", allow_hand_off=False,
+    )
+
+    assert enqueued == [], "the failure-report turn must not enqueue a task"
+    assert "quota" in result.text, "the operator still has to answer the user"
+
+    # Not sticky: the very next user message hands off as normal.
+    llm2 = ScriptedLLM(script=[[("hand_off", {"ack_msg": "On it."})], "Looking."])
+    await _make_operator(stack, llm2).chat_turn(
+        session_id="s1", user_text="try again please",
+    )
+    assert len(enqueued) == 1
+    assert enqueued[0]["prompt"].endswith("try again please")
+
+
+@pytest.mark.asyncio
 async def test_hand_off_with_hint_prepends_operator_hint_block(stack):
     """When the user's literal message is something like 'yes', the
     operator can attach a hint that the executor sees ahead of the

@@ -305,6 +305,20 @@ class Settings(BaseSettings):
     # same-language pairs (token overlap across scripts is ~0), so it drags
     # cross-language scores toward 0.7*cosine — hence the low floor.
     oncall_memory_relevance_floor: float = 0.15
+    # Fraction of the BEST score this query achieved that a candidate must
+    # reach to be injected. Unlike the floor, this is scale-free: it asks
+    # "close to the best match?" rather than "above some absolute number",
+    # so it survives an embedder swap far better than the two calibrated
+    # constants around it. It is what actually filters — the floor only
+    # catches queries where nothing scores at all.
+    #
+    # Calibrated on the live 109-row store: ten known-answer bilingual
+    # queries put their answer at ≥0.98 of the peak (9 of 10 at rank 1), so
+    # 0.6 loses none of them, while the noise that was reaching the operator
+    # sat at 0.17–0.58 of the peak. Raising it toward 1.0 starts demanding
+    # the answer be the single best row; dropping it toward 0 restores the
+    # tail. Re-measure on real rows before moving it.
+    oncall_memory_relative_gate: float = 0.6
     # Memories injected per turn as a `[memory note: ...]` message. Each is a
     # one-line fact, so 20 costs a few hundred tokens and is paid once per
     # memory per context window (the note is appended to history, not rebuilt
