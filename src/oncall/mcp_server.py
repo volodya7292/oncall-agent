@@ -22,14 +22,21 @@ import sys
 from typing import Any
 
 import httpx
-from mcp.server import Server
+import jsonschema
+from mcp.server import Server, ServerRequestContext
 from mcp.server.stdio import stdio_server
-from mcp.types import ImageContent, TextContent, Tool
+from mcp.types import (
+    CallToolRequestParams,
+    CallToolResult,
+    ImageContent,
+    ListToolsResult,
+    PaginatedRequestParams,
+    TextContent,
+    Tool,
+)
 
 
 log = logging.getLogger(__name__)
-
-app: Server = Server("oncall")
 
 
 def _orchestrator_url() -> str:
@@ -195,7 +202,6 @@ _SCHEDULE_TOOL = Tool(
 )
 
 
-@app.list_tools()
 async def list_tools() -> list[Tool]:
     tools = [
         Tool(
@@ -365,7 +371,6 @@ async def list_tools() -> list[Tool]:
     return tools
 
 
-@app.call_tool()
 async def call_tool(
     name: str, arguments: dict[str, Any],
 ) -> list[TextContent | ImageContent]:
@@ -601,6 +606,49 @@ async def _proxy_memory(args: dict[str, Any]) -> dict[str, Any]:
     except Exception as e:
         log.exception("memory proxy failed")
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+# ---- protocol adapters ----
+#
+# mcp 2.0 dropped the `@app.list_tools()` / `@app.call_tool()` decorators for
+# handlers passed to the constructor, which receive the raw request params and
+# return the full result model. Two conveniences the decorators used to supply
+# are reproduced below, because the executor depends on both: arguments are
+# validated against the advertised inputSchema, and a raise becomes an
+# isError result rather than a JSON-RPC transport fault. The distinction
+# matters most for `approve` — a broker failure must reach claude as a tool
+# result it can act on, not as a protocol error that takes down the turn.
+
+
+async def _on_list_tools(
+    ctx: ServerRequestContext, params: PaginatedRequestParams | None,
+) -> ListToolsResult:
+    return ListToolsResult(tools=await list_tools())
+
+
+async def _on_call_tool(
+    ctx: ServerRequestContext, params: CallToolRequestParams,
+) -> CallToolResult:
+    arguments = params.arguments or {}
+    try:
+        tool = next((t for t in await list_tools() if t.name == params.name), None)
+        # An unknown name is left to call_tool, which reports it as an ordinary
+        # result; only a *known* tool's schema is enforced.
+        if tool is not None:
+            jsonschema.validate(instance=arguments, schema=tool.input_schema)
+        content = await call_tool(params.name, arguments)
+    except Exception as e:
+        log.exception("tool %s failed", params.name)
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"{type(e).__name__}: {e}")],
+            is_error=True,
+        )
+    return CallToolResult(content=content)
+
+
+app: Server = Server(
+    "oncall", on_list_tools=_on_list_tools, on_call_tool=_on_call_tool,
+)
 
 
 async def main() -> None:

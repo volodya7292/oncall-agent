@@ -3,34 +3,41 @@ name = "oncall-agent"
 version = "0.1.0"
 description = "Personal on-call agent: Gemma operator + Claude CLI executor under a deterministic permission broker."
 requires-python = ">=3.12"
+# Every range carries an upper bound at the next breaking version (the next
+# minor for 0.x, where minors break). The Docker image resolves these ranges
+# afresh whenever its dependency layer rebuilds, so an unbounded `>=` lets a
+# major land in production untested: mcp 2.0 did exactly that, removing the
+# decorator API and taking the executor down. Raise a bound deliberately,
+# after porting.
 dependencies = [
-    "fastapi>=0.136",
-    "uvicorn[standard]>=0.47",
-    "pydantic>=2.13",
-    "pydantic-settings>=2.14",
-    "httpx>=0.28",
-    "sse-starlette>=3.4",
-    "mcp>=1.27",
-    "aiosqlite>=0.22",
-    "python-dotenv>=1.2",
-    "bashlex>=0.18",     # bash AST for the classifier's catastrophic scan
-    "telethon>=1.43",    # Telegram userbot (milestone 3)
-    "openai>=2.37",      # OpenAI-compatible client; we point it at Vercel AI Gateway
-    "google-genai>=2.5", # native Google AI Studio / Gemini API client (operator backend)
-    "qrcode>=8.2",       # terminal QR rendering for `oncall telegram-login --qr`
-    "numpy>=2.4",      # cosine matrix over packed float32 embeddings (operator memory)
-    "py-tgcalls>=2.2",   # MTProto 1:1 voice calls on the agent userbot session
-    "opuslib>=3.0",      # Opus encode/decode for the OpenAI-compat STT/TTS endpoints
-    "silero-vad>=6.2",   # Voice activity detection for utterance segmentation + barge-in
-    "audioop-lts>=0.2; python_version >= '3.13'",  # stdlib audioop dropped in 3.13; we need ratecv for 48k→16k
-    "anthropic>=0.49",
+    "fastapi>=0.136,<1",
+    "uvicorn[standard]>=0.47,<1",
+    "pydantic>=2.13,<3",
+    "pydantic-settings>=2.14,<3",
+    "httpx>=0.28,<1",
+    "sse-starlette>=3.4,<4",
+    "mcp>=2,<3",
+    "jsonschema>=4.26,<5",  # tool-argument validation in the MCP server
+    "aiosqlite>=0.22,<1",
+    "python-dotenv>=1.2,<2",
+    "bashlex>=0.18,<1",     # bash AST for the classifier's catastrophic scan
+    "telethon>=1.43,<2",    # Telegram userbot (milestone 3)
+    "openai>=2.37,<3",      # OpenAI-compatible client; we point it at Vercel AI Gateway
+    "google-genai>=2.5,<3", # native Google AI Studio / Gemini API client (operator backend)
+    "qrcode>=8.2,<9",       # terminal QR rendering for `oncall telegram-login --qr`
+    "numpy>=2.4,<3",        # cosine matrix over packed float32 embeddings (operator memory)
+    "py-tgcalls>=2.2,<3",   # MTProto 1:1 voice calls on the agent userbot session
+    "opuslib>=3.0,<4",      # Opus encode/decode for the OpenAI-compat STT/TTS endpoints
+    "silero-vad>=6.2,<7",   # Voice activity detection for utterance segmentation + barge-in
+    "audioop-lts>=0.2,<1; python_version >= '3.13'",  # stdlib audioop dropped in 3.13; we need ratecv for 48k→16k
+    "anthropic>=0.49,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=9",
-    "pytest-asyncio>=1.3",
-    "ruff>=0.15",
+    "pytest>=9,<10",
+    "pytest-asyncio>=1.3,<2",
+    "ruff>=0.15,<1",
 ]
 
 [project.scripts]
