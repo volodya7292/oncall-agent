@@ -61,6 +61,7 @@ class Lifecycle:
         chat_session_id: str | None = None,
         restricted_to_chat: str | None = None,
         model: str | None = None,
+        first_pass_answer: str | None = None,
     ) -> Task:
         """Build, persist, queue. Returns the constructed Task so callers
         that need state (deferred dispatch approval) can read it.
@@ -72,6 +73,7 @@ class Lifecycle:
             dispatched_by_chat_session=chat_session_id,
             restricted_to_chat=restricted_to_chat,
             model=model,
+            first_pass_answer=first_pass_answer,
         )
         await self.db.insert_task(task)
         await self.events.publish(task.id, "state.changed", {"state": task.state.value})
@@ -82,6 +84,7 @@ class Lifecycle:
     async def enqueue_executor(
         self, *, prompt: str, chat_session_id: str | None = None,
         restricted_to_chat: str | None = None,
+        first_pass_answer: str | None = None,
     ) -> dict[str, object]:
         """Programmatic entry point for the operator's `hand_off()` tool.
         Creates a Task row, pushes it onto the FIFO queue, and returns
@@ -90,11 +93,16 @@ class Lifecycle:
         `restricted_to_chat` propagates the inbox-drain's "this task is a
         reply to chat X" constraint to the broker, which uses it as the
         scoping key for dm_allowlist auto-approval.
+
+        `first_pass_answer` is whatever the operator told the user in this
+        same turn. It changes how the result comes back — see
+        `result_delivery.deliver_executor_result`.
         """
         task = await self.submit_task(
             prompt=prompt,
             chat_session_id=chat_session_id,
             restricted_to_chat=restricted_to_chat,
+            first_pass_answer=first_pass_answer,
         )
         return {
             "task_id": str(task.id),

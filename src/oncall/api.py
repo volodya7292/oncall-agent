@@ -725,6 +725,41 @@ async def deliver_failure_via_operator(
     })
 
 
+async def deliver_reconciliation_via_operator(
+    *, operator: Operator, events: EventBus, chat_session_id: str, note: str,
+) -> None:
+    """Re-invoke the operator to reconcile a finished hand_off against the
+    answer it gave the user in the same turn, and PUBLISH what it writes.
+
+    Same shape as `deliver_failure_via_operator`, and raises for the same
+    reason: an empty turn here routes the caller back to verbatim delivery,
+    so a successful task never goes silent just because this round produced
+    nothing.
+
+    `allow_hand_off=False` because this turn IS the answer to a hand_off that
+    already ran. Without it the operator can hand the same question off again
+    on seeing a report it doesn't like, and each round buys another task.
+    """
+    result = await operator.auto_ping(
+        chat_session_id, note,
+        # The note quotes both texts in full; retrieving against that prose
+        # would key on the bookkeeping wrapper, and the turn that asked the
+        # question already pulled whatever memories were relevant.
+        retrieval_query=None,
+        allow_hand_off=False,
+    )
+    text = (result.text or "").strip()
+    if not text:
+        raise RuntimeError("operator produced no text for the reconciliation ping")
+    await events.publish_global("chat.reply", {
+        "session_id": chat_session_id,
+        "text": text,
+        "voice_text": to_voice_text(text),
+        "trigger": "executor.done",
+        "task_id": None,
+    })
+
+
 async def _result_delivery_loop(
     *, events: EventBus, db: Database,
     operator: Operator,
@@ -738,8 +773,12 @@ async def _result_delivery_loop(
 
     Approval requests are NOT relayed through the operator — the
     telegram agent's `_approval_subscriber` sends the challenge-phrase
-    prompt directly. The operator stays out of the executor's loop
-    entirely after a hand_off that SUCCEEDS.
+    prompt directly.
+
+    A hand_off that SUCCEEDS also stays out of the operator's way, unless the
+    operator answered the user itself in the handing-off turn: then
+    `_on_handoff_reconcile` gives it the finding so it can correct or confirm
+    what it already said (see result_delivery's module docstring).
 
     A hand_off that FAILS comes back to it: `_on_handoff_failed` re-invokes
     the operator so it answers the user itself instead of the system emitting
@@ -749,6 +788,12 @@ async def _result_delivery_loop(
 
     async def _on_handoff_failed(chat_session_id: str, note: str) -> None:
         await deliver_failure_via_operator(
+            operator=operator, events=events,
+            chat_session_id=chat_session_id, note=note,
+        )
+
+    async def _on_handoff_reconcile(chat_session_id: str, note: str) -> None:
+        await deliver_reconciliation_via_operator(
             operator=operator, events=events,
             chat_session_id=chat_session_id, note=note,
         )
@@ -786,6 +831,8 @@ async def _result_delivery_loop(
                             )
                         ),
                         on_failure=_on_handoff_failed,
+                        first_pass_answer=task.first_pass_answer,
+                        on_reconcile=_on_handoff_reconcile,
                     )
                 except Exception:
                     log.exception(

@@ -422,9 +422,14 @@ class OpenRouterLLMClient:
     DeepSeek ~0.1x) with NO cache_control needed — nothing to plumb here. Note
     caching cuts cost, not TTFT (the operator's latency is round-trip-bound).
 
-    The operator's hand_off ack rides INSIDE the tool call (ack_msg arg), not as
-    parallel assistant text, so the gateway's text+tool_call stripping — the
-    reason GenAILLMClient exists for Gemini — is a non-issue here."""
+    The operator's hand_off ack rides INSIDE the tool call (ack_msg arg), so
+    the gateway's text+tool_call stripping — the reason GenAILLMClient exists
+    for Gemini — never breaks the ack. It DOES bear on the answer-alongside-
+    hand_off path (see prompts/operator_system.md): a provider that drops the
+    assistant text when a tool_call shares the response silently degrades that
+    to an ack-only hand_off. Not a correctness bug — `first_pass_answer` comes
+    out empty and delivery stays verbatim — but the immediate answer is lost,
+    so verify text survives alongside tool_calls before switching backends."""
 
     def __init__(
         self, base_url: str, api_key: str, provider_order: list[str] | None = None,
@@ -735,6 +740,12 @@ OPERATOR_TOOLS: list[dict[str, Any]] = [
                 "make, OR when you don't have "
                 "enough context to answer confidently.\n"
                 "\n"
+                "Emit your own best answer as the text body alongside this "
+                "call whenever you have one — the user reads it immediately "
+                "and you get to confirm or correct it once the result lands. "
+                "Omit the body only when any answer you could give now would "
+                "be a guess.\n"
+                "\n"
                 "The user's verbatim message is forwarded automatically. "
                 "Optionally pass `hint` to add context the user's literal "
                 "words don't carry — most commonly when the user replies "
@@ -743,11 +754,9 @@ OPERATOR_TOOLS: list[dict[str, Any]] = [
                 "short (one sentence) and factual; do NOT restate the "
                 "user's message.\n"
                 "\n"
-                "`ack_msg` is REQUIRED — the one-line acknowledgement the "
-                "user will see immediately. Pick varied phrasing each turn "
-                "(see the menu in your system prompt). Do NOT emit a text "
-                "body alongside this tool call; the ack lives in this "
-                "parameter and nothing else."
+                "`ack_msg` is REQUIRED — the one-line acknowledgement shown "
+                "when you emit no text body. Pick varied phrasing each turn "
+                "(see the menu in your system prompt)."
             ),
             "parameters": {
                 "type": "object",
@@ -1784,6 +1793,12 @@ class Operator:
                         tool_calls_made=tool_calls_made,
                         user_text=user_text,
                         allow_hand_off=allow_hand_off,
+                        # What the user is about to read from us this turn.
+                        # hand_off records it so the result can come back as
+                        # a correction to it rather than a second answer.
+                        assistant_text=_strip_breadcrumb_impersonation(
+                            resp.get("content") or ""
+                        ),
                     )
                 except Exception as e:
                     log.exception("operator tool %s failed", tc["name"])
@@ -2514,6 +2529,7 @@ class Operator:
         tool_calls_made: list[dict[str, Any]] | None = None,
         user_text: str = "",
         allow_hand_off: bool = True,
+        assistant_text: str = "",
     ) -> dict[str, Any]:
         del tool_calls_made  # vestigial; kept for compat
         if name == "hand_off":
@@ -2558,6 +2574,10 @@ class Operator:
                 outcome = await self._lifecycle.enqueue_executor(
                     prompt=forwarded, chat_session_id=chat_session_id,
                     restricted_to_chat=restricted_to_chat,
+                    # Empty when the operator only acked. Non-empty means it
+                    # answered the user in this same turn, which makes the
+                    # executor's finding a correction rather than the answer.
+                    first_pass_answer=(assistant_text or "").strip() or None,
                 )
             except Exception as e:
                 log.exception("hand_off: enqueue_executor failed")
@@ -2581,6 +2601,7 @@ class Operator:
                 hint=hint or None,
                 forwarded_len=len(forwarded),
                 cursor=new_cursor,
+                first_pass=(assistant_text or "").strip()[:120] or None,
             ))
             return {"enqueued": True, **outcome}
 

@@ -42,8 +42,10 @@ from oncall.operator_memory import Memory
 
 class ScriptedLLM:
     """Replays a sequence of LLM responses. Each script item is either
-    a plain string (text-only assistant turn) or a list of
-    (tool_name, args_dict) tuples (a tool-calling turn)."""
+    a plain string (text-only assistant turn), a list of
+    (tool_name, args_dict) tuples (a tool-calling turn with no body), or a
+    (text, [(tool_name, args_dict), ...]) tuple — a turn that answers and
+    calls a tool at once."""
 
     def __init__(self, script: list) -> None:
         self.script = list(script)
@@ -56,6 +58,7 @@ class ScriptedLLM:
         step = self.script.pop(0)
         if isinstance(step, str):
             return {"role": "assistant", "content": step, "tool_calls": []}
+        content, step = step if isinstance(step, tuple) else ("", step)
         tool_calls = []
         for i, (name, args) in enumerate(step):
             tool_calls.append({
@@ -63,7 +66,7 @@ class ScriptedLLM:
                 "name": name,
                 "arguments_json": json.dumps(args),
             })
-        return {"role": "assistant", "content": "", "tool_calls": tool_calls}
+        return {"role": "assistant", "content": content, "tool_calls": tool_calls}
 
 
 class StubMemory:
@@ -234,6 +237,38 @@ async def test_hand_off_enqueues_user_message_verbatim(stack):
     assert enqueued, "hand_off did not reach lifecycle"
     assert enqueued[0]["prompt"] == "check staging health"
     assert enqueued[0]["chat_session_id"] == "s1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body, expect_shown, expect_recorded",
+    [
+        ("Kerrygold — grass-fed, richest of that shelf.",
+         "Kerrygold — grass-fed, richest of that shelf.",
+         "Kerrygold — grass-fed, richest of that shelf."),
+        ("", "On it.", None),
+    ],
+    ids=["answer-and-verify", "ack-only"],
+)
+async def test_answer_alongside_hand_off_rides_onto_the_task(
+    stack, body, expect_shown, expect_recorded,
+):
+    """The operator may answer AND hand off in the same turn.
+
+    Two things have to hold together for the follow-up to work: the answer is
+    what the user sees (the ack is dropped, not appended), and it lands on the
+    task row so delivery knows the executor's finding is a correction to
+    something already said rather than the first thing the user will read. An
+    ack-only hand_off must leave the column NULL — that is what keeps ordinary
+    action tasks on the verbatim path.
+    """
+    llm = ScriptedLLM(script=[(body, [("hand_off", {"ack_msg": "On it."})])])
+    operator = _make_operator(stack, llm)
+    result = await operator.chat_turn(session_id="s1", user_text="what should I buy?")
+
+    assert result.user_facing_text() == expect_shown
+    (task,) = await stack["db"].list_tasks()
+    assert task.first_pass_answer == expect_recorded
 
 
 @pytest.mark.asyncio

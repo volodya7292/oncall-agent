@@ -71,6 +71,13 @@ class Task(BaseModel):
     # itself doesn't require a separate broker round-trip. None ⇒ normal
     # mutating-tool challenge flow applies.
     pre_approved_send_chat: str | None = None
+    # The operator's own immediate answer, written in the same turn that
+    # handed this task off. Non-empty means the user has already been given
+    # a first-pass answer, so result delivery routes the executor's finding
+    # back through the operator to confirm or correct it rather than
+    # publishing a second, unrelated-looking answer verbatim. None/empty ⇒
+    # the operator only acked, and the executor's text IS the answer.
+    first_pass_answer: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
     terminal_reason: TerminalReason | None = None

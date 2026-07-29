@@ -62,10 +62,12 @@ async def env(tmp_path):
 
 async def _task_with_text(
     db: Database, events: EventBus, text: str, *, rate_limited: bool = False,
+    first_pass_answer: str | None = None,
 ) -> Task:
     task = Task(
         session_id=str(uuid4()), prompt="do a thing",
         dispatched_by_chat_session="tg-agent-42",
+        first_pass_answer=first_pass_answer,
     )
     await db.insert_task(task)
     if rate_limited:
@@ -175,6 +177,71 @@ async def test_failure_falls_back_to_the_banner_when_the_operator_raises(env):
     replies = [p for t, p in published if t == "chat.reply"]
     assert len(replies) == 1
     assert replies[0]["trigger"] == "executor.failed"
+
+
+async def test_first_pass_answer_replaces_verbatim_delivery_with_a_correction(env):
+    """When the operator already answered, the executor's finding must reach
+    the user through the operator — and only once.
+
+    Both halves matter. Publishing the finding verbatim *as well* would land a
+    second answer that quietly disagrees with the first; writing it into
+    history as an assistant turn would make the operator believe it had said
+    something it never said. The operator's own reply is the only output.
+    """
+    db, events, published = env
+    task = await _task_with_text(
+        db, events, "Kerrygold is the pick — grass-fed, and it's on offer.",
+        first_pass_answer="Probably the Meggle, it spreads straight from the fridge.",
+    )
+    notes: list[str] = []
+
+    async def on_reconcile(session_id: str, note: str) -> None:
+        notes.append(note)
+        await events.publish_global("chat.reply", {
+            "session_id": session_id, "text": "Correction — take the Kerrygold.",
+            "voice_text": "", "trigger": "executor.done", "task_id": None,
+        })
+
+    await deliver_executor_result(
+        db=db, events=events, task_id=task.id,
+        chat_session_id="tg-agent-42", terminal_state="completed",
+        first_pass_answer=task.first_pass_answer, on_reconcile=on_reconcile,
+    )
+
+    (reply,) = [p for t, p in published if t == "chat.reply"]
+    assert reply["text"] == "Correction — take the Kerrygold."
+    assert await db.load_chat_history("tg-agent-42") == [], (
+        "the executor's text must not be written as an operator turn on this path"
+    )
+    # The operator can only reconcile if it is shown both sides of the diff.
+    (note,) = notes
+    assert "Kerrygold is the pick" in note
+    assert "Probably the Meggle" in note
+
+
+async def test_reconciliation_failure_falls_back_to_verbatim_delivery(env):
+    """A working answer must not be lost because the follow-up turn broke.
+
+    The operator has an answer sitting in hand and the user is holding a first
+    reply that may be wrong; going silent here is strictly worse than shipping
+    the executor's text unreconciled.
+    """
+    db, events, published = env
+    task = await _task_with_text(
+        db, events, "Kerrygold — grass-fed.", first_pass_answer="Take the Meggle.",
+    )
+
+    async def on_reconcile(session_id: str, note: str) -> None:
+        raise RuntimeError("operator is down")
+
+    await deliver_executor_result(
+        db=db, events=events, task_id=task.id,
+        chat_session_id="tg-agent-42", terminal_state="completed",
+        first_pass_answer=task.first_pass_answer, on_reconcile=on_reconcile,
+    )
+
+    (reply,) = [p for t, p in published if t == "chat.reply"]
+    assert reply["text"] == "Kerrygold — grass-fed."
 
 
 @pytest.mark.parametrize(

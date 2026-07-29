@@ -8,8 +8,21 @@ assistant text and dual-write it verbatim:
      so the operator's next turn naturally sees "what I just told the
      user" without being re-invoked.
 
-The operator is intentionally NOT involved in the SUCCESS path. It said
-"Looking…" when it called hand_off; the system delivers the answer.
+The operator is not involved in that path. It said "Looking…" when it called
+hand_off; the system delivers the answer.
+
+That holds only when the ack really was an ack. The operator may instead
+answer the user outright AND hand off in the same turn (see "Answer now,
+verify in the background" in prompts/operator_system.md) — the user has then
+already read an answer, and publishing the executor's text verbatim would
+land as a second, unattached answer that silently disagrees with the first.
+So when the task carries a `first_pass_answer`, the finding goes back to the
+operator (`on_reconcile`) and it writes the follow-up itself: confirm, correct,
+or extend what it already said. This is the ONE rewrite on the success path
+and it exists because there is something to reconcile against; it is not a
+reintroduction of the compressor described below. If it fails for any reason
+we fall through to verbatim delivery — an ack (or a first answer) followed by
+silence is the one outcome this module must never produce.
 
 The FAILURE path is the opposite: a task that dies produces no answer, and
 a canned system banner is a dead end for the user. So a terminal failure is
@@ -56,11 +69,21 @@ log = logging.getLogger(__name__)
 
 # (chat_session_id, note) -> awaits the operator turn that answers the user.
 FailureHandler = Callable[[str, str], Awaitable[None]]
+# Same shape, success path: the operator reconciles the executor's finding
+# against the answer it already gave. Must raise if it publishes nothing, so
+# the caller can fall back to verbatim delivery.
+ReconcileHandler = Callable[[str, str], Awaitable[None]]
 
 # How much of a failed task's own output to quote back to the operator. It is
 # context for writing a reply, not the reply — a failed run's text is as often
 # a CLI error string as a partial answer.
 _FAILURE_EXCERPT_CHARS = 300
+
+# Ceiling on each of the two texts quoted into a reconciliation note. Set at the
+# text ceiling so a well-behaved executor reply is never clipped, and explicitly
+# NOT at the voice one: on a call the operator still needs the whole finding to
+# reconcile against, however short what it then says aloud has to be.
+_RECONCILE_QUOTE_CHARS = 1500
 
 
 # Hard ceiling on what reaches the user, per delivery channel.
@@ -102,6 +125,8 @@ async def deliver_executor_result(
     terminal_state: str,
     spoken: bool = False,
     on_failure: FailureHandler | None = None,
+    first_pass_answer: str | None = None,
+    on_reconcile: ReconcileHandler | None = None,
 ) -> None:
     """Read the executor's final text and dual-write it verbatim.
 
@@ -111,6 +136,11 @@ async def deliver_executor_result(
     `on_failure`: called with a composed `[system note: ...]` body when the
     task failed, so the caller can re-invoke the operator to answer the user
     itself. None falls back to the canned banner (tests / no operator).
+
+    `first_pass_answer`: what the operator itself told the user in the turn
+    that handed this task off, if anything. When set (and `on_reconcile` is
+    wired) the executor's finding is handed back to the operator to reconcile
+    instead of being published verbatim.
     """
     task_events = await db.list_events(task_id)
     raw = latest_executor_text(task_events)
@@ -149,6 +179,22 @@ async def deliver_executor_result(
             task_id, terminal_state,
         )
         return
+
+    # The operator already answered this turn: its finding is a correction to
+    # that answer, not a standalone reply. Let the operator write the follow-up.
+    # Falling through on any failure is the point — see the module docstring.
+    first_pass = (first_pass_answer or "").strip()
+    if first_pass and on_reconcile is not None:
+        note = _compose_reconcile_note(first_pass, raw)
+        try:
+            await on_reconcile(chat_session_id, note)
+            return
+        except Exception:
+            log.exception(
+                "result_delivery: reconciliation handoff to the operator raised "
+                "for task %s; delivering the executor text verbatim instead",
+                task_id,
+            )
 
     final = _hard_truncate(raw, spoken=spoken).strip()
     if not final:
@@ -229,15 +275,41 @@ def _compose_failure_note(
         f"Answer them yourself now, from what you already know; if the "
         f"request genuinely needs tools you cannot reach, say so plainly."
     )
-    excerpt = (raw or "").strip()
+    excerpt = _clip(raw, _FAILURE_EXCERPT_CHARS)
     if excerpt:
-        if len(excerpt) > _FAILURE_EXCERPT_CHARS:
-            excerpt = excerpt[: _FAILURE_EXCERPT_CHARS - 1] + "…"
         note += (
             f" All it emitted before dying was: {excerpt!r} — that is "
             f"diagnostic output, not an answer, so do not relay it verbatim."
         )
     return note
+
+
+def _clip(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _compose_reconcile_note(first_pass: str, report: str) -> str:
+    """Build the `[system note: ...]` body handed to the operator when a task
+    it handed off — after already answering the user itself — comes back.
+
+    Both texts are quoted because the operator has to diff them: its own
+    answer is what the user has read, the report is what turned out to be
+    true. The instruction has to hold two edges at once — say what changed
+    (or the follow-up is noise) without re-saying what didn't (or it is a
+    duplicate answer).
+    """
+    return (
+        f"the job you handed off came back. Your acting layer reports: "
+        f"{_clip(report, _RECONCILE_QUOTE_CHARS)!r}. In that same turn you had "
+        f"already answered the user yourself: "
+        f"{_clip(first_pass, _RECONCILE_QUOTE_CHARS)!r} — they have read that. "
+        f"Write the follow-up now, in your own voice: correct yourself plainly "
+        f"where the report disagrees with you, and pass on what it adds that "
+        f"they still need. Where it only confirms you, say so in a few words. "
+        f"Do not restate what they have already read, and claim nothing the "
+        f"report does not support."
+    )
 
 
 async def _publish_failure_notice(

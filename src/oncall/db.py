@@ -40,6 +40,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Telegram chat the task is pre-authorized to op=send to. Broker
     -- auto-allows op=send when chat_id matches. NULL = no pre-approval.
     pre_approved_send_chat TEXT,
+    -- Operator's own answer written in the same turn as the hand_off.
+    -- Non-NULL ⇒ the user already has a first-pass answer, so the
+    -- executor's result is reconciled by the operator, not published raw.
+    first_pass_answer TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     terminal_reason TEXT
@@ -348,6 +352,12 @@ class Database:
         # user-approved draft). Broker auto-allows op=send when the input
         # chat_id matches this column. NULL means no pre-approval.
         await self._migrate_add_column("tasks", "pre_approved_send_chat", "TEXT")
+        # The operator's immediate answer that accompanied this hand_off, if
+        # any. Read at result-delivery time to decide whether the executor's
+        # finding is published verbatim or reconciled by the operator against
+        # what it already told the user. NULL on pre-migration rows, which is
+        # the correct backfill — they were ack-only hand_offs.
+        await self._migrate_add_column("tasks", "first_pass_answer", "TEXT")
         await self._migrate_add_column(
             "operator_memories", "model", "TEXT NOT NULL DEFAULT ''",
         )
@@ -468,8 +478,9 @@ class Database:
             INSERT INTO tasks (id, session_id, state, prompt, model, max_turns,
                                consecutive_denials, dispatched_by_chat_session,
                                restricted_to_chat, pre_approved_send_chat,
+                               first_pass_answer,
                                created_at, updated_at, terminal_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(task.id),
@@ -482,6 +493,7 @@ class Database:
                 task.dispatched_by_chat_session,
                 task.restricted_to_chat,
                 task.pre_approved_send_chat,
+                task.first_pass_answer,
                 iso(task.created_at),
                 iso(task.updated_at),
                 task.terminal_reason.value if task.terminal_reason else None,
@@ -1796,6 +1808,7 @@ def _row_to_task(row: aiosqlite.Row) -> Task:
         dispatched_by_chat_session=row["dispatched_by_chat_session"],
         restricted_to_chat=row["restricted_to_chat"],
         pre_approved_send_chat=row["pre_approved_send_chat"],
+        first_pass_answer=row["first_pass_answer"],
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
         terminal_reason=TerminalReason(row["terminal_reason"]) if row["terminal_reason"] else None,
