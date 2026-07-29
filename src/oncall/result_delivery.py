@@ -17,12 +17,17 @@ verify in the background" in prompts/operator_system.md) — the user has then
 already read an answer, and publishing the executor's text verbatim would
 land as a second, unattached answer that silently disagrees with the first.
 So when the task carries a `first_pass_answer`, the finding goes back to the
-operator (`on_reconcile`) and it writes the follow-up itself: confirm, correct,
-or extend what it already said. This is the ONE rewrite on the success path
-and it exists because there is something to reconcile against; it is not a
-reintroduction of the compressor described below. If it fails for any reason
-we fall through to verbatim delivery — an ack (or a first answer) followed by
-silence is the one outcome this module must never produce.
+operator (`on_reconcile`) and it writes the follow-up itself: correct what it
+said, add what the report adds, or — when the report merely confirms it — say
+nothing. This is the ONE rewrite on the success path and it exists because
+there is something to reconcile against; it is not a reintroduction of the
+compressor described below.
+
+Note the inverted invariant. Everywhere else here, silence after an ack is the
+outcome to prevent at all costs. On this path the user is already holding a
+real answer, so silence is not a dead end — restating what they just read is
+the actual failure. Only a reconciliation turn that *breaks* falls through to
+verbatim delivery; one that deliberately produces nothing is honoured.
 
 The FAILURE path is the opposite: a task that dies produces no answer, and
 a canned system banner is a dead end for the user. So a terminal failure is
@@ -70,8 +75,10 @@ log = logging.getLogger(__name__)
 # (chat_session_id, note) -> awaits the operator turn that answers the user.
 FailureHandler = Callable[[str, str], Awaitable[None]]
 # Same shape, success path: the operator reconciles the executor's finding
-# against the answer it already gave. Must raise if it publishes nothing, so
-# the caller can fall back to verbatim delivery.
+# against the answer it already gave. Returning WITHOUT publishing is a
+# legitimate outcome — it means the finding added nothing the user needs, and
+# they already have an answer, so silence is correct. Only RAISE if the turn
+# itself failed; that is what routes the caller back to verbatim delivery.
 ReconcileHandler = Callable[[str, str], Awaitable[None]]
 
 # How much of a failed task's own output to quote back to the operator. It is
@@ -303,11 +310,12 @@ def _compose_reconcile_note(first_pass: str, report: str) -> str:
         f"the job you handed off came back. Your acting layer reports: "
         f"{_clip(report, _RECONCILE_QUOTE_CHARS)!r}. In that same turn you had "
         f"already answered the user yourself: "
-        f"{_clip(first_pass, _RECONCILE_QUOTE_CHARS)!r} — they have read that. "
-        f"Write the follow-up now, in your own voice: correct yourself plainly "
-        f"where the report disagrees with you, and pass on what it adds that "
-        f"they still need. Where it only confirms you, say so in a few words. "
-        f"Do not restate what they have already read, and claim nothing the "
+        f"{_clip(first_pass, _RECONCILE_QUOTE_CHARS)!r} — they have read that "
+        f"and do not need it again. Say ONLY what is new: a plain correction "
+        f"where the report contradicts you, or the specific thing it adds that "
+        f"they still need. If it merely confirms what you already told them, "
+        f"reply with nothing at all — an empty reply is the correct output "
+        f"here, and restating yourself is the failure. Claim nothing the "
         f"report does not support."
     )
 

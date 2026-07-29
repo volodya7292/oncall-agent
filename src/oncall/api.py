@@ -731,10 +731,11 @@ async def deliver_reconciliation_via_operator(
     """Re-invoke the operator to reconcile a finished hand_off against the
     answer it gave the user in the same turn, and PUBLISH what it writes.
 
-    Same shape as `deliver_failure_via_operator`, and raises for the same
-    reason: an empty turn here routes the caller back to verbatim delivery,
-    so a successful task never goes silent just because this round produced
-    nothing.
+    Unlike `deliver_failure_via_operator`, an empty turn here is NOT an error.
+    The user is already holding the operator's own answer, so "the report
+    changed nothing worth sending" is a real verdict and we honour it by
+    staying quiet. Raising instead would fall the caller back to verbatim
+    delivery and publish the very restatement we were trying to avoid.
 
     `allow_hand_off=False` because this turn IS the answer to a hand_off that
     already ran. Without it the operator can hand the same question off again
@@ -750,7 +751,11 @@ async def deliver_reconciliation_via_operator(
     )
     text = (result.text or "").strip()
     if not text:
-        raise RuntimeError("operator produced no text for the reconciliation ping")
+        log.info(
+            "reconciliation: operator had nothing to add for chat %s; staying "
+            "silent (the user already has its first answer)", chat_session_id,
+        )
+        return
     await events.publish_global("chat.reply", {
         "session_id": chat_session_id,
         "text": text,

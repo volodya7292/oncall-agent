@@ -219,6 +219,34 @@ async def test_first_pass_answer_replaces_verbatim_delivery_with_a_correction(en
     assert "Probably the Meggle" in note
 
 
+async def test_silent_reconciliation_is_honoured_not_backfilled(env):
+    """When the finding only confirms what the operator already said, saying
+    nothing is the right output — and must NOT fall back to verbatim.
+
+    This inverts the invariant every other path here holds. Elsewhere an empty
+    operator turn means "the user is holding an ack and would hear silence",
+    so we backfill. Here they are holding a real answer, and backfilling
+    publishes exactly the restatement the reconciliation existed to avoid.
+    """
+    db, events, published = env
+    task = await _task_with_text(
+        db, events, "Kerrygold, 1.99 — best value on the shelf.",
+        first_pass_answer="Kerrygold at 1.99 is the pick.",
+    )
+
+    async def on_reconcile(session_id: str, note: str) -> None:
+        return  # nothing to add
+
+    await deliver_executor_result(
+        db=db, events=events, task_id=task.id,
+        chat_session_id="tg-agent-42", terminal_state="completed",
+        first_pass_answer=task.first_pass_answer, on_reconcile=on_reconcile,
+    )
+
+    assert not [p for t, p in published if t == "chat.reply"]
+    assert await db.load_chat_history("tg-agent-42") == []
+
+
 async def test_reconciliation_failure_falls_back_to_verbatim_delivery(env):
     """A working answer must not be lost because the follow-up turn broke.
 
