@@ -450,6 +450,15 @@ def _parse_json_loose(text: str) -> Any:
 # at the local DB; a Telegram reaction is MUTATING in the literal sense and
 # auto-allows because it is a single curated emoji the user can undo. None of
 # that is derivable from the op name, which is why no model is consulted.
+#
+# The READONLY entries here that the broker would auto-allow unconditionally
+# are ALSO allow-listed in executor/settings.json, so in practice the CLI
+# never asks and they never reach this table. That duplication is deliberate:
+# the round-trip (MCP approve → HTTP → classify → allow) bought nothing but an
+# audit row, and it was being paid on the executor's hottest tools — WebSearch
+# alone accounted for 219 of them. Keep the two lists in sync; a tool that
+# stops being READONLY here MUST come out of that allow-list in the same
+# change, or it silently skips the broker for good.
 # ---------------------------------------------------------------------------
 
 def policy_verdict(tool_name: str, tool_input: dict[str, Any]) -> Verdict:

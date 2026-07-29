@@ -3,7 +3,11 @@
   "permissions": {
     "defaultMode": "default",
     "allow": [
-      "WebFetch"
+      "WebFetch",
+      "WebSearch",
+      "Read",
+      "Glob",
+      "Grep"
     ],
     "ask": [],
     "deny": [
