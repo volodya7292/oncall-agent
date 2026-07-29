@@ -11,21 +11,6 @@
 #     docker exec -it oncall claude login
 # The credential persists on the mounted /root/.claude volume.
 #
-# Claude Code keeps a SECOND state file at ~/.claude.json — a sibling of that
-# directory, not a member of it — holding the oauth account, per-directory
-# trust, and model caches. Mounting only /root/.claude leaves it in the
-# container's own filesystem, so every `compose up` that recreates the
-# container silently reverts it to the copy baked in at build time: the
-# executor comes back deauthenticated and every hand_off dies with
-# "OAuth session expired and could not be refreshed".
-#
-# It is symlinked into the mounted directory below rather than bind-mounted as
-# a file, because a file bind whose host path is missing makes Docker create a
-# DIRECTORY there — which breaks the CLI differently and only on fresh hosts.
-# Directory binds have no such trap. Verified that the CLI writes through the
-# symlink (open+write on the resolved path) instead of renaming over it, so
-# the link survives config writes and works even while dangling on first boot.
-#
 # Run (single container; Ollama already on the host, no compose):
 #     docker run -d --name oncall --restart unless-stopped \
 #       -e ONCALL_BIND_HOST=0.0.0.0 \
@@ -57,14 +42,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get purge -y curl \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
-
-# Relocate ~/.claude.json into the persisted directory (see Auth note above).
-# Must run AFTER the install step, which creates a real file there via
-# `claude --version`. The link target does not exist at build time and does not
-# need to: the CLI creates it on first write.
-RUN mkdir -p /root/.claude \
-    && rm -f /root/.claude.json \
-    && ln -s /root/.claude/claude.json /root/.claude.json
 
 WORKDIR /app
 
