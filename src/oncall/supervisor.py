@@ -348,28 +348,38 @@ class Supervisor:
             # the moment the subprocess exited, so the next spawn would
             # fail with "No conversation found".
         ]
-        # The CLI ships its own scheduling family, which has nothing to do with
-        # ours: its jobs fire inside a `--print` subprocess that exits seconds
-        # later, so they are inert here, and their names shadow
-        # `mcp__oncall__schedule` — the only scheduler that actually persists.
-        # Asked whether a scheduled job was still live, the executor called
-        # CronList, got "No scheduled jobs", and reported none existed while a
-        # daily oncall check was still firing. Removing them leaves exactly one
-        # tool that answers scheduling questions.
-        disallowed = ["CronCreate", "CronDelete", "CronList", "ScheduleWakeup"]
-        # Cloud-primary mode: this process runs in a container on a VPS.
-        # Deny the executor's native MUTATING tools so it can't silently
-        # operate on the server box — local work goes through the
-        # `mcp__oncall__laptop` proxy, which runs on the user's laptop.
-        # Read-only tools (Read/Glob/Grep) stay enabled: the container is
+        # The built-in tool set is an ALLOWLIST, not a denylist. Beyond the
+        # obvious file/shell/web tools, the CLI ships an orchestration surface
+        # for its OWN runtime — timers, background jobs, subagents, workflows,
+        # plan and worktree modes. All of it is scoped to a `--print` subprocess
+        # that exits when this turn ends, and all of it duplicates a mechanism
+        # oncall already owns (`mcp__oncall__schedule` for timers, our task
+        # table for jobs, `invoke_developer` for delegation).
+        #
+        # The introspection half is not merely redundant, it is wrong on its
+        # face: those tools answer "nothing scheduled" / "no tasks" truthfully
+        # about a runtime that has never held any of the user's work, and the
+        # executor reports that as an answer about oncall. It cleared a live
+        # daily check via CronList; with CronList denied it reached for TaskList
+        # and said the same thing. Denying decoys one bug at a time loses to
+        # whatever the CLI ships next, so name what the executor may use and let
+        # everything else — present and future — default to absent.
+        #
+        # `--tools` gates built-ins only: every `mcp__oncall__*` tool stays
+        # available through --mcp-config regardless of what is listed here.
+        tools = ["Read", "Glob", "Grep", "WebFetch", "WebSearch"]
+        # Cloud-primary mode: this process runs in a container on a VPS, so the
+        # MUTATING tools stay out and local work goes through the
+        # `mcp__oncall__laptop` proxy, which runs on the user's laptop. The
+        # read-only three are in the list above for both roles: the container is
         # isolated, and Telegram attachments land on the SERVER's disk
-        # (~/.oncall/inbound) — without native Read the executor has no way
-        # to open them (the laptop proxy looks at the wrong machine).
-        # WebFetch/WebSearch (allowlisted in settings.json) and the MCP tools
-        # stay available.
-        if self._settings.is_server_role:
-            disallowed += ["Bash", "Edit", "Write", "NotebookEdit"]
-        argv += ["--disallowedTools", ",".join(disallowed)]
+        # (~/.oncall/inbound), so without native Read the executor has no way to
+        # open them (the laptop proxy looks at the wrong machine).
+        if not self._settings.is_server_role:
+            tools += ["Bash", "Edit", "Write", "NotebookEdit"]
+        # Comma-joined into ONE argv element: --tools is variadic, so passing
+        # the names as separate elements would swallow whatever follows.
+        argv += ["--tools", ",".join(tools)]
         argv += ["--model", task.model or "sonnet"]
         if task.max_turns:
             # claude uses --max-turns or similar — we keep it generic; if not
