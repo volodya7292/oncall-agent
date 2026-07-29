@@ -1443,6 +1443,18 @@ class Database:
             rows = await cur.fetchall()
         return [_row_to_scheduled_check(r) for r in rows]
 
+    async def list_pending_scheduled_checks(self) -> list[dict[str, Any]]:
+        """Every pending check across all chats, soonest-due first. Backs the
+        owner-facing `/status` surface, which is a whole-service snapshot; the
+        executor's own `schedule` tool uses the per-chat variant below so one
+        session can't see or cancel another's."""
+        async with self.conn.execute(
+            "SELECT * FROM scheduled_checks WHERE status = 'pending' "
+            "ORDER BY fire_at ASC",
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_scheduled_check(r) for r in rows]
+
     async def list_pending_scheduled_checks_for_chat(
         self, chat_session_id: str,
     ) -> list[dict[str, Any]]:

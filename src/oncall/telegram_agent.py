@@ -43,6 +43,7 @@ from .operator import Operator, summarize_llm_error
 from .telegram_format import (
     age,
     chunk_message,
+    format_seconds,
     label_for_chat,
     relative_age,
     reply_context_note,
@@ -86,6 +87,18 @@ def agent_session_id(owner_user_id: int) -> str:
     return f"tg-agent-{owner_user_id}"
 
 
+def _fmt_due(fire_at: str) -> str:
+    """When a scheduled check next fires, relative to now: 'in 3h' / 'due now'."""
+    try:
+        when = datetime.fromisoformat(fire_at)
+    except (TypeError, ValueError):
+        return "at unknown time"
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    delta = (when - datetime.now(timezone.utc)).total_seconds()
+    return "due now" if delta <= 0 else f"in {format_seconds(delta)}"
+
+
 def _fmt_ms(ms: float) -> str:
     """Human-friendly duration: sub-second in ms, else seconds."""
     return f"{ms:.0f}ms" if ms < 1000 else f"{ms / 1000:.1f}s"
@@ -102,7 +115,7 @@ def _fmt_latency(s: dict[str, float | int]) -> str:
 
 _SLASH_HELP = (
     "/start — greeting\n"
-    "/status — snapshot of running tasks, queue, approvals, pending DMs\n"
+    "/status — snapshot of running tasks, queue, approvals, scheduled jobs, pending DMs\n"
     "/context — export this session's chat history + latest summary as a markdown file\n"
     "/clear — wipe this chat's history and reset the executor session (memory is preserved)\n"
     "/compact — force-compact older messages into a summary now\n"
@@ -674,6 +687,7 @@ class TelegramAgentService:
         # chat may still be unread, and a read chat may be mid-flight.
         pending_chats = await self._db.list_pending_chats()
         pending = sum(r["unread_count"] for r in pending_chats)
+        scheduled = await self._db.list_pending_scheduled_checks()
 
         running.sort(key=lambda t: t.created_at)
         queued.sort(key=lambda t: t.created_at)
@@ -684,6 +698,7 @@ class TelegramAgentService:
             f"Tasks: {len(running)} running, {len(queued)} queued, "
             f"{len(awaiting)} awaiting approval",
             f"Approvals pending: {len(approvals)}",
+            f"Scheduled jobs: {len(scheduled)}",
             f"Pending DMs: {pending}",
         ]
 
@@ -700,6 +715,22 @@ class TelegramAgentService:
                 lines.append(f"- {str(t.id)[:6]}: {truncate(t.prompt, 70)}")
             if len(queued) > 5:
                 lines.append(f"- ...and {len(queued) - 5} more")
+
+        if scheduled:
+            lines += ["", "Scheduled:"]
+            for c in scheduled[:5]:
+                interval = c["interval_seconds"]
+                recur = f", every {format_seconds(interval)}" if interval else ""
+                elsewhere = (
+                    "" if c["chat_session_id"] == self._session_id
+                    else f", chat {c['chat_session_id']}"
+                )
+                lines.append(
+                    f"- {c['id'][:6]} ({_fmt_due(c['fire_at'])}{recur}{elsewhere}): "
+                    f"{truncate(c['prompt'], 70)}"
+                )
+            if len(scheduled) > 5:
+                lines.append(f"- ...and {len(scheduled) - 5} more")
 
         try:
             op = await self._operator.get_status(self._session_id)
@@ -743,8 +774,14 @@ class TelegramAgentService:
         if lat_lines:
             lines += ["", "Latency (rolling):", *lat_lines]
 
-        if not (running or queued or approvals or pending) and op is None and not lat_lines:
-            return "All quiet. No tasks, no pending approvals, no pending DMs."
+        if (
+            not (running or queued or approvals or pending or scheduled)
+            and op is None and not lat_lines
+        ):
+            return (
+                "All quiet. No tasks, no pending approvals, no scheduled "
+                "jobs, no pending DMs."
+            )
 
         return "\n".join(lines)
 
