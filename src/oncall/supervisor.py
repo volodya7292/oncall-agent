@@ -348,6 +348,15 @@ class Supervisor:
             # the moment the subprocess exited, so the next spawn would
             # fail with "No conversation found".
         ]
+        # The CLI ships its own scheduling family, which has nothing to do with
+        # ours: its jobs fire inside a `--print` subprocess that exits seconds
+        # later, so they are inert here, and their names shadow
+        # `mcp__oncall__schedule` — the only scheduler that actually persists.
+        # Asked whether a scheduled job was still live, the executor called
+        # CronList, got "No scheduled jobs", and reported none existed while a
+        # daily oncall check was still firing. Removing them leaves exactly one
+        # tool that answers scheduling questions.
+        disallowed = ["CronCreate", "CronDelete", "CronList", "ScheduleWakeup"]
         # Cloud-primary mode: this process runs in a container on a VPS.
         # Deny the executor's native MUTATING tools so it can't silently
         # operate on the server box — local work goes through the
@@ -359,10 +368,8 @@ class Supervisor:
         # WebFetch/WebSearch (allowlisted in settings.json) and the MCP tools
         # stay available.
         if self._settings.is_server_role:
-            argv += [
-                "--disallowedTools",
-                "Bash,Edit,Write,NotebookEdit",
-            ]
+            disallowed += ["Bash", "Edit", "Write", "NotebookEdit"]
+        argv += ["--disallowedTools", ",".join(disallowed)]
         argv += ["--model", task.model or "sonnet"]
         if task.max_turns:
             # claude uses --max-turns or similar — we keep it generic; if not
