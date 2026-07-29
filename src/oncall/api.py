@@ -686,6 +686,45 @@ def _supervise_bg_task(
     task.add_done_callback(_cb)
 
 
+async def deliver_failure_via_operator(
+    *, operator: Operator, events: EventBus, chat_session_id: str, note: str,
+) -> None:
+    """Re-invoke the operator to answer a user whose hand_off just died, and
+    PUBLISH what it writes.
+
+    The publish is the whole point and is easy to lose: `auto_ping` runs the
+    turn and records it, but sending is the caller's job (same shape as
+    `Operator._notify_dispatch_denied`). Shipped once without it — the
+    operator wrote four perfectly good answers that stopped in the DB while
+    the user, who had already seen "Шукаю варіанти.", got silence and asked
+    again.
+
+    Raises when the operator produced nothing, which routes the caller to the
+    canned banner. That is deliberate: an ack followed by silence is the one
+    outcome this path must never produce.
+    """
+    result = await operator.auto_ping(
+        chat_session_id, note,
+        # The note is machine bookkeeping, not a topic — retrieving memories
+        # against it would key on the failure prose.
+        retrieval_query=None,
+        allow_hand_off=False,
+    )
+    text = (result.text or "").strip()
+    if not text:
+        raise RuntimeError("operator produced no text for the failure ping")
+    await events.publish_global("chat.reply", {
+        "session_id": chat_session_id,
+        "text": text,
+        "voice_text": to_voice_text(text),
+        # Same trigger a delivered result uses: on a live call this IS the
+        # answer to what the user asked out loud, so it must cut ahead of
+        # chitchat rather than queue behind it.
+        "trigger": "executor.done",
+        "task_id": None,
+    })
+
+
 async def _result_delivery_loop(
     *, events: EventBus, db: Database,
     operator: Operator,
@@ -709,12 +748,9 @@ async def _result_delivery_loop(
     from uuid import UUID
 
     async def _on_handoff_failed(chat_session_id: str, note: str) -> None:
-        await operator.auto_ping(
-            chat_session_id, note,
-            # The note is machine bookkeeping, not a topic — retrieving
-            # memories against it would key on the failure prose.
-            retrieval_query=None,
-            allow_hand_off=False,
+        await deliver_failure_via_operator(
+            operator=operator, events=events,
+            chat_session_id=chat_session_id, note=note,
         )
 
     consecutive_crashes = 0

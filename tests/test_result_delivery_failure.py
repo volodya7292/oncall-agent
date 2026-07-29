@@ -10,11 +10,13 @@ re-asked and got the same line back each time.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
 import pytest
 
+from oncall.api import deliver_failure_via_operator
 from oncall.config import Settings
 from oncall.db import Database
 from oncall.events import EventBus
@@ -103,6 +105,56 @@ async def test_failed_task_text_goes_to_the_operator_not_the_user(env):
     assert "02:00 UTC" in note, "resetsAt must be rendered for the operator"
     assert cli_meta in note
     assert "do not relay it verbatim" in note
+
+
+async def test_operator_answer_to_a_failed_hand_off_reaches_the_user(env):
+    """Regression: the operator's answer must be PUBLISHED, not just written.
+
+    `auto_ping` runs the turn and records it; sending is the caller's job.
+    Shipped once without the publish — the operator wrote good answers that
+    stopped in the DB while the user, holding an ack, heard nothing and asked
+    again. Asserting only that `on_failure` fired does not catch this, which
+    is why this test goes through the real publish path.
+    """
+    db, events, published = env
+
+    class StubOperator:
+        def __init__(self) -> None:
+            self.pings: list[tuple[str, bool]] = []
+
+        async def auto_ping(self, session_id, note, **kwargs):
+            self.pings.append((session_id, kwargs.get("allow_hand_off", True)))
+            return SimpleNamespace(text="Can't reach my tools — Oakley or Uvex.")
+
+    op = StubOperator()
+    await deliver_failure_via_operator(
+        operator=op, events=events, chat_session_id="tg-agent-42",
+        note="the job you handed off failed",
+    )
+
+    assert op.pings == [("tg-agent-42", False)], "must block hand_off for the turn"
+    (reply,) = [p for t, p in published if t == "chat.reply"]
+    assert reply["session_id"] == "tg-agent-42"
+    assert reply["text"] == "Can't reach my tools — Oakley or Uvex."
+    # On a live call this is the answer to a spoken question, so it has to cut
+    # ahead of chitchat rather than queue behind it.
+    assert reply["trigger"] == "executor.done"
+
+
+async def test_silent_operator_falls_back_instead_of_leaving_an_ack_hanging(env):
+    """If the operator writes nothing, the caller must still say something —
+    an ack followed by silence is the outcome this path exists to prevent."""
+    events = env[1]
+
+    class MuteOperator:
+        async def auto_ping(self, session_id, note, **kwargs):
+            return SimpleNamespace(text="")
+
+    with pytest.raises(RuntimeError):
+        await deliver_failure_via_operator(
+            operator=MuteOperator(), events=events,
+            chat_session_id="tg-agent-42", note="failed",
+        )
 
 
 async def test_failure_falls_back_to_the_banner_when_the_operator_raises(env):
