@@ -740,11 +740,10 @@ OPERATOR_TOOLS: list[dict[str, Any]] = [
                 "make, OR when you don't have "
                 "enough context to answer confidently.\n"
                 "\n"
-                "Emit your own best answer as the text body alongside this "
-                "call whenever you have one — the user reads it immediately "
-                "and you get to confirm or correct it once the result lands. "
-                "Omit the body only when any answer you could give now would "
-                "be a guess.\n"
+                "`answer` carries your own best reply RIGHT NOW. The user "
+                "reads it immediately and you get to confirm or correct it "
+                "once the result lands, so fill it whenever you can say "
+                "something useful from what is already in front of you.\n"
                 "\n"
                 "The user's verbatim message is forwarded automatically. "
                 "Optionally pass `hint` to add context the user's literal "
@@ -755,18 +754,34 @@ OPERATOR_TOOLS: list[dict[str, Any]] = [
                 "user's message.\n"
                 "\n"
                 "`ack_msg` is REQUIRED — the one-line acknowledgement shown "
-                "when you emit no text body. Pick varied phrasing each turn "
+                "when `answer` is empty. Pick varied phrasing each turn "
                 "(see the menu in your system prompt)."
             ),
             "parameters": {
                 "type": "object",
-                "required": ["ack_msg"],
+                # `answer` is required rather than optional because an optional
+                # one is simply not filled: measured on gemini-3.5-flash-lite,
+                # an optional `answer` was populated in 1 of 8 trials, a
+                # required one in 8 of 10. Models answer the question a schema
+                # actually asks them.
+                "required": ["ack_msg", "answer"],
                 "properties": {
+                    "answer": {
+                        "type": "string",
+                        "description": (
+                            "REQUIRED. Your own best answer to the user right "
+                            "now, written in full, in their language. Shown to "
+                            "them immediately in place of `ack_msg`. Empty "
+                            "string ONLY when any answer you could give would "
+                            "be a guess — the request needs an action taken, "
+                            "or data you do not have."
+                        ),
+                    },
                     "ack_msg": {
                         "type": "string",
                         "description": (
-                            "Short one-line acknowledgement shown to the "
-                            "user right now (e.g. \"Looking.\", \"On it.\", "
+                            "Short one-line acknowledgement, shown only when "
+                            "`answer` is empty (e.g. \"Looking.\", \"On it.\", "
                             "\"Let me check.\"). Match the user's language. "
                             "Vary each turn — do not repeat the previous "
                             "ack."
@@ -915,9 +930,15 @@ class OperatorTurnResult:
 
     def user_facing_text(self) -> str:
         """The single string a transport (Telegram text / voice TTS) should
-        show the user for this turn. Prefers any non-empty assistant text
-        body; otherwise pulls `ack_msg` from a successful `hand_off` tool
-        call (the canonical ack channel since hand_off requires the arg).
+        show the user for this turn.
+
+        Three channels in falling priority: a plain assistant text body, then
+        a successful `hand_off`'s `answer`, then its `ack_msg`. The text body
+        comes first only so backends that DO emit text alongside a tool call
+        keep working — no Gemini model does (measured 0/6 on flash-lite,
+        3.5-flash and 3.6-flash alike), which is exactly why the real answer
+        rides inside the call as an argument instead.
+
         Empty string when there's nothing to show — caller may suppress."""
         if self.text:
             return self.text
@@ -927,7 +948,9 @@ class OperatorTurnResult:
                 and isinstance(tc.get("result"), dict)
                 and tc["result"].get("enqueued")
             ):
-                return ((tc.get("args") or {}).get("ack_msg") or "").strip()
+                args = tc.get("args") or {}
+                answer = (args.get("answer") or "").strip()
+                return answer or (args.get("ack_msg") or "").strip()
         return ""
 
 
@@ -2577,7 +2600,14 @@ class Operator:
                     # Empty when the operator only acked. Non-empty means it
                     # answered the user in this same turn, which makes the
                     # executor's finding a correction rather than the answer.
-                    first_pass_answer=(assistant_text or "").strip() or None,
+                    # `assistant_text` first for backends that emit a body
+                    # alongside the call; on Gemini it is always the `answer`
+                    # arg that carries it.
+                    first_pass_answer=(
+                        (assistant_text or "").strip()
+                        or str(args.get("answer") or "").strip()
+                        or None
+                    ),
                 )
             except Exception as e:
                 log.exception("hand_off: enqueue_executor failed")
@@ -2601,7 +2631,9 @@ class Operator:
                 hint=hint or None,
                 forwarded_len=len(forwarded),
                 cursor=new_cursor,
-                first_pass=(assistant_text or "").strip()[:120] or None,
+                first_pass=str(
+                    (assistant_text or "").strip() or args.get("answer") or "",
+                )[:120] or None,
             ))
             return {"enqueued": True, **outcome}
 

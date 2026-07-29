@@ -206,8 +206,12 @@ def test_hand_off_tool_shape():
     arg — it's read from chat history."""
     hand_off = next(t for t in OPERATOR_TOOLS if t["function"]["name"] == "hand_off")
     params = hand_off["function"]["parameters"]
-    assert set(params.get("properties", {}).keys()) == {"ack_msg", "hint"}
-    assert params.get("required", []) == ["ack_msg"]
+    assert set(params.get("properties", {}).keys()) == {"ack_msg", "answer", "hint"}
+    # `answer` must stay REQUIRED. As an optional param it is simply not
+    # filled — measured on gemini-3.5-flash-lite, 1/8 trials optional vs
+    # 8/10 required — which silently reduces every turn to an ack-only
+    # hand_off and makes the reconciliation path dead code.
+    assert sorted(params.get("required", [])) == ["ack_msg", "answer"]
 
 
 # ---------------------------------------------------------------------------
@@ -239,19 +243,21 @@ async def test_hand_off_enqueues_user_message_verbatim(stack):
     assert enqueued[0]["chat_session_id"] == "s1"
 
 
+_ANSWER = "Kerrygold — grass-fed, richest of that shelf."
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "body, expect_shown, expect_recorded",
+    "body, args, expect_shown, expect_recorded",
     [
-        ("Kerrygold — grass-fed, richest of that shelf.",
-         "Kerrygold — grass-fed, richest of that shelf.",
-         "Kerrygold — grass-fed, richest of that shelf."),
-        ("", "On it.", None),
+        ("", {"ack_msg": "On it.", "answer": _ANSWER}, _ANSWER, _ANSWER),
+        (_ANSWER, {"ack_msg": "On it."}, _ANSWER, _ANSWER),
+        ("", {"ack_msg": "On it.", "answer": ""}, "On it.", None),
     ],
-    ids=["answer-and-verify", "ack-only"],
+    ids=["answer-arg", "text-body", "ack-only"],
 )
-async def test_answer_alongside_hand_off_rides_onto_the_task(
-    stack, body, expect_shown, expect_recorded,
+async def test_answer_on_a_hand_off_rides_onto_the_task(
+    stack, body, args, expect_shown, expect_recorded,
 ):
     """The operator may answer AND hand off in the same turn.
 
@@ -259,10 +265,14 @@ async def test_answer_alongside_hand_off_rides_onto_the_task(
     what the user sees (the ack is dropped, not appended), and it lands on the
     task row so delivery knows the executor's finding is a correction to
     something already said rather than the first thing the user will read. An
-    ack-only hand_off must leave the column NULL — that is what keeps ordinary
+    empty `answer` must leave the column NULL — that is what keeps ordinary
     action tasks on the verbatim path.
+
+    Both carriers are covered because they are not interchangeable in
+    production: no Gemini model emits a text body alongside a tool call, so
+    on the live backend it is always the `answer` argument that carries this.
     """
-    llm = ScriptedLLM(script=[(body, [("hand_off", {"ack_msg": "On it."})])])
+    llm = ScriptedLLM(script=[(body, [("hand_off", args)])])
     operator = _make_operator(stack, llm)
     result = await operator.chat_turn(session_id="s1", user_text="what should I buy?")
 
