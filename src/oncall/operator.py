@@ -956,6 +956,23 @@ class OperatorTurnResult:
 
 AUTO_PING_PREFIX = "[system note: "
 
+# Inline image parts sent to the operator per turn. 10 is Telegram's own
+# album maximum, so a coalesced album is never truncated.
+#
+# This was 3, on the belief that flash-lite degrades past that. Measured
+# instead — 10 distinct images, "name each in order" — both gemini-3.6-flash
+# and flash-lite got 10/10, and latency grew from 1.17s to 2.00s and 0.60s to
+# 1.07s respectively. The old cap was silently dropping images for no reason.
+# Extras beyond the cap still get a text placeholder in history (see
+# `_run_turn`) so the model can ask the user to resend.
+_MAX_INLINE_ATTACHMENTS = 10
+
+# Cumulative inline-image budget per turn. The count cap alone is not enough:
+# each attachment may be up to _ATTACHMENT_MAX_BYTES (10MB), so ten of them
+# could build a ~130MB request that just times out. Ordinary phone photos are
+# a few hundred KB, so this only ever bites on a pathological album.
+_MAX_INLINE_ATTACHMENT_BYTES = 16 * 1024 * 1024
+
 # Marker introducing an operator-only "next action" footer inside an
 # auto-ping system-note body. Stripped before forwarding the note as
 # `user_text` to the executor so the executor doesn't read role
@@ -1571,19 +1588,43 @@ class Operator:
         # bytes; cross-turn the operator remembers what it described in
         # its assistant reply rather than the original pixels.
         #
-        # Hard cap at 3: Gemini flash-lite (the default operator model)
-        # tops out around 3 inline-image parts per request before
-        # latency / reliability degrades. Any extras are dropped from
-        # this turn — the model still sees the placeholders so it can
-        # ask the user to resend if needed.
-        attachments = list(attachments or [])[:3]
-        for att in attachments:
+        # Hard cap at 3 inline images: Gemini flash-lite (the default
+        # operator model) tops out around 3 inline-image parts per request
+        # before latency / reliability degrades. Any extras are dropped from
+        # this turn — the model still sees the placeholders so it can ask the
+        # user to resend if needed.
+        #
+        # The cap is applied AFTER the placeholders are written, so a group
+        # larger than it leaves a visible trace of what was dropped instead
+        # of vanishing. That distinction only started mattering once
+        # Telegram albums began arriving as ONE turn (they carry up to 10
+        # photos); before that each photo was its own turn and the cap was
+        # effectively unreachable.
+        all_attachments = list(attachments or [])
+        for att in all_attachments:
             placeholder = (
                 f"[attachment: {att.get('mime_type', '?')}, "
                 f"{att.get('size_bytes', 0)} bytes — "
                 f"{att.get('source', '?')}; content not persisted]"
             )
             await self._db.append_chat_message(session_id, "user", placeholder)
+        attachments = []
+        budget = _MAX_INLINE_ATTACHMENT_BYTES
+        for att in all_attachments[:_MAX_INLINE_ATTACHMENTS]:
+            size = int(att.get("size_bytes") or 0)
+            # Always inline the first one, whatever its size — a single
+            # oversized image is still the thing the user asked about.
+            if attachments and size > budget:
+                break
+            budget -= size
+            attachments.append(att)
+        if len(attachments) < len(all_attachments):
+            log.info(
+                "operator: inlining %d of %d attachments this turn (caps: %d "
+                "images, %d bytes); the rest are placeholders only",
+                len(attachments), len(all_attachments),
+                _MAX_INLINE_ATTACHMENTS, _MAX_INLINE_ATTACHMENT_BYTES,
+            )
 
         # Load + possibly compress the rolling history. Compression is
         # idempotent: if no compression is needed, the summary returned is

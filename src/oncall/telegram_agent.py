@@ -171,6 +171,9 @@ class TelegramAgentService:
         # Cached at startup via get_me() so /help / logs can reference us.
         self._me_user_id: int | None = None
         self._me_username: str | None = None
+        # grouped_id → parts of a Telegram album still arriving, plus the
+        # settle-timer task that will flush them. See `_buffer_album_part`.
+        self._albums: dict[int, dict[str, Any]] = {}
 
     @property
     def session_id(self) -> str:
@@ -233,9 +236,14 @@ class TelegramAgentService:
     async def stop(self) -> None:
         if not self._started:
             return
+        album_tasks = [
+            b["task"] for b in self._albums.values() if b.get("task") is not None
+        ]
+        self._albums.clear()
         for task in (
             self._reply_task, self._approval_task,
             self._approval_resolved_task, self._dispatch_approval_task,
+            *album_tasks,
         ):
             if task is not None and not task.done():
                 task.cancel()
@@ -341,6 +349,11 @@ class TelegramAgentService:
                 )
                 reply_note = reply_context_note(reply, who=who)
         attachments: list[dict[str, Any]] = []
+        # Kept separate from `text` because the album path has to rebuild the
+        # message from its parts: `text` accumulates the file note below,
+        # which must not be duplicated per member.
+        caption = text
+        file_note: str | None = None
         if getattr(event.message, "media", None) is not None:
             try:
                 data = await event.message.download_media(file=bytes)
@@ -383,10 +396,24 @@ class TelegramAgentService:
                         f"[file attached: {local_path} "
                         f"({mime}, {len(data)} bytes)]"
                     )
+                    file_note = note
                     text = f"{text}\n{note}".strip() if text else note
                 elif not text:
                     text = "(attachment — please look at the image)"
         if not text:
+            return
+
+        # Telegram has no "one message with N photos" on the wire: an album
+        # arrives as N messages sharing a grouped_id, and only one of them
+        # carries the caption. Handled as they land, the user's single
+        # message becomes N operator turns — N hand_offs, N executor tasks,
+        # N answers. Buffer the parts instead and run one turn for the group.
+        grouped_id = getattr(event.message, "grouped_id", None)
+        if grouped_id is not None:
+            self._buffer_album_part(
+                int(grouped_id), caption=caption, file_note=file_note,
+                attachments=attachments, reply_note=reply_note,
+            )
             return
 
         # Approval phrase match BEFORE slash commands / operator routing.
@@ -414,6 +441,89 @@ class TelegramAgentService:
         if reply_note:
             text = f"{reply_note}\n{text}"
 
+        await self._run_operator_turn(text, attachments)
+
+    # How long an album may go quiet before we call it complete. Its members
+    # arrive together, so this only has to outlast the gap between two
+    # consecutive downloads — and it delays every album reply by exactly this
+    # much, so it stays short.
+    _ALBUM_SETTLE_SECONDS = 2.0
+
+    def _buffer_album_part(
+        self, grouped_id: int, *, caption: str, file_note: str | None,
+        attachments: list[dict[str, Any]], reply_note: str,
+    ) -> None:
+        """Accumulate one member of a Telegram album for a later single turn.
+
+        Every part restarts the settle timer, so a group whose members arrive
+        slowly is still delivered whole rather than split. Buffering also
+        keeps the inbound handler fast, which matters: the handler is
+        effectively serialized behind the operator turn it starts, so
+        answering part 1 inline is what delayed part 2 by seconds and made
+        the group look like two unrelated messages in the first place.
+        """
+        buf = self._albums.get(grouped_id)
+        if buf is None:
+            buf = {
+                "captions": [], "notes": [], "attachments": [],
+                "reply_note": "", "task": None,
+            }
+            self._albums[grouped_id] = buf
+        if caption:
+            buf["captions"].append(caption)
+        if file_note:
+            buf["notes"].append(file_note)
+        buf["attachments"].extend(attachments)
+        if reply_note and not buf["reply_note"]:
+            buf["reply_note"] = reply_note
+        pending: asyncio.Task | None = buf["task"]
+        if pending is not None:
+            pending.cancel()
+        buf["task"] = asyncio.create_task(
+            self._flush_album_after_settle(grouped_id),
+            name=f"tg-agent-album-{grouped_id}",
+        )
+
+    async def _flush_album_after_settle(self, grouped_id: int) -> None:
+        """Wait out `_ALBUM_SETTLE_SECONDS` of quiet, then run one turn for
+        the whole album. Cancelled and replaced whenever another part lands."""
+        try:
+            await asyncio.sleep(self._ALBUM_SETTLE_SECONDS)
+        except asyncio.CancelledError:
+            return  # a later part landed and now owns the timer
+        buf = self._albums.pop(grouped_id, None)
+        if buf is None:
+            log.info(
+                "album %s had no buffered parts at flush; nothing to send",
+                grouped_id,
+            )
+            return
+        try:
+            captions = [c for c in buf["captions"] if c]
+            lines = captions + buf["notes"]
+            if not captions:
+                # No caption anywhere in the group. Without this the model
+                # sees only bare file-path notes and reads them as several
+                # unrelated drops rather than one thing to look at.
+                lines.insert(0, (
+                    f"(album of {len(buf['attachments'])} attachments — "
+                    f"please look at them)"
+                ))
+            text = "\n".join(lines).strip()
+            if buf["reply_note"]:
+                text = f"{buf['reply_note']}\n{text}"
+            await self._run_operator_turn(text, buf["attachments"])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("album %s flush failed", grouped_id)
+
+    async def _run_operator_turn(
+        self, text: str, attachments: list[dict[str, Any]],
+    ) -> None:
+        """Run one operator turn for already-assembled text + attachments and
+        deliver whatever it says. Shared by the single-message path and the
+        album path, which differ only in how they build those two values."""
         telegram_log.info("agent inbound " + fmt(
             session=self._session_id, len=len(text),
             attachments=len(attachments),
