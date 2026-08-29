@@ -7,6 +7,9 @@ These pin two non-obvious properties:
     fire a TTS round-trip per "Ok."
   * _drain_chitchat_items is a safety invariant: a user barge-in drops stale
     chitchat but must NEVER drop a queued approval prompt.
+  * _mirror_voice_note re-uses the spoken bytes and stays detached from the
+    call: an unplayable container or a dead upload must cost nothing on the
+    line.
 """
 
 from __future__ import annotations
@@ -154,3 +157,59 @@ def test_handoff_result_sorts_ahead_of_chitchat_behind_approval():
         return [(await q.get())[2] for _ in range(3)]
 
     assert asyncio.run(run()) == ["approval", "result", "chit"]
+
+
+# ---- voice-note mirror ----
+
+class _FakeClient:
+    def __init__(self, fail: bool = False) -> None:
+        self.sent: list[dict] = []
+        self._fail = fail
+
+    async def send_file(self, peer, buf, **kw):
+        if self._fail:
+            raise RuntimeError("upload died")
+        self.sent.append({"peer": peer, "data": buf.read(), **kw})
+
+
+def _mirror(ogg: bytes, *, fail: bool = False) -> _FakeClient:
+    """Drive _mirror_voice_note on a CallService stripped to the attributes it
+    actually touches, and wait for the fire-and-forget upload task."""
+    from oncall.voice_call import CallService, _ActiveCall
+
+    svc = CallService.__new__(CallService)
+    svc._client = _FakeClient(fail=fail)
+    svc._owner_user_id = 42
+    svc._mirror_tasks = set()
+    svc._active = _ActiveCall.__new__(_ActiveCall)
+    svc._active.is_owner = True
+
+    async def run():
+        svc._mirror_voice_note(ogg, pcm_len=48_000 * 2 * 3)  # 3 s of PCM16/48k
+        for t in list(svc._mirror_tasks):
+            await t
+        return svc._client
+
+    return asyncio.run(run())
+
+
+def test_mirror_sends_the_spoken_bytes_as_a_voice_note():
+    client = _mirror(b"OggS" + b"\x00" * 64)
+    assert len(client.sent) == 1
+    sent = client.sent[0]
+    assert sent["peer"] == 42
+    assert sent["data"] == b"OggS" + b"\x00" * 64  # never re-synthesized
+    assert sent["voice_note"] is True
+    assert sent["attributes"][0].duration == 3
+
+
+def test_mirror_skips_tts_output_without_an_ogg_container():
+    # Raw-Opus TTS responses decode fine for the call but are unplayable as a
+    # Telegram voice note, so nothing is uploaded.
+    assert _mirror(b"\x78\x00raw-opus-packet").sent == []
+
+
+def test_mirror_upload_failure_does_not_escape_into_the_call():
+    # The upload runs detached; a dead Telegram connection must not take the
+    # audio path down with it.
+    assert _mirror(b"OggS" + b"\x00" * 64, fail=True).sent == []

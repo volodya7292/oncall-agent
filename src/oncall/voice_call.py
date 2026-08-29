@@ -22,7 +22,9 @@ HTTP request and drops queued audio. The user always wins.
 
 Voice and text chat share the same `chat_sessions` row (agent_session_id),
 so a voice call continues the same conversation the user had in text and
-vice versa.
+vice versa. Every reply the agent speaks on a call is also sent to the
+owner as a Telegram voice message (`_mirror_voice_note`), reusing the
+audio that just went out on the line.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ import asyncio
 import audioop
 import ctypes
 import ctypes.util
+import io
 import logging
 import re
 import struct
@@ -344,6 +347,8 @@ class CallService:
         # this the event loop only holds a weak reference and Python GC
         # destroys the coroutine mid-flight (see asyncio.create_task docs).
         self._brief_tasks: set[asyncio.Task] = set()
+        # Same, for the fire-and-forget voice-note uploads (_mirror_voice_note).
+        self._mirror_tasks: set[asyncio.Task] = set()
         # Looped office-ambience PCM (int16/48k/mono), decoded once in start().
         # None when disabled or the asset fails to load → calls run bed-free.
         self._ambient_bed_enabled = ambient_bed
@@ -1281,6 +1286,7 @@ class CallService:
         # Play the prewarmed audio directly, bypassing the outbound text
         # queue. Mirrors _speak's send_frame loop with barge-in support
         # but without TTS synthesis.
+        self._mirror_voice_note(opus_bytes, len(pcm))
         await self._play_pcm(active, pcm, label="prewarm")
 
     async def _play_pcm(
@@ -1527,6 +1533,7 @@ class CallService:
         """Synthesize one text chunk to PCM16 @ 48 kHz."""
         opus_bytes = await self._tts_http(text)
         pcm = self._opus_decode(opus_bytes)
+        self._mirror_voice_note(opus_bytes, len(pcm))
         log.debug(
             "voice: chunk synth %d chars -> %d opus -> %.0fms PCM",
             len(text), len(opus_bytes), len(pcm) / 2 / PCM_RATE * 1000,
@@ -1855,6 +1862,53 @@ class CallService:
                 )
                 r.raise_for_status()
             return r.content
+
+    # ---- voice-note mirror ----
+
+    def _mirror_voice_note(self, ogg_bytes: bytes, pcm_len: int) -> None:
+        """Post what the agent says on the call into the owner's Telegram chat
+        as a voice message, so a call leaves the same trail a text conversation
+        does. Hangs off the TTS chokepoint, so it covers every spoken path.
+
+        Fire-and-forget: the upload must never delay the audio going out on the
+        line. Nothing is re-synthesized — the bytes are the ones just spoken."""
+        active = self._active
+        if active is None:
+            return
+        if not ogg_bytes.startswith(b"OggS"):
+            # Telegram voice notes must carry an Ogg container. A raw-Opus TTS
+            # response (the other case _opus_decode sniffs for) has none, so
+            # there is nothing playable to send.
+            log.warning("voice: TTS response not Ogg/Opus; no voice note sent")
+            return
+        duration = max(1, round(pcm_len / 2 / PCM_RATE))
+        task = asyncio.create_task(
+            self._send_voice_note(active, ogg_bytes, duration),
+            name="voice-note-mirror",
+        )
+        self._mirror_tasks.add(task)
+        task.add_done_callback(self._mirror_tasks.discard)
+
+    async def _send_voice_note(
+        self, active: _ActiveCall, ogg_bytes: bytes, duration: int,
+    ) -> None:
+        """Upload one Ogg/Opus reply to the owner as a Telegram voice note.
+        Always to the OWNER, even on a call placed to someone else — that
+        transcript is theirs to hear, so it carries who was on the line."""
+        from telethon.tl.types import DocumentAttributeAudio
+        buf = io.BytesIO(ogg_bytes)
+        buf.name = "reply.ogg"
+        try:
+            await self._client.send_file(
+                self._owner_user_id, buf,
+                voice_note=True,
+                attributes=[
+                    DocumentAttributeAudio(duration=duration, voice=True),
+                ],
+                caption=None if active.is_owner else f"\U0001f4de {active.callee_label}",
+            )
+        except Exception:
+            log.exception("voice: sending voice note to telegram failed")
 
     def _opus_decode(self, ogg_or_opus: bytes) -> bytes:
         """Decode the TTS Opus response to PCM16 @ 48 kHz mono. Handles both
