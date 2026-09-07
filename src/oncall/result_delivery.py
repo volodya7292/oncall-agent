@@ -36,13 +36,16 @@ from what it already knows — or says plainly that it can't. Nothing about
 that is remembered: the failure is a per-turn event, and the very next user
 message hands off again as normal.
 
-Critically, a failed task's last `assistant.text` is NOT delivered. It is
-usually not an answer — when the Claude CLI rejects a run it emits its own
-meta-text as an assistant turn ("You've hit your weekly limit · resets 2am
-(UTC)"), which this module used to forward verbatim to Telegram *and* write
-into operator history as something the operator had said. Whatever text a
-failed task produced is passed to the operator as context instead, and the
-operator decides what (if anything) the user should hear.
+Critically, a failed task's last `assistant.text` is NOT delivered as an
+answer. It is usually not one — when the Claude CLI rejects a run it emits
+its own meta-text as an assistant turn ("You've hit your weekly limit ·
+resets 2am (UTC)"), which this module used to forward verbatim to Telegram
+*and* write into operator history as something the operator had said.
+Whatever text a failed task produced is passed to the operator as context
+instead, and the operator decides what (if anything) the user should hear.
+The CLI's diagnosis itself still goes out, but as a `SYSTEM:` line that is
+never written to history: an expired login or exhausted quota is the owner's
+to fix, and an operator reply that hides it left one outage invisible.
 
 There is deliberately NO rewrite step here. An LLM compressor used to sit
 on this path, and since any chat digest overruns the budget it ran on
@@ -158,7 +161,28 @@ async def deliver_executor_result(
         # docstring). Hand the whole situation to the operator; it decides
         # what the user hears. Nothing here is written to history: the
         # operator's own turn does that.
-        note = _compose_failure_note(task_events, raw)
+        # The owner still has to hear the CLI's own diagnosis: an expired
+        # login or exhausted quota is theirs to fix, and the operator's reply
+        # is told not to relay it. A SYSTEM line is not an answer and is
+        # never written to history, so it cannot be mistaken for one.
+        await _publish_cli_error_notice(events, chat_session_id, task_id, task_events, raw)
+        first_pass = (first_pass_answer or "").strip()
+        note = _compose_failure_note(task_events, raw, first_pass)
+        if first_pass and on_reconcile is not None:
+            # The user already holds the operator's own answer, so this is a
+            # reconciliation with a dead report, and silence is a real verdict.
+            # Routing it through `on_failure` instead re-answered the question
+            # from scratch and the user read the same reply twice.
+            try:
+                await on_reconcile(chat_session_id, note)
+                return
+            except Exception:
+                log.exception(
+                    "result_delivery: failure reconciliation raised for task %s; "
+                    "falling back to the canned notice", task_id,
+                )
+                await _publish_failure_notice(events, chat_session_id, task_id)
+                return
         if on_failure is None:
             log.info(
                 "result_delivery: task %s failed and no on_failure handler is "
@@ -258,15 +282,18 @@ def _rate_limit_reset(task_events: list[dict[str, Any]]) -> str | None:
 
 
 def _compose_failure_note(
-    task_events: list[dict[str, Any]], raw: str,
+    task_events: list[dict[str, Any]], raw: str, first_pass: str = "",
 ) -> str:
     """Build the `[system note: ...]` body handed to the operator when a
     hand_off'd task dies.
 
     States the failure, names the cause when we can (a rate-limit rejection
     reads very differently to the user than a crash), and quotes whatever the
-    task did emit as context. The instruction is to answer NOW: the user has
-    already seen an ack promising a result, so silence is the one wrong move.
+    task did emit as context. Without `first_pass` the instruction is to
+    answer NOW: the user has seen only an ack promising a result, so silence
+    is the one wrong move. With it the user has already read the operator's
+    own answer, and the instruction flips: add only what the failure changes,
+    or nothing.
     """
     resets = _rate_limit_reset(task_events)
     if resets:
@@ -276,12 +303,25 @@ def _compose_failure_note(
         )
     else:
         cause = "your acting layer crashed before finishing"
-    note = (
-        f"the job you handed off failed — {cause}. Nothing was done and the "
-        f"user is still waiting on the acknowledgement you already sent. "
-        f"Answer them yourself now, from what you already know; if the "
-        f"request genuinely needs tools you cannot reach, say so plainly."
-    )
+    if first_pass:
+        note = (
+            f"the job you handed off failed — {cause}. Nothing was done. In "
+            f"that same turn you had already answered the user yourself: "
+            f"{_clip(first_pass, _RECONCILE_QUOTE_CHARS)!r} — they have read "
+            f"that and do not need it again. Say ONLY what the failure "
+            f"changes for them: retract anything that answer promised the "
+            f"job would do or verify, and nothing else. If it promised "
+            f"nothing, reply with nothing at all — an empty reply is the "
+            f"correct output here, and answering again is the failure."
+        )
+    else:
+        note = (
+            f"the job you handed off failed — {cause}. Nothing was done and "
+            f"the user is still waiting on the acknowledgement you already "
+            f"sent. Answer them yourself now, from what you already know; if "
+            f"the request genuinely needs tools you cannot reach, say so "
+            f"plainly."
+        )
     excerpt = _clip(raw, _FAILURE_EXCERPT_CHARS)
     if excerpt:
         note += (
@@ -318,6 +358,38 @@ def _compose_reconcile_note(first_pass: str, report: str) -> str:
         f"here, and restating yourself is the failure. Claim nothing the "
         f"report does not support."
     )
+
+
+def cli_error_text(task_events: list[dict[str, Any]], raw: str) -> str:
+    """The CLI's own explanation of a failed run: the `result` error string
+    when it gave one, else its last assistant turn (an older CLI reports the
+    same rejection only there). Empty when the run died saying nothing."""
+    for e in reversed(task_events):
+        if e.get("type") == "result.final":
+            payload = e.get("payload") or {}
+            if payload.get("is_error") and payload.get("error"):
+                return str(payload["error"]).strip()
+            break
+    return _clip(raw, _FAILURE_EXCERPT_CHARS)
+
+
+async def _publish_cli_error_notice(
+    events: EventBus, chat_session_id: str, task_id: UUID,
+    task_events: list[dict[str, Any]], raw: str,
+) -> None:
+    detail = cli_error_text(task_events, raw)
+    if not detail:
+        return
+    try:
+        await events.publish_global("chat.reply", {
+            "session_id": chat_session_id,
+            "text": f"SYSTEM: ⚠️ executor CLI error: {detail}",
+            "voice_text": "",
+            "trigger": "executor.failed",
+            "task_id": str(task_id),
+        })
+    except Exception:
+        log.exception("result_delivery: failed to publish CLI error notice for %s", task_id)
 
 
 async def _publish_failure_notice(

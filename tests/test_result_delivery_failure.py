@@ -77,7 +77,8 @@ async def _task_with_text(
 
 
 async def test_failed_task_text_goes_to_the_operator_not_the_user(env):
-    """The CLI's own error text must never reach the user or history."""
+    """The CLI's own error text must never pass as the answer or enter history.
+    It reaches the user only as a marked SYSTEM line."""
     db, events, published = env
     cli_meta = "You've hit your weekly limit · resets 2am (UTC)"
     task = await _task_with_text(db, events, cli_meta, rate_limited=True)
@@ -92,8 +93,10 @@ async def test_failed_task_text_goes_to_the_operator_not_the_user(env):
         on_failure=on_failure,
     )
 
-    assert not [p for t, p in published if t == "chat.reply"], (
-        "a failed task must not publish its text as the answer"
+    replies = [p for t, p in published if t == "chat.reply"]
+    assert [r["trigger"] for r in replies] == ["executor.failed"]
+    assert replies[0]["text"].startswith("SYSTEM:") and cli_meta in replies[0]["text"], (
+        "the CLI's diagnosis goes out only as a SYSTEM line, never as the answer"
     )
     assert await db.load_chat_history("tg-agent-42") == [], (
         "CLI meta-text must not be persisted as an operator turn"
@@ -107,6 +110,75 @@ async def test_failed_task_text_goes_to_the_operator_not_the_user(env):
     assert "02:00 UTC" in note, "resetsAt must be rendered for the operator"
     assert cli_meta in note
     assert "do not relay it verbatim" in note
+
+
+async def test_cli_rejection_is_surfaced_from_the_result_event(env):
+    """Regression: the executor CLI's login expired ("Failed to authenticate:
+    OAuth session expired") and every hand_off died in 2s. The operator was
+    told not to relay the text, re-answered from memory, and the owner learnt
+    about the outage from the server logs days later. The `result` error
+    string wins over the assistant turn, and a run that died saying nothing
+    gets no notice — the operator's reply covers that."""
+    db, events, published = env
+    task = await _task_with_text(db, events, "Failed to authenticate")
+    await events.publish(task.id, "result.final", {
+        "is_error": True,
+        "error": "Failed to authenticate: OAuth session expired and could not be refreshed",
+    })
+
+    async def on_failure(session_id: str, note: str) -> None:
+        pass
+
+    await deliver_executor_result(
+        db=db, events=events, task_id=task.id,
+        chat_session_id="tg-agent-42", terminal_state="failed",
+        on_failure=on_failure,
+    )
+    (reply,) = [p for t, p in published if t == "chat.reply"]
+    assert "OAuth session expired" in reply["text"]
+
+    silent = Task(
+        session_id=str(uuid4()), prompt="x", dispatched_by_chat_session="tg-agent-42",
+    )
+    await db.insert_task(silent)
+    published.clear()
+    await deliver_executor_result(
+        db=db, events=events, task_id=silent.id,
+        chat_session_id="tg-agent-42", terminal_state="failed",
+        on_failure=on_failure,
+    )
+    assert not [p for t, p in published if t == "chat.reply"]
+
+
+async def test_failure_after_a_first_pass_answer_may_stay_silent(env):
+    """Regression: the operator answered at hand_off time, the job then died,
+    and the failure ping told it to "answer now" — so the user read the same
+    reply twice, a minute apart. With a first-pass answer on record the
+    failure is a reconciliation: the silence-tolerant handler gets it, the
+    note names the answer already sent, and `on_failure` is never called."""
+    db, events, published = env
+    task = await _task_with_text(
+        db, events, "Failed to authenticate", first_pass_answer="Yes, JYSK has them.",
+    )
+    reconciled: list[str] = []
+
+    async def on_failure(session_id: str, note: str) -> None:
+        raise AssertionError("must not re-answer a question already answered")
+
+    async def on_reconcile(session_id: str, note: str) -> None:
+        reconciled.append(note)
+
+    await deliver_executor_result(
+        db=db, events=events, task_id=task.id,
+        chat_session_id="tg-agent-42", terminal_state="failed",
+        on_failure=on_failure, first_pass_answer="Yes, JYSK has them.",
+        on_reconcile=on_reconcile,
+    )
+    (note,) = reconciled
+    assert "Yes, JYSK has them." in note
+    assert "failed" in note and "empty reply is the correct output" in note
+    # Only the SYSTEM diagnosis went out; nothing posed as a second answer.
+    assert [p["trigger"] for t, p in published if t == "chat.reply"] == ["executor.failed"]
 
 
 async def test_operator_answer_to_a_failed_hand_off_reaches_the_user(env):
@@ -175,8 +247,9 @@ async def test_failure_falls_back_to_the_banner_when_the_operator_raises(env):
         on_failure=on_failure,
     )
     replies = [p for t, p in published if t == "chat.reply"]
-    assert len(replies) == 1
-    assert replies[0]["trigger"] == "executor.failed"
+    # One SYSTEM line quoting what the run emitted, then the canned notice.
+    assert [r["trigger"] for r in replies] == ["executor.failed", "executor.failed"]
+    assert "couldn't complete that" in replies[-1]["text"]
 
 
 async def test_first_pass_answer_replaces_verbatim_delivery_with_a_correction(env):

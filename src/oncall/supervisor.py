@@ -573,8 +573,11 @@ class Supervisor:
             usage = evt.get("usage") or {}
             iters = usage.get("iterations") or []
             self._last_context_tokens = _context_tokens(iters[-1] if iters else usage)
+            # On an error the CLI's `result` string is the diagnosis (auth
+            # expired, quota, ...). Keep it — nothing else records it.
             await self._events.publish(task.id, "result.final", {
                 "is_error": is_error,
+                "error": (str(evt.get("result") or "")[:500] if is_error else None),
                 "duration_ms": evt.get("duration_ms"),
                 "total_cost_usd": evt.get("total_cost_usd"),
                 "num_turns": evt.get("num_turns"),
