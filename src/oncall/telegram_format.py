@@ -15,7 +15,7 @@ TELEGRAM_MSG_LIMIT = 4000
 
 # Long enough for one complete thought, short enough to still look like a
 # normal chat bubble rather than a mini-paragraph.
-MESSENGER_BUBBLE_TARGET = 45
+MESSENGER_BUBBLE_TARGET = 90
 
 
 def chunk_message(text: str, *, limit: int = TELEGRAM_MSG_LIMIT) -> list[str]:

@@ -18,4 +18,4 @@ def test_split_messenger_reply_breaks_long_prose_at_a_word_boundary():
 
     assert len(pieces) == 2
     assert "".join(piece + " " for piece in pieces).split() == text.split()
-    assert all(len(piece) <= 45 for piece in pieces)
+    assert all(len(piece) <= 90 for piece in pieces)
