@@ -51,7 +51,10 @@ GEMINI_MODEL = os.environ.get("BENCH_GEMINI_MODEL", "gemini-3.5-flash-lite")
 # (and would leave ZDR behind, which is the reason for pinning in the first
 # place). The operator's real client keeps fallbacks ON — worth knowing that
 # these numbers are the pinned-endpoint case, not the fallback case.
-OR_PROVIDER = os.environ.get("BENCH_OR_PROVIDER", "xai/zdr/priority")
+# Leave routing unpinned by default so a mixed-provider comparison (for
+# example Gemini vs DeepSeek) can use each model's available providers.  Set
+# this to a tag such as ``xai/zdr/priority`` when measuring one pinned route.
+OR_PROVIDER = os.environ.get("BENCH_OR_PROVIDER", "")
 
 # model -> "effort,effort,..." for the OpenRouter side. Efforts are empirical:
 # grok-4.20 advertises no supported_efforts at all, and grok-4.5 is
@@ -75,11 +78,14 @@ def load_or_pricing(models: list[str], tag: str) -> None:
         url = f"https://openrouter.ai/api/v1/models/{model}/endpoints"
         with urllib.request.urlopen(url, timeout=20) as r:
             data = json.load(r)["data"]
-        match = [e for e in data["endpoints"] if e.get("tag") == tag]
+        # OpenRouter changed this endpoint from a list to a model object with
+        # an ``endpoints`` member.  Keep the bench usable with either shape.
+        endpoints = data.get("endpoints", []) if isinstance(data, dict) else data
+        match = [e for e in endpoints if not tag or e.get("tag") == tag]
         if not match:
             raise SystemExit(
                 f"{model}: no endpoint tagged {tag!r} "
-                f"(have: {[e.get('tag') for e in data['endpoints']]})"
+                f"(have: {[e.get('tag') for e in endpoints]})"
             )
         p = match[0]["pricing"]
         PRICING[model] = (float(p["prompt"]), float(p["completion"]))
@@ -232,9 +238,11 @@ async def call_openrouter(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    extra_body: dict[str, Any] = {
-        "provider": {"order": [OR_PROVIDER], "allow_fallbacks": False},
-    }
+    extra_body: dict[str, Any] = {}
+    if OR_PROVIDER:
+        extra_body["provider"] = {
+            "order": [OR_PROVIDER], "allow_fallbacks": False,
+        }
     if effort is not None:
         if effort.lower() in ("none", "off", "disabled"):
             extra_body["reasoning"] = {"enabled": False}

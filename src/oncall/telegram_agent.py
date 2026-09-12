@@ -47,6 +47,7 @@ from .telegram_format import (
     label_for_chat,
     relative_age,
     reply_context_note,
+    split_messenger_reply,
     truncate,
 )
 from .voice import strip_expression_tags
@@ -65,6 +66,11 @@ _ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024
 # `filename` (multiple users sending "image.png") can't clobber each other.
 _INBOUND_DIR = Path("~/.oncall/inbound").expanduser()
 _FILENAME_SAFE = _re.compile(r"[^A-Za-z0-9._-]+")
+
+# The natural little gap between consecutive chat bubbles.  During it Telethon
+# keeps Telegram's typing indicator visible, rather than making a multi-part
+# reply appear as one machine-generated burst.
+_REPLY_INTER_MESSAGE_PAUSE_SECONDS = 0.65
 
 
 def _persist_inbound_attachment(data: bytes, filename: str | None) -> Path:
@@ -562,7 +568,7 @@ class TelegramAgentService:
                     tool_calls=len(result.tool_calls_made),
                 ))
                 return
-            await self._send(reply)
+            await self._send(reply, messenger_style=True)
         telegram_log.info("agent reply " + fmt(
             session=self._session_id, len=len(reply),
             tool_calls=len(result.tool_calls_made),
@@ -1151,7 +1157,7 @@ class TelegramAgentService:
             if not text:
                 continue
             try:
-                await self._send(text)
+                await self._send(text, messenger_style=True)
                 telegram_log.info("agent auto-ping " + fmt(
                     session=self._session_id, len=len(text),
                     task_id=payload.get("task_id"),
@@ -1161,7 +1167,7 @@ class TelegramAgentService:
 
     # ---- send ----
 
-    async def _send(self, text: str) -> None:
+    async def _send(self, text: str, *, messenger_style: bool = False) -> None:
         # Deterministic backstop: expression tags ([laughter], [sigh], …) are
         # voice-only — the TTS path renders each as sound, but in text they show
         # as literal [brackets]. The prompt forbids them off-call, yet the model
@@ -1173,7 +1179,10 @@ class TelegramAgentService:
         text = strip_expression_tags(text)
         if not text:
             return
-        for piece in chunk_message(text):
+        pieces = split_messenger_reply(text) if messenger_style else chunk_message(text)
+        for index, piece in enumerate(pieces):
+            if index:
+                await self._show_typing_pause()
             try:
                 await self._client.send_message(
                     self._owner_user_id, piece, parse_mode="md",
@@ -1186,3 +1195,15 @@ class TelegramAgentService:
                     await self._client.send_message(self._owner_user_id, piece)
                 except Exception:
                     log.exception("plain-text send also failed")
+
+    async def _show_typing_pause(self) -> None:
+        """Show a human-sized typing gap between model-authored chat bubbles."""
+        action = getattr(self._client, "action", None)
+        if action is None:
+            return
+        try:
+            async with action(self._owner_user_id, "typing"):
+                await asyncio.sleep(_REPLY_INTER_MESSAGE_PAUSE_SECONDS)
+        except Exception:
+            # Sending the reply matters more than a cosmetic typing indicator.
+            log.debug("could not show typing indicator between reply pieces", exc_info=True)
