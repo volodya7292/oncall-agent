@@ -185,7 +185,7 @@ def _mirror(ogg: bytes, *, fail: bool = False) -> _FakeClient:
     svc._active.is_owner = True
 
     async def run():
-        svc._mirror_voice_note(ogg, pcm_len=48_000 * 2 * 3)  # 3 s of PCM16/48k
+        svc._mirror_voice_note(ogg, 48_000 * 2 * 3, "")  # 3 s of PCM16/48k
         for t in list(svc._mirror_tasks):
             await t
         return svc._client

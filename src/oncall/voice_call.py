@@ -1286,7 +1286,7 @@ class CallService:
         # Play the prewarmed audio directly, bypassing the outbound text
         # queue. Mirrors _speak's send_frame loop with barge-in support
         # but without TTS synthesis.
-        self._mirror_voice_note(opus_bytes, len(pcm))
+        self._mirror_voice_note(opus_bytes, len(pcm), text)
         await self._play_pcm(active, pcm, label="prewarm")
 
     async def _play_pcm(
@@ -1533,7 +1533,7 @@ class CallService:
         """Synthesize one text chunk to PCM16 @ 48 kHz."""
         opus_bytes = await self._tts_http(text)
         pcm = self._opus_decode(opus_bytes)
-        self._mirror_voice_note(opus_bytes, len(pcm))
+        self._mirror_voice_note(opus_bytes, len(pcm), text)
         log.debug(
             "voice: chunk synth %d chars -> %d opus -> %.0fms PCM",
             len(text), len(opus_bytes), len(pcm) / 2 / PCM_RATE * 1000,
@@ -1865,7 +1865,7 @@ class CallService:
 
     # ---- voice-note mirror ----
 
-    def _mirror_voice_note(self, ogg_bytes: bytes, pcm_len: int) -> None:
+    def _mirror_voice_note(self, ogg_bytes: bytes, pcm_len: int, text: str) -> None:
         """Post what the agent says on the call into the owner's Telegram chat
         as a voice message, so a call leaves the same trail a text conversation
         does. Hangs off the TTS chokepoint, so it covers every spoken path.
@@ -1883,14 +1883,14 @@ class CallService:
             return
         duration = max(1, round(pcm_len / 2 / PCM_RATE))
         task = asyncio.create_task(
-            self._send_voice_note(active, ogg_bytes, duration),
+            self._send_voice_note(active, ogg_bytes, duration, text),
             name="voice-note-mirror",
         )
         self._mirror_tasks.add(task)
         task.add_done_callback(self._mirror_tasks.discard)
 
     async def _send_voice_note(
-        self, active: _ActiveCall, ogg_bytes: bytes, duration: int,
+        self, active: _ActiveCall, ogg_bytes: bytes, duration: int, text: str
     ) -> None:
         """Upload one Ogg/Opus reply to the owner as a Telegram voice note.
         Always to the OWNER, even on a call placed to someone else — that
@@ -1905,7 +1905,7 @@ class CallService:
                 attributes=[
                     DocumentAttributeAudio(duration=duration, voice=True),
                 ],
-                caption=None if active.is_owner else f"\U0001f4de {active.callee_label}",
+                caption=text if active.is_owner else f"{text}\n\U0001f4de {active.callee_label}",
             )
         except Exception:
             log.exception("voice: sending voice note to telegram failed")
