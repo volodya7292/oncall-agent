@@ -13,10 +13,6 @@ from typing import Any
 # Telegram caps a single message at 4096 chars. Stay slightly under for headroom.
 TELEGRAM_MSG_LIMIT = 4000
 
-# Long enough for one complete thought, short enough to still look like a
-# normal chat bubble rather than a mini-paragraph.
-MESSENGER_BUBBLE_TARGET = 90
-
 
 def chunk_message(text: str, *, limit: int = TELEGRAM_MSG_LIMIT) -> list[str]:
     """Split a message into ≤limit-char chunks, preferring newline boundaries.
@@ -37,32 +33,15 @@ def chunk_message(text: str, *, limit: int = TELEGRAM_MSG_LIMIT) -> list[str]:
 
 
 def split_messenger_reply(text: str, *, limit: int = TELEGRAM_MSG_LIMIT) -> list[str]:
-    """Turn an LLM reply into natural-sized Telegram chat bubbles.
+    """One Telegram bubble per blank-line-separated paragraph of an LLM reply.
 
-    Blank lines are explicit boundaries. Longer prose also splits at sentence
-    or word boundaries, never in the middle of a word. Telegram's ordinary
-    size limit still applies within each bubble.
+    The model decides where a thought ends; length never does. Only Telegram's
+    hard size limit may break a paragraph further.
     """
-    paragraphs = [part.strip() for part in re.split(r"\n[ \t]*\n+", text) if part.strip()]
     pieces: list[str] = []
-    for paragraph in paragraphs:
-        # Structured content is clearer as one unit; only Telegram's hard
-        # limit may break it up.
-        if "```" in paragraph or re.search(r"(?m)^\s*(?:[-*+] |\d+[.)] )", paragraph):
-            pieces.extend(chunk_message(paragraph, limit=limit))
-            continue
-        remaining = paragraph
-        target = min(MESSENGER_BUBBLE_TARGET, limit)
-        while len(remaining) > target:
-            # Prefer finishing a sentence, then use the last complete word
-            # that fits the target bubble.
-            sentence_ends = [m.end() for m in re.finditer(r"[.!?…)]\s+", remaining[:target])]
-            word_ends = [m.end() for m in re.finditer(r"\s+", remaining[:target])]
-            cut = (sentence_ends or word_ends or [target])[-1]
-            pieces.append(remaining[:cut].rstrip())
-            remaining = remaining[cut:].lstrip()
-        if remaining:
-            pieces.extend(chunk_message(remaining, limit=limit))
+    for paragraph in re.split(r"\n[ \t]*\n+", text):
+        if paragraph.strip():
+            pieces.extend(chunk_message(paragraph.strip(), limit=limit))
     return pieces
 
 

@@ -71,6 +71,9 @@ _FILENAME_SAFE = _re.compile(r"[^A-Za-z0-9._-]+")
 # keeps Telegram's typing indicator visible, rather than making a multi-part
 # reply appear as one machine-generated burst.
 _REPLY_INTER_MESSAGE_PAUSE_SECONDS = 0.65
+# Longer bubbles take longer to type; capped so a reply never drags.
+_REPLY_PAUSE_PER_CHAR_SECONDS = 0.03
+_REPLY_PAUSE_MAX_SECONDS = 2.5
 
 
 def _persist_inbound_attachment(data: bytes, filename: str | None) -> Path:
@@ -1182,7 +1185,7 @@ class TelegramAgentService:
         pieces = split_messenger_reply(text) if messenger_style else chunk_message(text)
         for index, piece in enumerate(pieces):
             if index:
-                await self._show_typing_pause()
+                await self._show_typing_pause(len(piece))
             try:
                 await self._client.send_message(
                     self._owner_user_id, piece, parse_mode="md",
@@ -1196,14 +1199,18 @@ class TelegramAgentService:
                 except Exception:
                     log.exception("plain-text send also failed")
 
-    async def _show_typing_pause(self) -> None:
+    async def _show_typing_pause(self, next_len: int) -> None:
         """Show a human-sized typing gap between model-authored chat bubbles."""
         action = getattr(self._client, "action", None)
         if action is None:
             return
         try:
             async with action(self._owner_user_id, "typing"):
-                await asyncio.sleep(_REPLY_INTER_MESSAGE_PAUSE_SECONDS)
+                await asyncio.sleep(min(
+                    _REPLY_INTER_MESSAGE_PAUSE_SECONDS
+                    + next_len * _REPLY_PAUSE_PER_CHAR_SECONDS,
+                    _REPLY_PAUSE_MAX_SECONDS,
+                ))
         except Exception:
             # Sending the reply matters more than a cosmetic typing indicator.
             log.debug("could not show typing indicator between reply pieces", exc_info=True)

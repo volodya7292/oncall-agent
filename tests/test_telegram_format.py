@@ -12,10 +12,8 @@ def test_split_messenger_reply_keeps_single_newlines_in_one_bubble():
     assert split_messenger_reply("one\ntwo\nthree") == ["one\ntwo\nthree"]
 
 
-def test_split_messenger_reply_breaks_long_prose_at_a_word_boundary():
-    text = "eins " * 20
-    pieces = split_messenger_reply(text)
-
-    assert len(pieces) == 2
-    assert "".join(piece + " " for piece in pieces).split() == text.split()
-    assert all(len(piece) <= 90 for piece in pieces)
+def test_split_messenger_reply_never_cuts_a_thought_by_length():
+    """Regression: a 90-char target once cut replies mid-sentence ("..., а" /
+    "не з ..."), producing bubbles no person would send."""
+    sentence = "вода выглядит чистой, но ручей течёт низко через мох и густые заросли, а не с ледника"
+    assert split_messenger_reply(sentence * 3) == [sentence * 3]
