@@ -131,3 +131,21 @@ async def test_ungrouped_message_still_answers_immediately(tmp_path, monkeypatch
 
     assert len(op.turns) == 1, "a lone message must not wait on the album timer"
     assert len(op.turns[0]["attachments"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_system_line_is_sent_as_one_message_even_in_messenger_style():
+    """Regression: a memory breadcrumb on the chat.reply path was split into
+    chat bubbles, leaving a dangling last word as its own message."""
+    sent: list[str] = []
+
+    async def record(_entity, text, **_kw):
+        sent.append(text)
+
+    svc = _agent(_RecordingOperator())
+    svc._client.send_message = record
+    notice = "SYSTEM: Remembered: fact one.\n\nfact two, still the same notice."
+    await svc._send(notice, messenger_style=True)
+    await svc._send("ok\n\nand another thought", messenger_style=True)
+
+    assert sent == [notice, "ok", "and another thought"]

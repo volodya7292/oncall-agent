@@ -1182,7 +1182,12 @@ class TelegramAgentService:
         text = strip_expression_tags(text)
         if not text:
             return
-        pieces = split_messenger_reply(text) if messenger_style else chunk_message(text)
+        # System lines (memory breadcrumbs, errors) are one notice, not chat:
+        # they share the chat.reply path but must never become bubbles.
+        if messenger_style and not text.lstrip().startswith("SYSTEM:"):
+            pieces = split_messenger_reply(text)
+        else:
+            pieces = chunk_message(text)
         for index, piece in enumerate(pieces):
             if index:
                 await self._show_typing_pause(len(piece))
