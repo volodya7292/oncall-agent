@@ -615,6 +615,37 @@ async def test_dedup_cluster_payload_carries_timestamps_oldest_first(db):
 
 
 @pytest.mark.asyncio
+async def test_dedup_oversized_cluster_converges(db):
+    """Regression: a component larger than `max_cluster_size` was truncated
+    to its densest members without regard to which pairs were already
+    reviewed. Once those members were all judged keep-separate, the same
+    subset was re-sent every 5 minutes forever (~290 LLM calls a day in
+    production) while the rest of the component was never shown at all.
+    """
+    emb = StubEmbedder()
+    texts = [f"fact number {i}" for i in range(11)]
+    for t in texts:
+        emb.register(t, [1.0, 0.0])
+    mem = make_memory(db, emb)
+    await mem.store(texts)
+
+    llm = _CapturingLLM()
+    for _ in range(10):
+        stats = await mem.dedup_pass(llm, model="test-model", max_cluster_size=8)
+        if stats["clusters_found"] == 0:
+            break
+    else:
+        pytest.fail(f"dedup never converged ({len(llm.messages)} LLM calls)")
+
+    shown = {
+        p["text"]
+        for msgs in llm.messages
+        for p in json.loads(msgs[1]["content"].split("Memories:\n", 1)[1])
+    }
+    assert shown == set(texts), "every member must reach the arbiter"
+
+
+@pytest.mark.asyncio
 async def test_retrieve_excludes_before_applying_the_limit(db):
     """Regression: `exclude_ids` must shrink the candidate pool, not the
     result set.

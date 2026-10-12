@@ -69,6 +69,34 @@ def _candidate_pairs(
     ]
 
 
+def _pick_subcluster(
+    sim: np.ndarray, reviewed: np.ndarray, size: int,
+) -> list[int]:
+    """Choose `size` members of an oversized cluster to show the arbiter.
+
+    Seeds on the strongest pair not yet reviewed, then grows by similarity to
+    the members chosen so far, preferring unreviewed pairs. Every component
+    holds at least one unreviewed edge (reviewed ones never join the graph),
+    so every pass reviews something new.
+
+    Ranking by plain total similarity ignored `reviewed`: once the densest
+    members were all judged, the same subset was picked and re-asked on every
+    pass while the rest of the component was never shown at all.
+    """
+    fresh = np.where(reviewed, 0.0, sim)
+    np.fill_diagonal(fresh, -1.0)
+    a, b = np.unravel_index(int(np.argmax(fresh)), fresh.shape)
+    chosen = [int(a), int(b)]
+    rest = [k for k in range(len(sim)) if k not in chosen]
+    while rest and len(chosen) < size:
+        best = max(rest, key=lambda k: (
+            fresh[k, chosen].sum(), sim[k, chosen].sum(),
+        ))
+        chosen.append(best)
+        rest.remove(best)
+    return chosen
+
+
 @dataclass
 class Memory:
     id: int
@@ -354,7 +382,7 @@ class OperatorMemory:
         llm: Any,
         *,
         model: str,
-        reasoning_effort: str = "medium",
+        reasoning_effort: str | None = "medium",
         cluster_threshold: float = 0.60,
         max_cluster_size: int = 8,
     ) -> dict[str, int]:
@@ -446,11 +474,11 @@ class OperatorMemory:
         merged_n = kept_n = failed_n = 0
         for indices in clusters:
             if len(indices) > max_cluster_size:
-                # Keep the densest members by total in-cluster similarity.
                 # Scored here, over one cluster, rather than read out of a
                 # full pairwise matrix we deliberately never build.
                 m = len(indices)
                 sub = np.zeros((m, m), dtype=np.float64)
+                reviewed = np.zeros((m, m), dtype=bool)
                 for a in range(m):
                     for b in range(a + 1, m):
                         ia, ib = indices[a], indices[b]
@@ -459,8 +487,14 @@ class OperatorMemory:
                             rows[ia]["text"], rows[ib]["text"],
                             alpha=self._alpha, beta=self._beta,
                         )
-                top = np.argsort(-sub.sum(axis=1))[:max_cluster_size]
-                indices = [indices[k] for k in top]
+                        x, y = int(rows[ia]["id"]), int(rows[ib]["id"])
+                        reviewed[a, b] = reviewed[b, a] = (
+                            (min(x, y), max(x, y)) in skip
+                        )
+                indices = [
+                    indices[k]
+                    for k in _pick_subcluster(sub, reviewed, max_cluster_size)
+                ]
             cluster_rows = [rows[i] for i in indices]
             cluster_ids = {int(r["id"]) for r in cluster_rows}
             try:
@@ -570,7 +604,7 @@ class OperatorMemory:
         llm: Any,
         *,
         model: str,
-        reasoning_effort: str,
+        reasoning_effort: str | None,
         cluster_rows: list[dict[str, Any]],
     ) -> dict[str, Any] | None:
         """One LLM call: decide merge-or-keep for one cluster. Returns the

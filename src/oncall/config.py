@@ -294,6 +294,11 @@ class Settings(BaseSettings):
     # Unreachable or misconfigured means every shell command escalates to an
     # approval prompt rather than auto-allowing — noisy, never unsafe.
     oncall_classifier_model: str = ""
+    # Model for the periodic memory-dedup arbiter. Empty falls back to the
+    # operator model; like the classifier, it shares the operator's LLM
+    # client, so it must be valid for ONCALL_OPERATOR_BACKEND.
+    oncall_memory_dedup_model: str = ""
+    oncall_memory_dedup_reasoning_effort: str | None = "minimal"
     oncall_memory_hybrid_alpha: float = 0.7
     oncall_memory_hybrid_beta: float = 0.3
     # Below the worst true-positive score measured on the real store under

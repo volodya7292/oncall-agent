@@ -539,7 +539,11 @@ def create_app() -> FastAPI:
             memory_dedup_task = asyncio.create_task(
                 _memory_dedup_loop(
                     memory=operator.memory, llm=llm,
-                    model=settings.oncall_operator_model,
+                    model=(
+                        settings.oncall_memory_dedup_model
+                        or settings.oncall_operator_model
+                    ),
+                    reasoning_effort=settings.oncall_memory_dedup_reasoning_effort,
                     events=events,
                     notify_session_id=notify_sid,
                 ),
@@ -1167,6 +1171,7 @@ _MEMORY_DEDUP_INTERVAL_SECONDS = 300.0
 
 async def _memory_dedup_loop(
     *, memory, llm, model: str,
+    reasoning_effort: str | None = None,
     interval_seconds: float = _MEMORY_DEDUP_INTERVAL_SECONDS,
     events: "EventBus | None" = None,
     notify_session_id: str | None = None,
@@ -1180,7 +1185,7 @@ async def _memory_dedup_loop(
         await asyncio.sleep(interval_seconds)
         try:
             await memory.dedup_pass(
-                llm, model=model, reasoning_effort="medium",
+                llm, model=model, reasoning_effort=reasoning_effort,
             )
             consecutive_crashes = 0
         except asyncio.CancelledError:
