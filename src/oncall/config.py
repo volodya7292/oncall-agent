@@ -296,8 +296,9 @@ class Settings(BaseSettings):
     oncall_classifier_model: str = ""
     # Model for the periodic memory-dedup arbiter. Empty falls back to the
     # operator model; like the classifier, it shares the operator's LLM
-    # client, so it must be valid for ONCALL_OPERATOR_BACKEND.
-    oncall_memory_dedup_model: str = ""
+    # client, so it must be valid for ONCALL_OPERATOR_BACKEND. The "google/"
+    # slug works on gemini (prefix stripped), openrouter and vercel alike.
+    oncall_memory_dedup_model: str = "google/gemini-3.5-flash-lite"
     oncall_memory_dedup_reasoning_effort: str | None = "minimal"
     oncall_memory_hybrid_alpha: float = 0.7
     oncall_memory_hybrid_beta: float = 0.3
