@@ -305,8 +305,10 @@ class Settings(BaseSettings):
     # reply to them is rewritten in that style before sending. Shares the
     # operator's LLM client, so the model must be valid for its backend.
     oncall_owner_style_model: str = "google/gemini-3.8-flash"
+    # "low" is the floor gemini-3.8-flash accepts on both backends: the native
+    # API rejects MINIMAL, and OpenRouter rejects reasoning off.
     oncall_owner_style_infer_reasoning_effort: str | None = "low"
-    oncall_owner_style_rewrite_reasoning_effort: str | None = "minimal"
+    oncall_owner_style_rewrite_reasoning_effort: str | None = "low"
     # How many recent 1:1 chats, and how many recent messages per chat, the
     # style inference reads.
     oncall_owner_style_chats: int = 30
