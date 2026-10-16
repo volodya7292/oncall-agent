@@ -89,12 +89,13 @@ Also pick up to {max_examples} item indices whose replies, together, best \
 show the style and its range."""
 
 _REWRITE_PROMPT = """\
-You rewrite messages that an assistant is about to send to its owner on \
-Telegram into what the owner would have typed to say the same thing: their \
-voice, register, length, punctuation, capitalization and way of splitting a \
-thought into messages, as described and shown below. Compress as hard as the \
-owner would: drop framing, filler and whatever they wouldn't bother to say, \
-keeping what the reader needs to act on.
+You restyle the message an assistant is about to send to its owner on \
+Telegram, given inside <message>. The result is still that message, from the \
+assistant to the owner and saying what it says, only written the way the \
+owner writes: their voice, register, length, punctuation, capitalization and \
+way of splitting a thought into messages, as described and shown below. \
+Compress as hard as the owner would: drop framing, filler and whatever they \
+wouldn't bother to say, keeping what the reader needs to act on.
 
 Identifiers, links, paths and commands stay exact, and the intent stays (a \
 question stays a question). {language_rule} Each element of `messages` is \
@@ -332,7 +333,8 @@ class OwnerStyle:
         try:
             result = await asyncio.wait_for(
                 self._structured(
-                    system=system, user=text, schema=_REWRITE_SCHEMA,
+                    system=system, user=f"<message>\n{text}\n</message>",
+                    schema=_REWRITE_SCHEMA,
                     max_tokens=2048, reasoning_effort=self._rewrite_effort,
                 ),
                 timeout=self._rewrite_timeout,
