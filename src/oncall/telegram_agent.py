@@ -40,6 +40,7 @@ from .events import EventBus
 from .metrics import LATENCY, timed
 from .models import TaskState
 from .operator import Operator, summarize_llm_error
+from .owner_style import OwnerStyle
 from .telegram_format import (
     age,
     chunk_message,
@@ -132,6 +133,8 @@ _SLASH_HELP = (
     "/denydm <chat_id> — remove a chat from the DM allowlist (stops triaging it)\n"
     "/dmlist — show allowlisted chats\n"
     "/setownername <name> — set your display name used in the operator's system prompt\n"
+    "/infer-style — learn your writing style from your replies in recent DMs; chat replies are then written in it\n"
+    "/infer-style clear — forget the learned style (replies go back to the operator's own voice)\n"
     "/yes <id> — approve a pending deferred dispatch\n"
     "/no <id> — deny a pending deferred dispatch (or approval)\n"
     "/restart — restart the oncall daemon via launchctl (brief downtime)\n"
@@ -152,6 +155,7 @@ class TelegramAgentService:
         broker: Broker,
         db: Database,
         telegram: Any | None = None,
+        owner_style: OwnerStyle | None = None,
     ) -> None:
         self._client = client
         self._operator = operator
@@ -162,6 +166,8 @@ class TelegramAgentService:
         # Optional primary-userbot handle; used by `/dmlist` to resolve
         # chat_ids to human-readable names. None → /dmlist shows ids only.
         self._telegram = telegram
+        # Rewrites chat replies in the owner's learned style. None → verbatim.
+        self._owner_style = owner_style
         self._session_id = agent_session_id(owner_user_id)
         self._started = False
         self._handler_ref: Any = None
@@ -642,6 +648,9 @@ class TelegramAgentService:
         if cmd == "/status":
             await self._send(await self._render_status())
             return True
+        if cmd == "/infer-style":
+            await self._handle_infer_style(text[len(cmd):].strip())
+            return True
         if cmd == "/context":
             if not await self._claim_heavy_op("/context"):
                 return True
@@ -905,6 +914,46 @@ class TelegramAgentService:
         return "\n".join(lines)
 
     # ---- heavy-op gate ----
+
+    async def _handle_infer_style(self, arg: str) -> None:
+        if self._owner_style is None:
+            await self._send("Style rewriting is unavailable: no operator LLM configured.")
+            return
+        if arg == "clear":
+            removed = await self._owner_style.clear()
+            telegram_log.info("agent infer-style clear " + fmt(removed=removed))
+            await self._send(
+                "Learned style forgotten." if removed else "No learned style to forget."
+            )
+            return
+        if arg:
+            await self._send("Usage: /infer-style  or  /infer-style clear")
+            return
+        if self._telegram is None:
+            await self._send(
+                "Can't read your chats: the primary Telegram account isn't connected."
+            )
+            return
+        if not await self._claim_heavy_op("/infer-style"):
+            return
+        try:
+            await self._send("Reading your recent DMs to learn your style…")
+            try:
+                style = await self._owner_style.infer(self._telegram)
+            except Exception as e:
+                log.exception("owner style inference failed")
+                await self._send(f"Style inference failed: {summarize_llm_error(e)}")
+                return
+            telegram_log.info("agent infer-style " + fmt(
+                chats=style["chats"], replies=style["replies_analyzed"],
+            ))
+            await self._send(
+                f"Learned your style from {style['replies_analyzed']} replies "
+                f"in {style['chats']} chats. Chat replies now use it.\n\n"
+                f"{style['profile']}"
+            )
+        finally:
+            self._release_heavy_op()
 
     async def _claim_heavy_op(self, name: str) -> bool:
         if self._heavy_op_in_flight is not None:
@@ -1185,7 +1234,14 @@ class TelegramAgentService:
         # System lines (memory breadcrumbs, errors) are one notice, not chat:
         # they share the chat.reply path but must never become bubbles.
         if messenger_style and not text.lstrip().startswith("SYSTEM:"):
-            pieces = split_messenger_reply(text)
+            styled = (
+                await self._owner_style.rewrite(text)
+                if self._owner_style is not None else None
+            )
+            if styled:
+                pieces = [c for piece in styled for c in chunk_message(piece)]
+            else:
+                pieces = split_messenger_reply(text)
         else:
             pieces = chunk_message(text)
         for index, piece in enumerate(pieces):

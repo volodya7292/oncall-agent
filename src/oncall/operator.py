@@ -115,8 +115,12 @@ class LLMClient(Protocol):
         tools: list[dict[str, Any]],
         max_tokens: int | None = None,
         reasoning_effort: str | None = None,
+        response_schema: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Return {role: 'assistant', content: str|None, tool_calls: list|None}."""
+        """Return {role: 'assistant', content: str|None, tool_calls: list|None}.
+
+        `response_schema` (a JSON Schema) constrains `content` to a JSON
+        document matching it, via the backend's native structured output."""
         ...
 
 
@@ -152,6 +156,7 @@ class GenAILLMClient:
         tools: list[dict[str, Any]],
         max_tokens: int | None = None,
         reasoning_effort: str | None = None,
+        response_schema: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         import base64
         from google.genai import types
@@ -288,6 +293,9 @@ class GenAILLMClient:
                     parameters=fn.get("parameters") or None,
                 ))
             cfg_kwargs["tools"] = [types.Tool(function_declarations=decls)]
+        if response_schema is not None:
+            cfg_kwargs["response_mime_type"] = "application/json"
+            cfg_kwargs["response_json_schema"] = response_schema
 
         cfg = types.GenerateContentConfig(**cfg_kwargs)
 
@@ -368,6 +376,14 @@ class GenAILLMClient:
         }
 
 
+def _openai_response_format(schema: dict[str, Any]) -> dict[str, Any]:
+    """Chat Completions `response_format` for a strict JSON-Schema reply."""
+    return {
+        "type": "json_schema",
+        "json_schema": {"name": "response", "strict": True, "schema": schema},
+    }
+
+
 class GatewayLLMClient:
     """OpenAI Chat Completions via Vercel AI Gateway. Async, non-streaming for
     MVP (streaming for the API surface is added in the /chat endpoint layer)."""
@@ -379,6 +395,7 @@ class GatewayLLMClient:
 
     async def chat(
         self, *, model, messages, tools, max_tokens=None, reasoning_effort=None,
+        response_schema=None,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": model,
@@ -391,6 +408,8 @@ class GatewayLLMClient:
             kwargs["max_completion_tokens"] = max_tokens
         if reasoning_effort is not None:
             kwargs["reasoning_effort"] = reasoning_effort
+        if response_schema is not None:
+            kwargs["response_format"] = _openai_response_format(response_schema)
         # OpenAI client rejects tools=None — strip if so.
         if kwargs["tools"] is None:
             kwargs.pop("tools")
@@ -446,6 +465,7 @@ class OpenRouterLLMClient:
 
     async def chat(
         self, *, model, messages, tools, max_tokens=None, reasoning_effort=None,
+        response_schema=None,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": model,
@@ -471,6 +491,8 @@ class OpenRouterLLMClient:
                 kwargs["reasoning_effort"] = reasoning_effort
         if extra_body:
             kwargs["extra_body"] = extra_body
+        if response_schema is not None:
+            kwargs["response_format"] = _openai_response_format(response_schema)
         # OpenAI client rejects tools=None — strip if so.
         if kwargs["tools"] is None:
             kwargs.pop("tools")
@@ -569,6 +591,7 @@ class AnthropicLLMClient:
 
     def _build_request(
         self, *, model, messages, tools, max_tokens=None, reasoning_effort=None,
+        response_schema=None,
     ) -> dict[str, Any]:
         """Translate the operator's OpenAI-style call into Anthropic Messages
         API kwargs: pull system messages out, pair tool_use/tool_result, merge
@@ -684,15 +707,21 @@ class AnthropicLLMClient:
             )
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
             kwargs["max_tokens"] = max(kwargs["max_tokens"], budget + 1024)
+        if response_schema is not None:
+            kwargs["output_config"] = {
+                "format": {"type": "json_schema", "schema": response_schema},
+            }
 
         return kwargs
 
     async def chat(
         self, *, model, messages, tools, max_tokens=None, reasoning_effort=None,
+        response_schema=None,
     ) -> dict[str, Any]:
         kwargs = self._build_request(
             model=model, messages=messages, tools=tools,
             max_tokens=max_tokens, reasoning_effort=reasoning_effort,
+            response_schema=response_schema,
         )
 
         # Stream to bound the call on wall-clock (mirrors GenAILLMClient). We

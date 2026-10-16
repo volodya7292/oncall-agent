@@ -300,6 +300,14 @@ CREATE TABLE IF NOT EXISTS scheduled_checks (
 );
 CREATE INDEX IF NOT EXISTS idx_scheduled_checks_due
   ON scheduled_checks(status, fire_at);
+
+-- The owner's learned writing style (single row, replaced by /infer-style).
+-- `style_json` holds the profile plus the analyzed example replies.
+CREATE TABLE IF NOT EXISTS owner_style (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    style_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -1327,6 +1335,29 @@ class Database:
         ) as cur:
             rows = await cur.fetchall()
         return [{"chat_id": r["chat_id"], "added_at": r["added_at"]} for r in rows]
+
+    # ---- owner style ----
+
+    async def get_owner_style(self) -> dict[str, Any] | None:
+        async with self.conn.execute(
+            "SELECT style_json FROM owner_style WHERE id = 1",
+        ) as cur:
+            row = await cur.fetchone()
+        return json.loads(row["style_json"]) if row else None
+
+    async def set_owner_style(self, style: dict[str, Any]) -> None:
+        await self.conn.execute(
+            "INSERT OR REPLACE INTO owner_style (id, style_json, created_at) "
+            "VALUES (1, ?, ?)",
+            (json.dumps(style, ensure_ascii=False), iso(utcnow())),
+        )
+        await self.conn.commit()
+
+    async def clear_owner_style(self) -> bool:
+        async with self.conn.execute("DELETE FROM owner_style") as cur:
+            rowcount = cur.rowcount or 0
+        await self.conn.commit()
+        return rowcount > 0
 
     # ---- per-task Write-dir allowlist ----
 

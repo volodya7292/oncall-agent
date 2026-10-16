@@ -300,6 +300,19 @@ class Settings(BaseSettings):
     # slug works on gemini (prefix stripped), openrouter and vercel alike.
     oncall_memory_dedup_model: str = "google/gemini-3.5-flash-lite"
     oncall_memory_dedup_reasoning_effort: str | None = "minimal"
+    # Owner-style rewriting (see owner_style.py): `/infer-style` learns how
+    # the owner writes from their own replies in their DMs, then every chat
+    # reply to them is rewritten in that style before sending. Shares the
+    # operator's LLM client, so the model must be valid for its backend.
+    oncall_owner_style_model: str = "google/gemini-3.8-flash"
+    oncall_owner_style_infer_reasoning_effort: str | None = "low"
+    oncall_owner_style_rewrite_reasoning_effort: str | None = "minimal"
+    # How many recent 1:1 chats, and how many recent messages per chat, the
+    # style inference reads.
+    oncall_owner_style_chats: int = 30
+    oncall_owner_style_messages_per_chat: int = 60
+    # The rewrite sits on the reply hot path; past this the original is sent.
+    oncall_owner_style_rewrite_timeout_seconds: float = 10.0
     oncall_memory_hybrid_alpha: float = 0.7
     oncall_memory_hybrid_beta: float = 0.3
     # Below the worst true-positive score measured on the real store under

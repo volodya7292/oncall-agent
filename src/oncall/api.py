@@ -49,6 +49,7 @@ from .operator import (
     Operator,
 )
 from .operator_memory import OperatorMemory
+from .owner_style import OwnerStyle
 from .result_delivery import deliver_executor_result
 from .telegram_agent import TelegramAgentService
 from .telegram_service import TelegramService, make_telethon_client
@@ -442,9 +443,20 @@ def create_app() -> FastAPI:
         # front-end. Voice calls (future) will bind here.
         telegram_agent: TelegramAgentService | None = None
         if operator is not None:
+            owner_style = OwnerStyle(
+                llm=llm, db=db,
+                model=settings.oncall_owner_style_model or settings.oncall_operator_model,
+                infer_reasoning_effort=settings.oncall_owner_style_infer_reasoning_effort,
+                rewrite_reasoning_effort=settings.oncall_owner_style_rewrite_reasoning_effort,
+                rewrite_timeout_seconds=settings.oncall_owner_style_rewrite_timeout_seconds,
+                max_chats=settings.oncall_owner_style_chats,
+                messages_per_chat=settings.oncall_owner_style_messages_per_chat,
+                language=settings.operator_language,
+            )
             telegram_agent = await _maybe_start_telegram_agent(
                 settings, operator, events,
                 broker=broker, db=db, telegram=telegram,
+                owner_style=owner_style,
             )
         # Voice calls — owner places a 1:1 voice call to the agent userbot.
         # Binds py-tgcalls to the agent's existing telethon client. Opt-in
@@ -1407,6 +1419,7 @@ async def _rebuild_memory_then_notify(
 async def _maybe_start_telegram_agent(
     settings, operator: Operator, events: EventBus,
     *, broker, db: Database, telegram: TelegramService | None = None,
+    owner_style: OwnerStyle | None = None,
 ) -> TelegramAgentService | None:
     """Boot the Telegram agent userbot if its session file + api credentials
     are present. The agent is the user-facing chat surface (replaces the old
@@ -1449,6 +1462,7 @@ async def _maybe_start_telegram_agent(
         service = TelegramAgentService(
             client=client, operator=operator, events=events,
             owner_user_id=owner_id, broker=broker, db=db, telegram=telegram,
+            owner_style=owner_style,
         )
         await service.start()
         # Persist the agent's discovered user_id so the primary userbot's

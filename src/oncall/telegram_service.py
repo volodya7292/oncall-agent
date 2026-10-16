@@ -37,6 +37,8 @@ from .telegram_format import reply_context_note
 
 
 _ONE_SECOND = timedelta(seconds=1)
+# Telegram's own login-code / security-notice account.
+_TELEGRAM_SERVICE_USER_ID = "777000"
 
 # Allowed reactions for the executor's `op=react` tool. Telegram's free
 # reaction set is larger; we expose only this curated 4 to keep prompt
@@ -369,6 +371,46 @@ class TelegramService:
                 })
         samples.sort(key=lambda s: s["date"] or "", reverse=True)
         return samples
+
+    async def get_owner_dm_threads(
+        self, *, max_chats: int, per_chat: int,
+    ) -> list[list[dict[str, Any]]]:
+        """Recent 1:1 threads with real people, for learning the owner's
+        writing style. One list per chat (most recently active first), each
+        the chat's last `per_chat` messages oldest-first as {outgoing, text}.
+
+        Skipped: bots, Saved Messages, the agent account, Telegram's service
+        account, forwards (someone else's words) and outgoing media without a
+        caption. Incoming media keeps a placeholder so a reply to it still
+        has context."""
+        threads: list[list[dict[str, Any]]] = []
+        async for dlg in self._client.iter_dialogs():
+            if len(threads) >= max_chats:
+                break
+            if not getattr(dlg, "is_user", False):
+                continue
+            entity = getattr(dlg, "entity", None)
+            if getattr(entity, "bot", False) or getattr(entity, "is_self", False):
+                continue
+            cid = _dialog_chat_id(dlg)
+            if cid is None or cid == _TELEGRAM_SERVICE_USER_ID:
+                continue
+            if self._agent_user_id is not None and cid == str(self._agent_user_id):
+                continue
+            thread: list[dict[str, Any]] = []
+            async for msg in self._client.iter_messages(_entity_arg(cid), limit=per_chat):
+                if getattr(msg, "fwd_from", None):
+                    continue
+                outgoing = bool(getattr(msg, "out", False))
+                text = getattr(msg, "message", None) or ""
+                if not text and getattr(msg, "media", None) and not outgoing:
+                    text = _media_placeholder(msg)
+                if text:
+                    thread.append({"outgoing": outgoing, "text": text})
+            thread.reverse()
+            if any(m["outgoing"] for m in thread):
+                threads.append(thread)
+        return threads
 
     async def get_chat_history(
         self, chat_id: str, *, limit: int = 10, since: datetime | None = None,
