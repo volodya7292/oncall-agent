@@ -60,11 +60,6 @@ def _agent(style: OwnerStyle) -> tuple[TelegramAgentService, list[str]]:
         operator=object(), events=object(), owner_user_id=OWNER,
         broker=object(), db=object(), owner_style=style,
     )
-
-    async def no_pause(_n):
-        return None
-
-    svc._show_typing_pause = no_pause
     return svc, sent
 
 
@@ -91,7 +86,7 @@ def test_reply_bursts_group_runs_and_drop_pasted_blocks():
 async def test_rewritten_reply_is_sent_as_the_models_bubbles():
     llm = _ScriptedLLM({"messages": ["done", " ", "3 files"]})
     svc, sent = _agent(OwnerStyle(llm=llm, db=_MemoryDB(STYLE), model="m"))
-    await svc._send("I finished the task. Three files changed.", messenger_style=True)
+    await svc._send("I finished the task. Three files changed.", styled=True)
     assert sent == ["done", "3 files"]
     assert llm.calls[0]["response_schema"]["required"] == ["messages"]
 
@@ -100,18 +95,18 @@ async def test_failed_or_empty_rewrite_sends_the_original():
     for outcome in (TimeoutError(), {"messages": []}, {"wrong": 1}):
         llm = _ScriptedLLM(outcome)
         svc, sent = _agent(OwnerStyle(llm=llm, db=_MemoryDB(STYLE), model="m"))
-        await svc._send("first thought\n\nsecond thought", messenger_style=True)
-        assert sent == ["first thought", "second thought"], outcome
+        await svc._send("first thought\n\nsecond thought", styled=True)
+        assert sent == ["first thought\n\nsecond thought"], outcome
 
 
 async def test_exempt_text_never_reaches_the_llm():
     llm = _ScriptedLLM()  # any call would pop from an empty script and fail
     svc, sent = _agent(OwnerStyle(llm=llm, db=_MemoryDB(STYLE), model="m"))
-    await svc._send("SYSTEM: memory saved", messenger_style=True)
-    await svc._send("run this:\n```\nls -la\n```", messenger_style=True)
-    await svc._send("Usage: /infer-style")  # slash replies aren't chat
+    await svc._send("SYSTEM: memory saved", styled=True)
+    await svc._send("run this:\n```\nls -la\n```", styled=True)
+    await svc._send("Usage: /infer-style")  # unstyled: slash-command output
     no_style, sent2 = _agent(OwnerStyle(llm=llm, db=_MemoryDB(None), model="m"))
-    await no_style._send("hello there", messenger_style=True)
+    await no_style._send("hello there", styled=True)
     assert llm.calls == []
     assert len(sent) == 3 and sent2 == ["hello there"]
 

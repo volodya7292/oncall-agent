@@ -5,7 +5,6 @@ bot is gone. None of these touch the network."""
 
 from __future__ import annotations
 
-import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -30,19 +29,6 @@ def chunk_message(text: str, *, limit: int = TELEGRAM_MSG_LIMIT) -> list[str]:
     if remaining:
         chunks.append(remaining)
     return chunks
-
-
-def split_messenger_reply(text: str, *, limit: int = TELEGRAM_MSG_LIMIT) -> list[str]:
-    """One Telegram bubble per blank-line-separated paragraph of an LLM reply.
-
-    The model decides where a thought ends; length never does. Only Telegram's
-    hard size limit may break a paragraph further.
-    """
-    pieces: list[str] = []
-    for paragraph in re.split(r"\n[ \t]*\n+", text):
-        if paragraph.strip():
-            pieces.extend(chunk_message(paragraph.strip(), limit=limit))
-    return pieces
 
 
 def label_for_chat(chat_id: str, resolved: dict[str, Any] | None) -> str:
