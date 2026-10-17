@@ -8,7 +8,9 @@ single row in `owner_style`, replaced on the next run.
 
 `OwnerStyle.rewrite` then runs on every chat reply to the owner. Any failure
 returns None and the caller sends the original: the style is cosmetic, the
-message is not.
+message is not. Quotations never reach the LLM: they are swapped for
+placeholders and put back verbatim, so a rewrite can't alter what someone
+was told.
 
 All three LLM steps use native structured output (`response_schema`)."""
 
@@ -17,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
@@ -34,6 +38,9 @@ _MAX_BURSTS = 200
 _ANALYZE_BATCH = 15
 _ANALYZE_CONCURRENCY = 4
 _MAX_EXAMPLES = 30
+# A quotation, marks included: „…“ / „…” (German), “…”, «…», "…", `…`.
+_QUOTE_RE = re.compile(r'„[^“”"\n]*[“”"]|“[^”\n]*”|«[^»\n]*»|"[^"\n]*"|`[^`\n]+`')
+_PLACEHOLDER_RE = re.compile(r"⟦(\d+)⟧")
 
 
 def _strict_object(properties: dict[str, Any]) -> dict[str, Any]:
@@ -97,9 +104,10 @@ way of splitting a thought into messages, as described and shown below. \
 Compress as hard as the owner would: drop framing, filler and whatever they \
 wouldn't bother to say, keeping what the reader needs to act on.
 
-Identifiers, links, paths and commands stay exact, and the intent stays (a \
-question stays a question). {language_rule} Each element of `messages` is \
-one Telegram message, sent in order.
+Each ⟦n⟧ stands for a quotation, marks included, and appears exactly once in \
+the result. Identifiers, links, paths and commands stay exact, and the intent \
+stays (a question stays a question). {language_rule} Each element of \
+`messages` is one Telegram message, sent in order.
 
 # The owner's style
 
@@ -173,6 +181,38 @@ def _render_example(example: dict[str, Any]) -> str:
     lines.append(f"(thinking: {example['thoughts']})")
     lines.append(f"(style: {example['writing_style']})")
     return "\n".join(lines)
+
+
+def _mask_quotes(text: str) -> tuple[str, list[str]]:
+    quotes: list[str] = []
+
+    def stash(match: re.Match[str]) -> str:
+        quotes.append(match.group(0))
+        return f"⟦{len(quotes)}⟧"
+
+    return _QUOTE_RE.sub(stash, text), quotes
+
+
+def _scripts(text: str) -> set[str]:
+    """Writing systems of the letters in `text` (LATIN, CYRILLIC, …)."""
+    return {unicodedata.name(ch, "?").split(" ", 1)[0] for ch in text if ch.isalpha()}
+
+
+def _restore_quotes(pieces: list[str], masked: str, quotes: list[str]) -> list[str]:
+    """Put the quotations back. Raises ValueError when the rewrite dropped,
+    repeated or invented one, or wrote in a script the original used only
+    inside quotes or not at all: that is the rewrite passing off its own
+    words as a quotation, or drifting into the examples' language."""
+    found = sorted(int(n) for piece in pieces for n in _PLACEHOLDER_RE.findall(piece))
+    if found != list(range(1, len(quotes) + 1)):
+        raise ValueError(f"quote placeholders {found}, expected {len(quotes)}")
+    introduced = _scripts(" ".join(pieces)) - _scripts(masked)
+    if introduced:
+        raise ValueError(f"introduced scripts {sorted(introduced)}")
+    return [
+        _PLACEHOLDER_RE.sub(lambda m: quotes[int(m.group(1)) - 1], piece)
+        for piece in pieces
+    ]
 
 
 def should_rewrite(text: str) -> bool:
@@ -325,6 +365,7 @@ class OwnerStyle:
             return None
         if not style:
             return None
+        masked, quotes = _mask_quotes(text)
         system = _REWRITE_PROMPT.format(
             profile=style["profile"],
             language_rule=_language_rule(self._language),
@@ -333,7 +374,7 @@ class OwnerStyle:
         try:
             result = await asyncio.wait_for(
                 self._structured(
-                    system=system, user=f"<message>\n{text}\n</message>",
+                    system=system, user=f"<message>\n{masked}\n</message>",
                     schema=_REWRITE_SCHEMA,
                     max_tokens=2048, reasoning_effort=self._rewrite_effort,
                 ),
@@ -350,4 +391,8 @@ class OwnerStyle:
         if not pieces:
             log.warning("owner style rewrite returned only empty messages, sending original")
             return None
-        return pieces
+        try:
+            return _restore_quotes(pieces, masked, quotes)
+        except ValueError as e:
+            log.warning("owner style rewrite rejected (%s), sending original", e)
+            return None

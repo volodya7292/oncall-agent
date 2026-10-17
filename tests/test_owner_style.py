@@ -99,6 +99,27 @@ async def test_failed_or_empty_rewrite_sends_the_original():
         assert sent == ["first thought\n\nsecond thought"], outcome
 
 
+async def test_quotes_go_out_verbatim_or_the_original_does():
+    """Regression: a report of a message sent to a contact quoted only its
+    intro and paraphrased the rest in German; the rewrite rendered that
+    paraphrase in Russian, reading like a quote of text never sent."""
+    original = "Gesendet. Beginnt mit „сори, это агент)“, Rest: Vertrag ist aus."
+    quote = "„сори, это агент)“"
+    cases = [
+        (["gesendet", "mit ⟦1⟧ am anfang", "rest: vertrag aus"],
+         ["gesendet", f"mit {quote} am anfang", "rest: vertrag aus"]),
+        (["gesendet, mit ⟦1⟧", "контракт закончился"], [original]),  # fake quote
+        (["gesendet", "vertrag aus"], [original]),                     # quote dropped
+        (["⟦1⟧ ⟦1⟧", "vertrag aus"], [original]),                      # quote repeated
+    ]
+    for reply, expected in cases:
+        llm = _ScriptedLLM({"messages": reply})
+        svc, sent = _agent(OwnerStyle(llm=llm, db=_MemoryDB(STYLE), model="m"))
+        await svc._send(original, styled=True)
+        assert sent == expected, reply
+        assert "сори" not in llm.calls[0]["messages"][1]["content"]
+
+
 async def test_exempt_text_never_reaches_the_llm():
     llm = _ScriptedLLM()  # any call would pop from an empty script and fail
     svc, sent = _agent(OwnerStyle(llm=llm, db=_MemoryDB(STYLE), model="m"))
