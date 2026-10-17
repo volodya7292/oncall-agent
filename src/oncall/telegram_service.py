@@ -12,9 +12,6 @@ not per-Claude-task) because:
 Operations exposed:
   * inbound: NewMessage handler writes to messenger_inbox + publishes a global event.
   * `list_inbox` / `get_message` / `mark_read`     — pure DB.
-  * `get_chat_style(chat_id, limit)`               — reads the USER'S OWN recent
-    outgoing messages in that chat, so the agent can mimic the user's voice
-    (length, tone, emoji, language) before drafting a reply.
   * `send(chat_id, text)`                          — telethon send_message;
     routed through the broker by the time it's reached (via MCP messenger_inbox
     tool + --permission-prompt-tool flow).
@@ -327,51 +324,6 @@ class TelegramService:
 
     # ---- telethon-backed reads/writes ----
 
-    async def get_chat_style(
-        self, chat_id: str, *, limit: int = 10,
-    ) -> list[dict[str, Any]]:
-        """Return the USER'S OWN outgoing messages in this chat, sampled
-        from three temporal windows (latest, ~2 days ago, ~30 days ago) so
-        the voice profile reflects how the user writes across different
-        conversational moods rather than just the latest exchange. Each
-        entry is {'message_id', 'text', 'date'}. Deduplicated across
-        windows by message_id; returned newest-first.
-
-        We deliberately filter to the user's own side (from_user='me');
-        reading the counterparty's messages would teach the wrong voice.
-        We also exclude messages ≥200 chars — long messages tend to be
-        structured/informational (lists, briefings, code) and are bad
-        examples of the user's casual voice. `limit` applies PER WINDOW;
-        the caller may receive up to ~3×limit samples in total."""
-        entity = _entity_arg(chat_id)
-        now = datetime.now(timezone.utc)
-        windows: list[datetime | None] = [
-            None,                          # 1) latest messages
-            now - timedelta(days=2),       # 2) ~2 days ago
-            now - timedelta(days=30),      # 3) ~30 days ago
-        ]
-        seen: set[str] = set()
-        samples: list[dict[str, Any]] = []
-        for offset_date in windows:
-            kwargs: dict[str, Any] = {"limit": limit, "from_user": "me"}
-            if offset_date is not None:
-                kwargs["offset_date"] = offset_date
-            async for msg in self._client.iter_messages(entity, **kwargs):
-                text = getattr(msg, "message", None)
-                if not text or len(text) >= 200:
-                    continue
-                mid = str(getattr(msg, "id", ""))
-                if not mid or mid in seen:
-                    continue
-                seen.add(mid)
-                samples.append({
-                    "message_id": mid,
-                    "date": _iso_or_none(getattr(msg, "date", None)),
-                    "text": text,
-                })
-        samples.sort(key=lambda s: s["date"] or "", reverse=True)
-        return samples
-
     async def get_owner_dm_threads(
         self, *, max_chats: int, per_chat: int,
     ) -> list[list[dict[str, Any]]]:
@@ -429,8 +381,7 @@ class TelegramService:
         message_id)` to load the bytes. Without this they were invisible
         and the operator would guess (wrongly) at nearby IDs.
 
-        Unlike `get_chat_style` (which filters to from_user='me'), this
-        includes the counterparty's messages — use it when the user asks
+        Includes the counterparty's messages — use it when the user asks
         'what did X say?'."""
         entity = _entity_arg(chat_id)
         iter_kwargs: dict[str, Any] = {"limit": limit}

@@ -593,10 +593,17 @@ def _classify_messenger(tool_input: dict[str, Any]) -> Verdict:
         )
     if op == "send":
         chat = str(tool_input.get("chat_id", "?"))
-        text = str(tool_input.get("text", ""))
+        texts = tool_input.get("texts")
+        if isinstance(texts, list) and tool_input.get("text") is None:
+            # The approval shows every message that will go out, in order.
+            canonical = f"Send {len(texts)} messages to chat {chat}:" + "".join(
+                f"\n{i}. {str(t)!r}" for i, t in enumerate(texts, 1)
+            )
+        else:
+            canonical = f"Send to chat {chat}: {str(tool_input.get('text', ''))!r}"
         return Verdict(
             kind=ClassifierVerdict.MUTATING,
-            canonical=f"Send to chat {chat}: {text!r}",
+            canonical=canonical,
             blast_radius=(
                 f"Sends a Telegram message AS the user to chat {chat}. "
                 f"Visible to recipient; cannot be unsent reliably."

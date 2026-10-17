@@ -162,3 +162,84 @@ async def test_infer_survives_a_failed_batch_and_persists(tmp_path):
         assert (await db.get_owner_style())["profile"] == "terse"
     finally:
         await db.close()
+
+
+# ---- messages to contacts: op=style restyles, op=send sends what was approved
+
+
+class _StubTelegram:
+    def __init__(self, history: list[dict[str, Any]] | None = None) -> None:
+        self.history = history or []  # newest-first, like get_chat_history
+        self.sent: list[str] = []
+
+    async def get_chat_history(self, chat_id, *, limit=10, since=None):
+        return self.history[:limit]
+
+    async def send(self, chat_id, text):
+        self.sent.append(text)
+        return {"message_id": str(len(self.sent)), "chat_id": chat_id}
+
+
+def _messenger(tg: _StubTelegram, style: OwnerStyle | None):
+    import httpx
+    from fastapi import FastAPI
+    from oncall.api import _register_routes, verify_loopback
+
+    app = FastAPI()
+    _register_routes(app)
+    app.dependency_overrides[verify_loopback] = lambda: None
+    app.state.telegram, app.state.owner_style, app.state.voice_call = tg, style, None
+    app.state.db = None
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+
+    async def call(**body: Any) -> httpx.Response:
+        return await client.post("/internal/messenger", json=body)
+    return call
+
+
+async def test_send_goes_out_exactly_as_the_approval_shows_it():
+    """Safety invariant: the owner approves the classifier's canonical text,
+    so every message the server sends must appear in it, in order, and an
+    ambiguous body (text AND texts) must send nothing."""
+    from oncall.classifier import _classify_messenger
+
+    tg = _StubTelegram()
+    call = _messenger(tg, None)
+    for body in (
+        {"op": "send", "chat_id": "7", "texts": ["first", "second"]},
+        {"op": "send", "chat_id": "7", "text": None, "texts": ["third"]},
+    ):
+        before = len(tg.sent)
+        assert (await call(**body)).status_code == 200
+        shown = _classify_messenger(body).canonical
+        assert all(repr(t) in shown for t in tg.sent[before:]), shown
+    assert tg.sent == ["first", "second", "third"]
+
+    for bad in (
+        {"op": "send", "chat_id": "7", "text": "a", "texts": ["b"]},
+        {"op": "send", "chat_id": "7", "texts": []},
+        {"op": "send", "chat_id": "7", "texts": ["ok", "  "]},
+    ):
+        assert (await call(**bad)).status_code == 400, bad
+    assert tg.sent == ["first", "second", "third"]
+
+
+async def test_contact_restyle_follows_the_chat_language_or_returns_the_draft():
+    # The owner writes Cyrillic to this contact, the draft is English: the
+    # chat's script is allowed even though the draft never used it.
+    tg = _StubTelegram(history=[
+        {"outgoing": True, "text": "ок, буду"},
+        {"outgoing": False, "text": "придёшь?"},
+    ])
+    llm = _ScriptedLLM({"messages": ["буду в 7", "⟦1⟧ взял"]}, {"messages": ["見る"]})
+    call = _messenger(tg, OwnerStyle(llm=llm, db=_MemoryDB(STYLE), model="m"))
+    draft = 'I will be there at 7, got "the keys".'
+
+    r = (await call(op="style", chat_id="7", text=draft)).json()
+    assert r == {"messages": ["буду в 7", '"the keys" взял'], "styled": True}
+    system = llm.calls[0]["messages"][0]["content"]
+    assert system.index("them: придёшь?") < system.index("owner: ок, буду")
+
+    r = (await call(op="style", chat_id="7", text=draft)).json()  # foreign script
+    assert r["styled"] is False and r["messages"] == [draft] and r["reason"]
+    assert tg.sent == []

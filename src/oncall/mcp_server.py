@@ -311,9 +311,12 @@ async def list_tools() -> list[Tool]:
                 "  transcribe     — transcribe a voice / voice-note message to text. "
                 "Requires `chat_id` + `message_id`. Returns `{text, pending}`.\n"
                 "  mark_read      — mark one inbox row read.\n"
-                "  style          — fetch the user's OWN recent outgoing messages in a chat. "
-                "Always run this before drafting a reply so you can match the user's voice.\n"
-                "  send           — send a message AS the user to any chat (DM or group). "
+                "  style          — restyle a draft (`text`) for `chat_id` into the user's "
+                "own voice with this contact. Returns `{messages, styled}`: the draft as "
+                "the user would write it, possibly split into several messages; when "
+                "`styled` is false, `messages` is the unchanged draft and `reason` says why.\n"
+                "  send           — send AS the user to any chat (DM or group): one "
+                "message in `text`, or several in order in `texts` (never both). "
                 "MUTATING — broker will require human approval before this fires, unless "
                 "the chat_id is on the user's per-chat allowlist (auto-allow).\n"
                 "  react          — drop a Telegram emoji reaction on one inbound message "
@@ -347,6 +350,7 @@ async def list_tools() -> list[Tool]:
                     "inbox_id":    {"type": "string"},
                     "message_id":  {"type": "string"},
                     "text":        {"type": "string"},
+                    "texts":       {"type": "array", "items": {"type": "string"}, "description": "op=send only, instead of `text`: messages sent in order under one approval."},
                     "file_path":   {"type": "string", "description": "Absolute local path to a regular file. For op=send_file."},
                     "caption":     {"type": "string", "description": "Optional caption shown with the uploaded file. For op=send_file."},
                     "emoji":       {"type": "string", "enum": ["👍", "❤️", "🔥", "😁"]},

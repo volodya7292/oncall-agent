@@ -5,7 +5,6 @@ These cover:
     fields, gated on the DM allowlist.
   * Private filter rejects non-private events.
   * Duplicate (chat_id, message_id) doesn't insert twice.
-  * `get_chat_style` reads only the user's OWN outgoing messages.
   * `send` calls send_message and returns the new message id.
 """
 
@@ -32,7 +31,6 @@ class FakeTelegramClient:
     def __init__(
         self,
         *,
-        outgoing: dict[int, list[dict[str, Any]]] | None = None,
         messages: dict[int, list[dict[str, Any]]] | None = None,
         dialogs: list[dict[str, Any]] | None = None,
         contact_search_users: list[dict[str, Any]] | None = None,
@@ -47,9 +45,6 @@ class FakeTelegramClient:
         # get_entity(id) reports .contact=True unless the id is listed here.
         # Lets outbound-contact-gate tests simulate a stranger.
         self._non_contact_ids = non_contact_ids or set()
-        # outgoing[chat_id_int] = [{"id": int, "message": str, "date": dt}]
-        # — only the user's own outgoing, used by get_chat_style tests.
-        self._outgoing = outgoing or {}
         # messages[chat_id_int] = [{"id": int, "message": str, "date": dt,
         #                           "out": bool, "sender": SimpleNamespace}]
         # — both sides, used by get_chat_history tests.
@@ -108,15 +103,8 @@ class FakeTelegramClient:
             eid = None
         return SimpleNamespace(id=eid, contact=(eid not in self._non_contact_ids))
 
-    def iter_messages(self, entity, *, limit=20, from_user=None, search=None, **kwargs):
+    def iter_messages(self, entity, *, limit=20, search=None, **kwargs):
         chat_id = entity if isinstance(entity, int) else 0
-        if from_user == "me":
-            # outgoing-only path (used by get_chat_style).
-            msgs = list(self._outgoing.get(chat_id, []))
-            return _async_iter([
-                SimpleNamespace(id=m["id"], message=m["message"], date=m["date"])
-                for m in msgs[:limit]
-            ])
         # Both-sides path (get_chat_history + search_messages). Each entry must
         # support .out and .get_sender() for the service to extract direction
         # + sender.
@@ -344,29 +332,6 @@ async def test_duplicate_message_dedup(service, db):
     await client.handler(e1)
     rows = await db.list_inbox()
     assert len(rows) == 1
-
-
-@pytest.mark.asyncio
-async def test_get_chat_style_returns_user_outgoing(db):
-    """Style samples must be the USER'S own messages, not the counterparty's.
-    Results are sorted newest-first (combined across the 3 temporal sampling
-    windows that get_chat_style fans out across)."""
-    base = datetime(2026, 5, 22, 10, 0, tzinfo=timezone.utc)
-    client = FakeTelegramClient(outgoing={
-        12345: [
-            {"id": 5, "message": "ало", "date": base},
-            {"id": 6, "message": "ща приду", "date": base + timedelta(minutes=1)},
-            {"id": 7, "message": "+1", "date": base + timedelta(minutes=2)},
-        ],
-    })
-    s = TelegramService(db=db, client=client)
-    await s.start()
-    try:
-        samples = await s.get_chat_style("12345", limit=10)
-    finally:
-        await s.stop()
-    texts = [m["text"] for m in samples]
-    assert texts == ["+1", "ща приду", "ало"]
 
 
 @pytest.mark.asyncio

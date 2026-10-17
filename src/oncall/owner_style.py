@@ -12,6 +12,11 @@ message is not. Quotations never reach the LLM: they are swapped for
 placeholders and put back verbatim, so a rewrite can't alter what someone
 was told.
 
+`OwnerStyle.rewrite_for_contact` backs the messenger `op=style`: a draft the
+executor will send as the owner to someone else, restyled with the same
+profile plus the recent chat with that person (whose language it follows).
+It runs before `op=send`, so the approval shows the restyled text.
+
 All three LLM steps use native structured output (`response_schema`)."""
 
 from __future__ import annotations
@@ -74,40 +79,37 @@ _REWRITE_SCHEMA = _strict_object({
 })
 
 _ANALYZE_PROMPT = """\
-You are studying how one person, the owner, writes in their Telegram DMs. Each \
-numbered item is one reply of the owner's: the messages they were answering \
-(written by someone else, possibly empty) and their reply, which may span \
-several consecutive messages.
-
-For every item, infer what went through the owner's mind while writing it, \
-and describe the writing style that results: register, length, punctuation, \
-capitalization, language choice and mixing, emoji, slang, and how the reply \
-is split across messages. Analyze only the owner; the context is there to \
-explain their choices. Return one analysis per item, keyed by its index."""
+Each numbered item is one Telegram reply by the owner, possibly several \
+messages, to the messages before it, which someone else wrote. Per item, \
+infer what the owner was thinking and describe their style: register, length, \
+punctuation, capitalization, language, emoji, slang, message splitting. \
+Analyze only the owner. One analysis per item, keyed by its index."""
 
 _PROFILE_PROMPT = """\
-Below are analyses of how the owner writes in their Telegram DMs, each with \
-the reply it describes. Distill them into a style guide that lets someone \
-write new messages indistinguishable from the owner's, in any language: what \
-holds across all chats, and what changes with the person, the situation or \
-the language.
+Distill these analyses of the owner's Telegram replies into a style guide for \
+writing new messages indistinguishable from theirs, in any language: what \
+holds everywhere and what shifts with the person, situation or language. \
+Pick up to {max_examples} item indices whose replies best show the style and \
+its range."""
 
-Also pick up to {max_examples} item indices whose replies, together, best \
-show the style and its range."""
+_OWNER_REWRITE_HEAD = """\
+Restyle the assistant's message to its owner, given in <message>, into the \
+way the owner writes, described and shown below. It stays the assistant's \
+message to the owner, saying the same thing. Compress as the owner would, \
+keeping only what the reader needs to act on."""
 
-_REWRITE_PROMPT = """\
-You restyle the message an assistant is about to send to its owner on \
-Telegram, given inside <message>. The result is still that message, from the \
-assistant to the owner and saying what it says, only written the way the \
-owner writes: their voice, register, length, punctuation, capitalization and \
-way of splitting a thought into messages, as described and shown below. \
-Compress as hard as the owner would: drop framing, filler and whatever they \
-wouldn't bother to say, keeping what the reader needs to act on.
+_CONTACT_REWRITE_HEAD = """\
+Restyle the message drafted for the owner to send a contact, given in \
+<message>, into the way the owner writes to this person, described and shown \
+below. It stays the owner's message to this contact, saying the same thing. \
+Compress as the owner would."""
 
-Each ⟦n⟧ stands for a quotation, marks included, and appears exactly once in \
-the result. Identifiers, links, paths and commands stay exact, and the intent \
-stays (a question stays a question). {language_rule} Each element of \
-`messages` is one Telegram message, sent in order.
+_REWRITE_BODY = """\
+{head}
+
+Each ⟦n⟧ is a quotation and appears exactly once. Identifiers, links, paths, \
+commands and the intent stay exact. {language_rule} Each element of \
+`messages` is one Telegram message.
 
 # The owner's style
 
@@ -117,10 +119,22 @@ stays (a question stays a question). {language_rule} Each element of \
 
 {examples}"""
 
+_CONTACT_THREAD_SECTION = """
+
+# Recent chat with this contact
+
+{thread}"""
+
 
 def _language_rule(language: str) -> str:
     target = f"{language} (ISO-639-1)" if language else "the original message's language"
-    return f"Write in {target}, whatever language the style notes and examples are in."
+    return f"Write in {target}, whatever language the examples are in."
+
+
+_CONTACT_LANGUAGE_RULE = (
+    "Write in the language the owner uses in the recent chat (else the "
+    "draft's), whatever language the examples are in."
+)
 
 
 def reply_bursts(thread: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -198,15 +212,19 @@ def _scripts(text: str) -> set[str]:
     return {unicodedata.name(ch, "?").split(" ", 1)[0] for ch in text if ch.isalpha()}
 
 
-def _restore_quotes(pieces: list[str], masked: str, quotes: list[str]) -> list[str]:
+def _restore_quotes(
+    pieces: list[str], masked: str, quotes: list[str],
+    allowed_scripts: frozenset[str] = frozenset(),
+) -> list[str]:
     """Put the quotations back. Raises ValueError when the rewrite dropped,
-    repeated or invented one, or wrote in a script the original used only
-    inside quotes or not at all: that is the rewrite passing off its own
-    words as a quotation, or drifting into the examples' language."""
+    repeated or invented one, or wrote in a script neither the original
+    (outside quotes) nor `allowed_scripts` has: that is the rewrite passing
+    off its own words as a quotation, or drifting into the examples'
+    language."""
     found = sorted(int(n) for piece in pieces for n in _PLACEHOLDER_RE.findall(piece))
     if found != list(range(1, len(quotes) + 1)):
         raise ValueError(f"quote placeholders {found}, expected {len(quotes)}")
-    introduced = _scripts(" ".join(pieces)) - _scripts(masked)
+    introduced = _scripts(" ".join(pieces)) - _scripts(masked) - allowed_scripts
     if introduced:
         raise ValueError(f"introduced scripts {sorted(introduced)}")
     return [
@@ -356,21 +374,55 @@ class OwnerStyle:
         """`text` in the owner's style, one string per Telegram message, or
         None when there is no style yet, the text is exempt, or the call
         fails, times out or returns nothing usable."""
+        pieces, reason = await self._restyle(
+            text, head=_OWNER_REWRITE_HEAD,
+            language_rule=_language_rule(self._language),
+        )
+        if pieces is None and reason:
+            log.warning("owner style rewrite: %s, sending original", reason)
+        return pieces
+
+    async def rewrite_for_contact(
+        self, text: str, thread: list[dict[str, Any]],
+    ) -> tuple[list[str] | None, str]:
+        """A draft for the owner to send to a contact, in the way the owner
+        writes to that person. `thread` is the recent chat with them,
+        oldest-first {outgoing, text}. Returns (messages, "") or
+        (None, why not)."""
+        own = [m["text"] for m in thread if m.get("outgoing") and m.get("text")]
+        rendered = "\n".join(
+            f"{'owner' if m.get('outgoing') else 'them'}: {(m.get('text') or '')[:_CONTEXT_CLIP]}"
+            for m in thread if m.get("text")
+        )
+        pieces, reason = await self._restyle(
+            text, head=_CONTACT_REWRITE_HEAD, language_rule=_CONTACT_LANGUAGE_RULE,
+            extra_section=_CONTACT_THREAD_SECTION.format(thread=rendered) if rendered else "",
+            allowed_scripts=frozenset(_scripts(" ".join(own))),
+        )
+        if pieces is None and reason:
+            log.warning("owner style contact rewrite: %s", reason)
+        return pieces, reason
+
+    async def _restyle(
+        self, text: str, *, head: str, language_rule: str,
+        extra_section: str = "", allowed_scripts: frozenset[str] = frozenset(),
+    ) -> tuple[list[str] | None, str]:
         if not should_rewrite(text):
-            return None
+            return None, ""
         try:
             style = await self.current()
         except Exception:
             log.exception("owner style: loading the stored style failed")
-            return None
+            return None, "loading the learned style failed"
         if not style:
-            return None
+            return None, "no learned style yet (the owner can run /infer-style)"
         masked, quotes = _mask_quotes(text)
-        system = _REWRITE_PROMPT.format(
+        system = _REWRITE_BODY.format(
+            head=head,
             profile=style["profile"],
-            language_rule=_language_rule(self._language),
+            language_rule=language_rule,
             examples="\n\n".join(_render_example(ex) for ex in style["examples"]),
-        )
+        ) + extra_section
         try:
             result = await asyncio.wait_for(
                 self._structured(
@@ -381,18 +433,14 @@ class OwnerStyle:
                 timeout=self._rewrite_timeout,
             )
         except Exception as e:
-            log.warning("owner style rewrite failed, sending original: %r", e)
-            return None
+            return None, f"rewrite call failed: {e!r}"
         messages = result.get("messages") if isinstance(result, dict) else None
         if not isinstance(messages, list):
-            log.warning("owner style rewrite returned no message list, sending original")
-            return None
+            return None, "rewrite returned no message list"
         pieces = [m.strip() for m in messages if isinstance(m, str) and m.strip()]
         if not pieces:
-            log.warning("owner style rewrite returned only empty messages, sending original")
-            return None
+            return None, "rewrite returned only empty messages"
         try:
-            return _restore_quotes(pieces, masked, quotes)
+            return _restore_quotes(pieces, masked, quotes, allowed_scripts), ""
         except ValueError as e:
-            log.warning("owner style rewrite rejected (%s), sending original", e)
-            return None
+            return None, f"rewrite rejected ({e})"

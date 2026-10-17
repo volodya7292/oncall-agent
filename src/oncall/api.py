@@ -135,6 +135,9 @@ class MessengerOpBody(BaseModel):
     message_id: str | None = None
     inbox_id: str | None = None
     text: str | None = None
+    # `send` only, instead of `text`: several messages sent in order under
+    # one approval (what `op=style` returns).
+    texts: list[str] | None = None
     file_path: str | None = None
     caption: str | None = None
     emoji: str | None = None
@@ -442,6 +445,7 @@ def create_app() -> FastAPI:
         # from the primary userbot above). Replaces the old HTTP Bot API
         # front-end. Voice calls (future) will bind here.
         telegram_agent: TelegramAgentService | None = None
+        owner_style: OwnerStyle | None = None
         if operator is not None:
             owner_style = OwnerStyle(
                 llm=llm, db=db,
@@ -483,6 +487,7 @@ def create_app() -> FastAPI:
         app.state.memory = memory
         app.state.telegram = telegram
         app.state.telegram_agent = telegram_agent
+        app.state.owner_style = owner_style
         app.state.voice_call = voice_call
         app.state.ask_futures = ask_futures if operator is not None else {}
         # Orphaned asks from a previous run cannot be resolved (the
@@ -1826,6 +1831,7 @@ def _register_routes(app: FastAPI) -> None:
                 call_service=request.app.state.voice_call,
                 db=_db(request),
                 owner_user_id=get_settings().telegram_owner_user_id,
+                owner_style=getattr(request.app.state, "owner_style", None),
             )
         except RPCError as e:
             # Emit on the audit channel too so messenger failures show up
@@ -1847,6 +1853,7 @@ def _register_routes(app: FastAPI) -> None:
         call_service: CallService | None = None,
         db: Database | None = None,
         owner_user_id: str | None = None,
+        owner_style: OwnerStyle | None = None,
     ) -> dict[str, Any]:
         if body.op == "list":
             unread_only = True if body.unread_only is None else body.unread_only
@@ -1892,9 +1899,21 @@ def _register_routes(app: FastAPI) -> None:
             ok = await tg.mark_read(body.inbox_id)
             return {"marked_read": ok}
         if body.op == "style":
-            if not body.chat_id:
-                raise HTTPException(400, "chat_id required")
-            return {"samples": await tg.get_chat_style(body.chat_id, limit=body.limit)}
+            if not body.chat_id or not body.text:
+                raise HTTPException(400, "chat_id and text required")
+            if owner_style is None:
+                return {"messages": [body.text], "styled": False,
+                        "reason": "owner style is not configured"}
+            history = await tg.get_chat_history(
+                body.chat_id, limit=max(1, min(50, body.limit)),
+            )
+            pieces, reason = await owner_style.rewrite_for_contact(
+                body.text, list(reversed(history)),
+            )
+            if pieces is None:
+                return {"messages": [body.text], "styled": False, "reason": reason
+                        or "exempt from restyling (code block or system notice)"}
+            return {"messages": pieces, "styled": True}
         if body.op == "history":
             if not body.chat_id:
                 raise HTTPException(400, "chat_id required")
@@ -1928,9 +1947,29 @@ def _register_routes(app: FastAPI) -> None:
                 limit=body.limit,
             )}
         if body.op == "send":
-            if not body.chat_id or not body.text:
-                raise HTTPException(400, "chat_id and text required")
-            return await tg.send(body.chat_id, body.text)
+            # Exactly one of text / texts: the approval shows whichever was
+            # given, so accepting both would send something unapproved.
+            if (body.text is None) == (body.texts is None):
+                raise HTTPException(400, "chat_id and exactly one of text / texts required")
+            texts = [body.text] if body.text is not None else body.texts or []
+            if not body.chat_id or not texts or not all(t.strip() for t in texts):
+                raise HTTPException(400, "chat_id and non-empty messages required")
+            if body.text is not None:
+                return await tg.send(body.chat_id, body.text)
+            sent: list[dict[str, Any]] = []
+            for i, t in enumerate(texts):
+                try:
+                    sent.append(await tg.send(body.chat_id, t))
+                except Exception as e:
+                    if not sent:
+                        raise
+                    log.warning("messenger send: chat=%s stopped after %d/%d: %r",
+                                body.chat_id, len(sent), len(texts), e)
+                    raise HTTPException(422, (
+                        f"sent {len(sent)} of {len(texts)} messages, then message "
+                        f"{i + 1} failed: {type(e).__name__}: {e}"
+                    ))
+            return {"chat_id": body.chat_id, "message_ids": [m["message_id"] for m in sent]}
         if body.op == "send_file":
             if not body.chat_id or not body.file_path:
                 raise HTTPException(400, "chat_id and file_path required")
