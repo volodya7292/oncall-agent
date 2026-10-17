@@ -164,7 +164,7 @@ async def test_infer_survives_a_failed_batch_and_persists(tmp_path):
         await db.close()
 
 
-# ---- messages to contacts: op=style restyles, op=send sends what was approved
+# ---- messages to contacts: op=send sends exactly what was approved
 
 
 class _StubTelegram:
@@ -224,22 +224,22 @@ async def test_send_goes_out_exactly_as_the_approval_shows_it():
     assert tg.sent == ["first", "second", "third"]
 
 
-async def test_contact_restyle_follows_the_chat_language_or_returns_the_draft():
+async def test_contact_restyle_follows_the_chat_language_or_fails():
     # The owner writes Cyrillic to this contact, the draft is English: the
     # chat's script is allowed even though the draft never used it.
-    tg = _StubTelegram(history=[
-        {"outgoing": True, "text": "ок, буду"},
+    thread = [
         {"outgoing": False, "text": "придёшь?"},
-    ])
+        {"outgoing": True, "text": "ок, буду"},
+    ]
     llm = _ScriptedLLM({"messages": ["буду в 7", "⟦1⟧ взял"]}, {"messages": ["見る"]})
-    call = _messenger(tg, OwnerStyle(llm=llm, db=_MemoryDB(STYLE), model="m"))
+    style = OwnerStyle(llm=llm, db=_MemoryDB(STYLE), model="m")
     draft = 'I will be there at 7, got "the keys".'
 
-    r = (await call(op="style", chat_id="7", text=draft)).json()
-    assert r == {"messages": ["буду в 7", '"the keys" взял'], "styled": True}
+    assert await style.rewrite_for_contact(draft, thread) == (
+        ["буду в 7", '"the keys" взял'], "",
+    )
     system = llm.calls[0]["messages"][0]["content"]
     assert system.index("them: придёшь?") < system.index("owner: ок, буду")
 
-    r = (await call(op="style", chat_id="7", text=draft)).json()  # foreign script
-    assert r["styled"] is False and r["messages"] == [draft] and r["reason"]
-    assert tg.sent == []
+    pieces, reason = await style.rewrite_for_contact(draft, thread)  # foreign script
+    assert pieces is None and reason

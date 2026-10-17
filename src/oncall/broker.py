@@ -49,6 +49,10 @@ MAX_CONSECUTIVE_DENIALS = 3
 
 EventPublisher = Callable[[UUID, str, dict[str, Any]], Awaitable[None]]
 ChatLabelResolver = Callable[[str], Awaitable[str | None]]
+# (chat_id, draft) -> (messages in the owner's voice, "") or (None, why not).
+SendRestyler = Callable[[str, str], Awaitable[tuple[list[str] | None, str]]]
+
+_MESSENGER_TOOL = "mcp__oncall__messenger_inbox"
 
 
 class Broker:
@@ -62,6 +66,7 @@ class Broker:
         max_consecutive_denials: int = MAX_CONSECUTIVE_DENIALS,
         approval_timeout_seconds: int | None = None,
         chat_label_resolver: ChatLabelResolver | None = None,
+        send_restyler: SendRestyler | None = None,
     ) -> None:
         self._db = db
         self._client = approval_client
@@ -77,6 +82,13 @@ class Broker:
         # "Rostislav (1756925023)" instead of the bare id. Resolver
         # returning None → no enrichment, fall back to the bare id.
         self._chat_label_resolver = chat_label_resolver
+        # Optional. Rewrites every messenger `op=send` draft into the owner's
+        # voice BEFORE classification, so the approval prompt, the auto-allow
+        # and the `updatedInput` the CLI executes all carry the same restyled
+        # messages. Done here rather than left to the executor, which skips
+        # an optional styling step whenever it believes it already knows the
+        # voice.
+        self._send_restyler = send_restyler
 
     async def decide(
         self,
@@ -95,7 +107,7 @@ class Broker:
                 event="dedup_hit", session=session_id, tool_use=tool_use_id,
                 tool=tool_name, decision=result.behavior,
             ))
-            return self._to_permission_result(result, tool_input)
+            return self._to_permission_result(result, req.tool_input)
 
         # 1b. Dedup (pending): if --resume re-issues the same call but the
         # user never responded before the crash, RE-ATTACH to the existing
@@ -118,7 +130,10 @@ class Broker:
                 event="reattach_pending", session=session_id, tool_use=tool_use_id,
                 approval=str(pending.id),
             ))
-            return await self._await_pending_resolution(pending, tool_input)
+            return await self._await_pending_resolution(pending)
+
+        # 1c. A send as the owner goes out in the owner's voice.
+        tool_input, restyle_failure = await self._restyle_send(tool_name, tool_input)
 
         # 2. Classify. Catastrophic is decided deterministically; readonly vs
         # mutating for shell commands is an LLM judgment that fails closed.
@@ -130,7 +145,7 @@ class Broker:
         # resolver failure or empty result is silently skipped.
         if (
             self._chat_label_resolver is not None
-            and tool_name == "mcp__oncall__messenger_inbox"
+            and tool_name == _MESSENGER_TOOL
             and tool_input.get("chat_id")
         ):
             chat_id_str = str(tool_input["chat_id"])
@@ -174,6 +189,23 @@ class Broker:
         if self._approval_timeout_seconds is not None:
             req_kwargs["timeout_seconds"] = self._approval_timeout_seconds
         req = ApprovalRequest(**req_kwargs)
+
+        # An autonomous reply that can't be put in the owner's voice is not
+        # sent at all: it would auto-allow, so nobody would see the draft.
+        # Elsewhere the unstyled draft goes to the owner's approval as is.
+        if restyle_failure and task.restricted_to_chat is not None:
+            await self._db.record_auto_approval(req, "deny", "restyle_failed")
+            broker_log.warning("decide " + fmt(
+                event="auto_deny_restyle_failed", task=str(task.id),
+                reason=restyle_failure,
+            ))
+            return PermissionResult(
+                behavior="deny",
+                message=(
+                    f"Not sent: the reply could not be written in the user's "
+                    f"voice ({restyle_failure})."
+                ),
+            )
 
         if verdict.kind == ClassifierVerdict.READONLY:
             await self._db.record_auto_approval(req, "allow", "auto:readonly")
@@ -342,11 +374,44 @@ class Broker:
             verdict="mutating", approval=str(req_id),
             canonical=verdict.canonical, phrase=challenge,
         ))
-        return await self._await_pending_resolution(req, tool_input)
+        return await self._await_pending_resolution(req)
 
-    async def _await_pending_resolution(
-        self, req: ApprovalRequest, tool_input: dict[str, Any],
-    ) -> PermissionResult:
+    async def _restyle_send(
+        self, tool_name: str, tool_input: dict[str, Any],
+    ) -> tuple[dict[str, Any], str]:
+        """`tool_input` with the draft replaced by `texts` in the owner's
+        voice, plus "" — or unchanged, plus why it couldn't be restyled
+        ("" when there was nothing to restyle: not a send, `verbatim`,
+        exempt text, or a malformed body the server will reject anyway)."""
+        if (
+            self._send_restyler is None
+            or tool_name != _MESSENGER_TOOL
+            or tool_input.get("op") != "send"
+            or tool_input.get("verbatim")
+        ):
+            return tool_input, ""
+        text, texts = tool_input.get("text"), tool_input.get("texts")
+        if text is not None and texts is not None:
+            return tool_input, ""
+        draft = text if isinstance(text, str) else (
+            "\n\n".join(t for t in texts if isinstance(t, str))
+            if isinstance(texts, list) else ""
+        )
+        chat_id = str(tool_input.get("chat_id") or "")
+        if not chat_id or not draft.strip():
+            return tool_input, ""
+        try:
+            messages, reason = await self._send_restyler(chat_id, draft)
+        except Exception as e:
+            log.exception("send restyler raised for chat %s", chat_id)
+            messages, reason = None, f"restyle failed: {e!r}"
+        if messages is None:
+            return tool_input, reason
+        restyled = {k: v for k, v in tool_input.items() if k not in ("text", "texts")}
+        restyled["texts"] = messages
+        return restyled, ""
+
+    async def _await_pending_resolution(self, req: ApprovalRequest) -> PermissionResult:
         """Block on the approval_client's Future until the user (or timeout)
         resolves the pending row, persist the response, fire the resolved
         event, update the denial counter. Shared between the first-time path
@@ -371,7 +436,9 @@ class Broker:
                 message=result.message or "User denied.",
             )
         await self._db.reset_consecutive_denials(req.task_id)
-        return PermissionResult(behavior="allow", updatedInput=tool_input)
+        # The stored input, not the caller's: on a resume re-attach that is
+        # the restyled send the owner actually approved.
+        return PermissionResult(behavior="allow", updatedInput=req.tool_input)
 
     # ---- helpers for the HTTP `/approvals/{id}/respond` endpoint ----
 

@@ -569,7 +569,7 @@ def _classify_laptop(tool_input: dict[str, Any]) -> Verdict:
 def _classify_messenger(tool_input: dict[str, Any]) -> Verdict:
     op = str(tool_input.get("op", ""))
     if op in (
-        "list", "read", "mark_read", "style", "read_image", "transcribe",
+        "list", "read", "mark_read", "read_image", "transcribe",
         "history", "search", "search_messages", "list_chats",
     ):
         return Verdict(

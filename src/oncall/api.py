@@ -126,7 +126,7 @@ class MemoryOpBody(BaseModel):
 
 class MessengerOpBody(BaseModel):
     op: Literal[
-        "list", "read", "mark_read", "style", "send", "send_file", "react",
+        "list", "read", "mark_read", "send", "send_file", "react",
         "read_image", "transcribe",
         "history", "search", "search_messages", "list_chats",
         "place_call",
@@ -136,7 +136,7 @@ class MessengerOpBody(BaseModel):
     inbox_id: str | None = None
     text: str | None = None
     # `send` only, instead of `text`: several messages sent in order under
-    # one approval (what `op=style` returns).
+    # one approval (what the broker turns a draft into; see Broker._restyle_send).
     texts: list[str] | None = None
     file_path: str | None = None
     caption: str | None = None
@@ -252,6 +252,16 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await db.connect()
+
+        async def _restyle_send(chat_id: str, draft: str) -> tuple[list[str] | None, str]:
+            """Broker hook: a draft the executor sends as the owner, rewritten
+            the way the owner writes to this contact."""
+            tg: TelegramService | None = getattr(app.state, "telegram", None)
+            style: OwnerStyle | None = getattr(app.state, "owner_style", None)
+            if tg is None or style is None:
+                return None, "owner style is not configured"
+            history = await tg.get_chat_history(chat_id, limit=20)
+            return await style.rewrite_for_contact(draft, list(reversed(history)))
 
         async def _resolve_chat_label(chat_id: str) -> str | None:
             """Broker hook: turn a bare chat_id into a human-readable name
@@ -379,6 +389,7 @@ def create_app() -> FastAPI:
             classifier=Classifier(llm, classifier_model),
             approval_timeout_seconds=settings.oncall_approval_timeout_seconds,
             chat_label_resolver=_resolve_chat_label,
+            send_restyler=_restyle_send,
         )
         lifecycle = Lifecycle(
             db=db, broker=broker, approval_client=approval_client,
@@ -1831,7 +1842,6 @@ def _register_routes(app: FastAPI) -> None:
                 call_service=request.app.state.voice_call,
                 db=_db(request),
                 owner_user_id=get_settings().telegram_owner_user_id,
-                owner_style=getattr(request.app.state, "owner_style", None),
             )
         except RPCError as e:
             # Emit on the audit channel too so messenger failures show up
@@ -1853,7 +1863,6 @@ def _register_routes(app: FastAPI) -> None:
         call_service: CallService | None = None,
         db: Database | None = None,
         owner_user_id: str | None = None,
-        owner_style: OwnerStyle | None = None,
     ) -> dict[str, Any]:
         if body.op == "list":
             unread_only = True if body.unread_only is None else body.unread_only
@@ -1898,22 +1907,6 @@ def _register_routes(app: FastAPI) -> None:
                 raise HTTPException(400, "inbox_id required")
             ok = await tg.mark_read(body.inbox_id)
             return {"marked_read": ok}
-        if body.op == "style":
-            if not body.chat_id or not body.text:
-                raise HTTPException(400, "chat_id and text required")
-            if owner_style is None:
-                return {"messages": [body.text], "styled": False,
-                        "reason": "owner style is not configured"}
-            history = await tg.get_chat_history(
-                body.chat_id, limit=max(1, min(50, body.limit)),
-            )
-            pieces, reason = await owner_style.rewrite_for_contact(
-                body.text, list(reversed(history)),
-            )
-            if pieces is None:
-                return {"messages": [body.text], "styled": False, "reason": reason
-                        or "exempt from restyling (code block or system notice)"}
-            return {"messages": pieces, "styled": True}
         if body.op == "history":
             if not body.chat_id:
                 raise HTTPException(400, "chat_id required")
@@ -2244,7 +2237,7 @@ def _register_routes(app: FastAPI) -> None:
 # would have to match; for now the simplest defensible behaviour is to
 # refuse them too, since a restricted executor has no legitimate reason
 # to read arbitrary inbox ids it didn't itself discover.
-_MESSENGER_OPS_LOCKED_TO_CHAT_ID = {"style", "send", "send_file", "react", "history", "search_messages", "read_image", "transcribe"}
+_MESSENGER_OPS_LOCKED_TO_CHAT_ID = {"send", "send_file", "react", "history", "search_messages", "read_image", "transcribe"}
 _MESSENGER_OPS_REFUSED_WHEN_RESTRICTED = {"list", "list_chats", "search", "read", "mark_read"}
 
 

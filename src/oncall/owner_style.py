@@ -12,10 +12,10 @@ message is not. Quotations never reach the LLM: they are swapped for
 placeholders and put back verbatim, so a rewrite can't alter what someone
 was told.
 
-`OwnerStyle.rewrite_for_contact` backs the messenger `op=style`: a draft the
-executor will send as the owner to someone else, restyled with the same
-profile plus the recent chat with that person (whose language it follows).
-It runs before `op=send`, so the approval shows the restyled text.
+`OwnerStyle.rewrite_for_contact` restyles every messenger `op=send` draft the
+executor sends as the owner to someone else, with the same profile plus the
+recent chat with that person (whose language it follows). The broker runs it
+before approval, so the approval shows exactly the restyled messages.
 
 All three LLM steps use native structured output (`response_schema`)."""
 

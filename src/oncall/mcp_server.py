@@ -311,12 +311,10 @@ async def list_tools() -> list[Tool]:
                 "  transcribe     — transcribe a voice / voice-note message to text. "
                 "Requires `chat_id` + `message_id`. Returns `{text, pending}`.\n"
                 "  mark_read      — mark one inbox row read.\n"
-                "  style          — restyle a draft (`text`) for `chat_id` into the user's "
-                "own voice with this contact. Returns `{messages, styled}`: the draft as "
-                "the user would write it, possibly split into several messages; when "
-                "`styled` is false, `messages` is the unchanged draft and `reason` says why.\n"
-                "  send           — send AS the user to any chat (DM or group): one "
-                "message in `text`, or several in order in `texts` (never both). "
+                "  send           — send AS the user to any chat (DM or group). Put the "
+                "draft in `text`: before approval it is rewritten the way the user writes "
+                "to this contact, possibly as several messages. Set `verbatim: true` for "
+                "wording the user dictated. "
                 "MUTATING — broker will require human approval before this fires, unless "
                 "the chat_id is on the user's per-chat allowlist (auto-allow).\n"
                 "  react          — drop a Telegram emoji reaction on one inbound message "
@@ -342,7 +340,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "op": {"type": "string", "enum": [
                         "list", "read", "list_chats", "search", "history",
-                        "search_messages", "mark_read", "style", "send",
+                        "search_messages", "mark_read", "send",
                         "send_file", "react", "read_image", "transcribe",
                         "place_call",
                     ]},
@@ -350,7 +348,8 @@ async def list_tools() -> list[Tool]:
                     "inbox_id":    {"type": "string"},
                     "message_id":  {"type": "string"},
                     "text":        {"type": "string"},
-                    "texts":       {"type": "array", "items": {"type": "string"}, "description": "op=send only, instead of `text`: messages sent in order under one approval."},
+                    "texts":       {"type": "array", "items": {"type": "string"}, "description": "op=send: messages sent in order. Filled in by the approval step from your `text` draft."},
+                    "verbatim":    {"type": "boolean", "description": "op=send: the user dictated this exact wording; send it unrewritten."},
                     "file_path":   {"type": "string", "description": "Absolute local path to a regular file. For op=send_file."},
                     "caption":     {"type": "string", "description": "Optional caption shown with the uploaded file. For op=send_file."},
                     "emoji":       {"type": "string", "enum": ["👍", "❤️", "🔥", "😁"]},

@@ -6,6 +6,7 @@ Verify:
   * mutating escalates and the supplied phrase is matched in submit_response
   * dedup on (session_id, tool_use_id) on resume
   * consecutive-denial backstop
+  * a send as the owner is approved and executed in its restyled form
 """
 
 from __future__ import annotations
@@ -352,3 +353,76 @@ async def test_consecutive_denial_backstop(db, events):
     assert r2.behavior == "deny"
     assert r3.behavior == "deny"
     assert "halted" in (r3.message or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# Sends as the owner are restyled before approval
+# ---------------------------------------------------------------------------
+
+class _RecordingAllow(AutoAllowApprovalClient):
+    def __init__(self) -> None:
+        self.shown: list[str] = []
+
+    async def request_approval(self, req):
+        self.shown.append(req.canonical_command)
+        return await super().request_approval(req)
+
+
+def _restyler(result):
+    calls: list[tuple[str, str]] = []
+
+    async def restyle(chat_id: str, draft: str):
+        calls.append((chat_id, draft))
+        return result
+
+    restyle.calls = calls  # type: ignore[attr-defined]
+    return restyle
+
+
+_SEND = "mcp__oncall__messenger_inbox"
+
+
+@pytest.mark.asyncio
+async def test_owner_sees_and_sends_the_restyled_messages_even_after_resume(db, events):
+    """Safety invariant: what the owner approves is what the CLI executes.
+    The restyled `texts` replace the draft in both the approval prompt and
+    `updatedInput`, and a resume replays the approved input rather than the
+    draft the executor re-sends."""
+    task = await _make_task(db)
+    client = _RecordingAllow()
+    restyle = _restyler((["yo", "running late"], ""))
+    broker = Broker(db, client, events, classifier=stub_classifier(), send_restyler=restyle)
+    draft = {"op": "send", "chat_id": "7", "text": "Hello, I am running late."}
+
+    for _ in range(2):  # second call: same tool_use_id after a resume
+        result = await broker.decide(task.session_id, "tu_send", _SEND, dict(draft))
+        assert result.behavior == "allow"
+        assert result.updatedInput == {"op": "send", "chat_id": "7", "texts": ["yo", "running late"]}
+    assert client.shown == ["Send 2 messages to chat 7:\n1. 'yo'\n2. 'running late'"]
+    assert restyle.calls == [("7", "Hello, I am running late.")]  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_unstyled_send_is_dropped_when_autonomous_and_escalated_otherwise(db, events):
+    client = _RecordingAllow()
+    failing = _restyler((None, "no learned style yet"))
+    broker = Broker(db, client, events, classifier=stub_classifier(), send_restyler=failing)
+    draft = {"op": "send", "chat_id": "7", "text": "Hello there."}
+
+    # Autonomous reply: it would auto-allow unseen, so it must not go out.
+    auto = Task(session_id="sess-auto", prompt="reply", restricted_to_chat="7")
+    await db.insert_task(auto)
+    result = await broker.decide(auto.session_id, "tu_a", _SEND, dict(draft))
+    assert result.behavior == "deny" and "no learned style yet" in (result.message or "")
+
+    # Owner-dispatched: the owner sees the unstyled draft and decides.
+    task = await _make_task(db)
+    result = await broker.decide(task.session_id, "tu_b", _SEND, dict(draft))
+    assert result.behavior == "allow" and result.updatedInput == draft
+    assert client.shown == ["Send to chat 7: 'Hello there.'"]
+
+    # Dictated wording never reaches the restyler.
+    dictated = {**draft, "verbatim": True}
+    result = await broker.decide(task.session_id, "tu_c", _SEND, dict(dictated))
+    assert result.updatedInput == dictated
+    assert len(failing.calls) == 2  # type: ignore[attr-defined]
