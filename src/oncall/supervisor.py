@@ -250,6 +250,8 @@ class Supervisor:
             "--model", task.model or "sonnet",
             "--resume", session_id,
         ]
+        if self._settings.oncall_executor_effort:
+            argv += ["--effort", self._settings.oncall_executor_effort]
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -334,13 +336,6 @@ class Supervisor:
             "--setting-sources", "project",  # only our executor/settings.json, not user-level
             "--permission-mode", "default",
             "--permission-prompt-tool", "mcp__oncall__approve",
-            # high, not medium: at medium the executor garbled its own summary
-            # while squeezing into the reply budget (dropped a load-bearing
-            # noun, mutated a quoted word, then re-read its own corruption and
-            # invented a meaning for it). Hand-offs are off the hot path —
-            # the operator has already acked — so the extra thinking is cheap
-            # here in a way it would not be on an operator turn.
-            "--effort", "high",
             "--append-system-prompt", self._render_executor_prompt(),
             # Persistence is REQUIRED in the single-session model: every
             # hand_off after the first uses --resume to pick up the same
@@ -381,6 +376,8 @@ class Supervisor:
         # the names as separate elements would swallow whatever follows.
         argv += ["--tools", ",".join(tools)]
         argv += ["--model", task.model or "sonnet"]
+        if self._settings.oncall_executor_effort:
+            argv += ["--effort", self._settings.oncall_executor_effort]
         if task.max_turns:
             # claude uses --max-turns or similar — we keep it generic; if not
             # supported in this CLI version, drop silently. For now: skip if

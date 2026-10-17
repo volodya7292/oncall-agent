@@ -35,7 +35,7 @@ def test_build_argv_auto_mode_no_bare():
     assert argv[0] == "claude"
     assert "--permission-mode" in argv and argv[argv.index("--permission-mode") + 1] == "auto"
     assert argv[argv.index("--model") + 1] == "opus"
-    assert argv[argv.index("--effort") + 1] == "high"
+    assert argv[argv.index("--effort") + 1] == "medium"
     assert "--settings" in argv  # developer deny list
     # OAuth keychain regression + "laptop's normal env" contract:
     assert "--bare" not in argv

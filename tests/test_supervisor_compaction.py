@@ -97,7 +97,9 @@ def _make_supervisor(threshold: int, last_tokens: int):
     s = Supervisor(
         db=None,
         events=_Events(),
-        settings=SimpleNamespace(oncall_executor_compact_at_tokens=threshold),
+        settings=SimpleNamespace(
+            oncall_executor_compact_at_tokens=threshold, oncall_executor_effort="medium",
+        ),
         paths=None,
     )
     s._last_context_tokens = last_tokens

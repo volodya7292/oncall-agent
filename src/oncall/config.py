@@ -197,6 +197,11 @@ class Settings(BaseSettings):
     # the next task resumes — keeping it well clear of the model's ceiling
     # (e.g. Sonnet-1M) where quality and cost degrade. Set 0 to disable.
     oncall_executor_compact_at_tokens: int = 200000
+    # Effort for every executor turn and its `/compact` pass (`claude
+    # --effort`). Medium once garbled the executor's own reply summary (a
+    # load-bearing noun dropped, a quoted word mutated); "high" is the fix if
+    # that returns. Empty string omits the flag.
+    oncall_executor_effort: str = "medium"
     oncall_db_path: Path = Field(default_factory=lambda: Path("~/.oncall/state.db").expanduser())
     oncall_prod_hosts: str = ""
 
@@ -238,7 +243,7 @@ class Settings(BaseSettings):
     # (one broker approval) and is notified of the result via a `<developers>`
     # context update. These are read on the LAPTOP (worker) side.
     oncall_developer_model: str = "opus"
-    oncall_developer_effort: str = "high"
+    oncall_developer_effort: str = "medium"
     # Hard cap: the worker kills the developer's whole process group at this
     # age, regardless of polling. 30 min covers real coding tasks.
     oncall_developer_timeout_seconds: int = 1800
