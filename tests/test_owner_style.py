@@ -120,6 +120,17 @@ async def test_quotes_go_out_verbatim_or_the_original_does():
         assert "сори" not in llm.calls[0]["messages"][1]["content"]
 
 
+async def test_placeholder_brackets_never_reach_the_owner():
+    """Regression: with no quotes in the message, the rewrite still saw the
+    ⟦n⟧ rule and wrapped bold names in ⟦…⟧, which went out as is."""
+    original = "Try **Place A** or **Place B**."
+    llm = _ScriptedLLM({"messages": ["⟦Place A⟧ or ⟦Place B⟧"]})
+    svc, sent = _agent(OwnerStyle(llm=llm, db=_MemoryDB(STYLE), model="m"))
+    await svc._send(original, styled=True)
+    assert sent == [original]
+    assert not any("⟦" in m["content"] for m in llm.calls[0]["messages"])
+
+
 async def test_exempt_text_never_reaches_the_llm():
     llm = _ScriptedLLM()  # any call would pop from an empty script and fail
     svc, sent = _agent(OwnerStyle(llm=llm, db=_MemoryDB(STYLE), model="m"))

@@ -46,6 +46,12 @@ _MAX_EXAMPLES = 30
 # A quotation, marks included: „…“ / „…” (German), “…”, «…», "…", `…`.
 _QUOTE_RE = re.compile(r'„[^“”"\n]*[“”"]|“[^”\n]*”|«[^»\n]*»|"[^"\n]*"|`[^`\n]+`')
 _PLACEHOLDER_RE = re.compile(r"⟦(\d+)⟧")
+# Only told when there are quotes: shown the brackets with nothing to stand
+# for, the model took them for markup and wrapped bold names in them.
+_QUOTE_NOTE = (
+    "Each ⟦n⟧ stands for a whole quotation, marks included, and appears "
+    "exactly once in the result."
+)
 
 
 def _strict_object(properties: dict[str, Any]) -> dict[str, Any]:
@@ -107,8 +113,7 @@ Compress as the owner would."""
 _REWRITE_BODY = """\
 {head}
 
-Each ⟦n⟧ is a quotation and appears exactly once. Identifiers, links, paths, \
-commands and the intent stay exact. {language_rule} Each element of \
+Identifiers, links, paths, commands and the intent stay exact. {language_rule} Each element of \
 `messages` is one Telegram message.
 
 # The owner's style
@@ -224,6 +229,8 @@ def _restore_quotes(
     found = sorted(int(n) for piece in pieces for n in _PLACEHOLDER_RE.findall(piece))
     if found != list(range(1, len(quotes) + 1)):
         raise ValueError(f"quote placeholders {found}, expected {len(quotes)}")
+    if _stray_brackets(" ".join(pieces)) > _stray_brackets(masked):
+        raise ValueError("placeholder brackets used as markup")
     introduced = _scripts(" ".join(pieces)) - _scripts(masked) - allowed_scripts
     if introduced:
         raise ValueError(f"introduced scripts {sorted(introduced)}")
@@ -231,6 +238,11 @@ def _restore_quotes(
         _PLACEHOLDER_RE.sub(lambda m: quotes[int(m.group(1)) - 1], piece)
         for piece in pieces
     ]
+
+
+def _stray_brackets(text: str) -> int:
+    rest = _PLACEHOLDER_RE.sub("", text)
+    return rest.count("⟦") + rest.count("⟧")
 
 
 def should_rewrite(text: str) -> bool:
@@ -426,7 +438,9 @@ class OwnerStyle:
         try:
             result = await asyncio.wait_for(
                 self._structured(
-                    system=system, user=f"<message>\n{masked}\n</message>",
+                    system=system,
+                    user=f"<message>\n{masked}\n</message>"
+                    + (f"\n\n{_QUOTE_NOTE}" if quotes else ""),
                     schema=_REWRITE_SCHEMA,
                     max_tokens=2048, reasoning_effort=self._rewrite_effort,
                 ),
