@@ -198,6 +198,19 @@ async def test_unknown_tool_auto_denies_without_escalating(db, events):
     refreshed = await db.get_task(task.id)
     assert refreshed.consecutive_denials == 1
 
+    # Same for an op invented on a known tool (an executor called
+    # messenger_inbox op=style and the owner got an approval card for it).
+    result = await broker.decide(
+        session_id=task.session_id,
+        tool_use_id="tu_unknown_op",
+        tool_name="mcp__oncall__messenger_inbox",
+        tool_input={"op": "style", "chat_id": "7"},
+    )
+    assert result.behavior == "deny"
+    assert "'style'" in (result.message or "")
+    refreshed = await db.get_task(task.id)
+    assert refreshed.consecutive_denials == 2
+
 
 # ---------------------------------------------------------------------------
 # Mutating escalates; phrase match coerces decision

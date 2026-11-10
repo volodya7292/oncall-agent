@@ -325,30 +325,39 @@ class Broker:
         # this?" prompt naming a tool nobody recognizes. Deny with a message
         # the agent can act on, and point it at the tool that does work.
         # Counts as a denial so the existing backstop halts a model that keeps
-        # retrying instead of letting it spin.
-        if verdict.reason == "unknown_tool":
+        # retrying instead of letting it spin. An invented op on a known tool
+        # (`messenger_inbox.style`) is the same case: the server would reject
+        # it even if the owner approved.
+        if verdict.reason in ("unknown_tool", "unknown_op"):
+            reason = verdict.reason
             await self._db.increment_consecutive_denials(req.task_id)
-            await self._db.record_auto_approval(req, "deny", "unknown_tool")
+            await self._db.record_auto_approval(req, "deny", reason)
             await self._publish(task.id, "approval.resolved", {
                 "approval_id": str(req_id),
                 "auto": True,
                 "decision": "deny",
-                "reason": "unknown_tool",
+                "reason": reason,
                 "canonical": verdict.canonical,
             })
             broker_log.warning("decide " + fmt(
-                event="auto_deny_unknown_tool", task=str(task.id), tool=tool_name,
+                event=f"auto_deny_{reason}", task=str(task.id), tool=tool_name,
+                canonical=verdict.canonical,
             ))
-            return PermissionResult(
-                behavior="deny",
-                message=(
+            if reason == "unknown_op":
+                message = (
+                    f"'{tool_input.get('op')}' is not an op of {tool_name} and "
+                    f"cannot be approved — do not call it again. Use only the "
+                    f"ops listed in the tool's schema."
+                )
+            else:
+                message = (
                     f"Tool '{tool_name}' is not available in this environment "
                     f"and cannot be approved — do not call it again. Use the "
                     f"oncall tools you were given instead; to ask the owner a "
                     f"question, use mcp__oncall__ask_user (it reaches them on "
                     f"Telegram; you run headless, so built-in prompts cannot)."
-                ),
-            )
+                )
+            return PermissionResult(behavior="deny", message=message)
 
         # 4. Mutating — check the denial backstop, then escalate.
         if task.consecutive_denials >= self._max_denials:
