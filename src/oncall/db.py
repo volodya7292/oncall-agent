@@ -653,6 +653,23 @@ class Database:
             return None
         return _row_to_approval_pair(row)
 
+    async def has_owner_approved_messenger_op(
+        self, task_id: str, op: str, chat_id: str,
+    ) -> bool:
+        """True when the owner tapped Allow (challenge matched, not auto) on a
+        messenger `op` to `chat_id` within this task."""
+        async with self.conn.execute(
+            "SELECT 1 FROM approvals "
+            "WHERE task_id = ? AND tool_name = 'mcp__oncall__messenger_inbox' "
+            "AND state = 'resolved' AND decision = 'allow' AND auto = 0 "
+            "AND challenge_matched = 1 "
+            "AND json_extract(tool_input_json, '$.op') = ? "
+            "AND CAST(json_extract(tool_input_json, '$.chat_id') AS TEXT) = ? "
+            "LIMIT 1",
+            (task_id, op, chat_id),
+        ) as cur:
+            return await cur.fetchone() is not None
+
     async def get_pending_approval(self, approval_id: UUID) -> ApprovalRequest | None:
         async with self.conn.execute(
             "SELECT * FROM approvals WHERE id = ? AND state = 'pending'",

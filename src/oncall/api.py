@@ -1824,7 +1824,9 @@ def _register_routes(app: FastAPI) -> None:
             locked = task.restricted_to_chat if task is not None else None
             if locked is not None:
                 err = _messenger_restriction_error(body, locked)
-                if err is not None:
+                if err is not None and not await _owner_approved_cross_chat_send(
+                    _db(request), str(task.id), body,
+                ):
                     raise HTTPException(403, err)
         # Top-level safety net for telethon-side rejections (FloodWait,
         # ChatWriteForbidden, PeerIdInvalid, MessageIdInvalid, …). Without
@@ -2260,6 +2262,26 @@ def _messenger_restriction_error(
                 f"chat_id={locked_chat}; got chat_id={body.chat_id!r}."
             )
     return None
+
+
+_MESSENGER_OPS_OWNER_CAN_UNLOCK = {"send", "send_file", "place_call"}
+
+
+async def _owner_approved_cross_chat_send(
+    db: "Database", task_id: str, body: "MessengerOpBody",
+) -> bool:
+    """A locked task may still send to another chat when the owner explicitly
+    approved that send (challenge phrase) — the lock guards against the inbound
+    DM steering the agent, not against the owner's own decision."""
+    if body.op not in _MESSENGER_OPS_OWNER_CAN_UNLOCK or not body.chat_id:
+        return False
+    ok = await db.has_owner_approved_messenger_op(task_id, body.op, body.chat_id)
+    if ok:
+        log.info(
+            "messenger lockdown: owner-approved %s to chat %s from locked task %s",
+            body.op, body.chat_id, task_id,
+        )
+    return ok
 
 
 def _task_out(t) -> dict[str, Any]:

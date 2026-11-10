@@ -426,3 +426,37 @@ async def test_unstyled_send_is_dropped_when_autonomous_and_escalated_otherwise(
     result = await broker.decide(task.session_id, "tu_c", _SEND, dict(dictated))
     assert result.updatedInput == dictated
     assert len(failing.calls) == 2  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_locked_task_crosses_chats_only_on_an_owner_approved_send(db, events):
+    """Safety invariant for the autonomous-reply lockdown: a task locked to
+    chat 7 may send to chat 9 only after the owner tapped Allow on that exact
+    send. An auto-approval (dm_allowlist) or a denied tap must not unlock it,
+    and reads of other chats stay refused regardless."""
+    from oncall.api import (
+        MessengerOpBody, _messenger_restriction_error, _owner_approved_cross_chat_send,
+    )
+
+    locked = Task(session_id="sess-locked", prompt="reply", restricted_to_chat="7")
+    await db.insert_task(locked)
+    await db.allow_dm("9")
+
+    async def gate(op: str, chat_id: str) -> bool:
+        body = MessengerOpBody(op=op, chat_id=chat_id, session_id=locked.session_id)
+        if _messenger_restriction_error(body, "7") is None:
+            return True
+        return await _owner_approved_cross_chat_send(db, str(locked.id), body)
+
+    send9 = {"op": "send", "chat_id": "9", "text": "hi", "verbatim": True}
+
+    denied = Broker(db, AutoDenyApprovalClient(), events, classifier=stub_classifier())
+    assert (await denied.decide(locked.session_id, "tu_d", _SEND, dict(send9))).behavior == "deny"
+    assert not await gate("send", "9")
+
+    allowed = Broker(db, AutoAllowApprovalClient(), events, classifier=stub_classifier())
+    assert (await allowed.decide(locked.session_id, "tu_a", _SEND, dict(send9))).behavior == "allow"
+    assert await gate("send", "9")
+    assert not await gate("send_file", "9")  # approval is per op
+    assert not await gate("send", "8")       # and per recipient
+    assert not await gate("history", "9")    # reads never unlock
