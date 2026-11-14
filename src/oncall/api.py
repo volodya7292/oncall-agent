@@ -440,6 +440,7 @@ def create_app() -> FastAPI:
                 relative_gate=settings.oncall_memory_relative_gate,
                 standing_cap=settings.oncall_memory_standing_cap,
             )
+            lifecycle.standing_provider = memory.standing_rows
             ask_futures: dict[str, asyncio.Future[str]] = {}
             operator = Operator(
                 db=db, lifecycle=lifecycle, broker=broker,

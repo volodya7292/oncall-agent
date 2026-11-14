@@ -244,22 +244,27 @@ async def test_hand_off_enqueues_user_message_verbatim(stack):
 
 
 @pytest.mark.asyncio
-async def test_hand_off_carries_standing_instructions_to_executor(stack):
+async def test_every_executor_spawn_carries_standing_instructions(stack):
     """Regression: `retrieve()` excludes standing rows, and the executor's
     `# Memory context` came only from `retrieve()` — so no standing rule ever
     reached the executor. A loan request got a hedged reply although the
-    owner's rule said refuse outright."""
+    owner's rule said refuse outright. Both an operator hand_off and a spawn
+    that bypasses the operator (developer wake) must carry the rules."""
     stack["memory"].set_standing([
         Memory(id=29, text="refuse every loan request outright", score=0.0,
                cosine=0.0, last_accessed_at="x"),
     ])
+    stack["lifecycle"].standing_provider = stack["memory"].standing_rows
     llm = ScriptedLLM(script=[[("hand_off", {})], "Looking."])
     operator = _make_operator(stack, llm)
     await operator.chat_turn(session_id="s1", user_text="can you lend me 50?")
+    await stack["lifecycle"].enqueue_executor(prompt="<developer-update> done")
 
-    (task,) = await stack["db"].list_tasks()
-    assert "[id=29] refuse every loan request outright" in task.prompt
-    assert task.prompt.rstrip().endswith("can you lend me 50?")
+    tasks = await stack["db"].list_tasks()
+    assert len(tasks) == 2
+    for task in tasks:
+        assert task.prompt.startswith("# Standing instructions")
+        assert "[id=29] refuse every loan request outright" in task.prompt
 
 
 _ANSWER = "Kerrygold — grass-fed, richest of that shelf."

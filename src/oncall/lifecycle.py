@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from uuid import UUID, uuid4
 
@@ -20,6 +20,7 @@ from .config import Paths, Settings
 from .db import Database
 from .events import EventBus
 from .models import Task, TaskState, TerminalReason
+from .operator_memory import Memory
 from .supervisor import Supervisor
 
 
@@ -45,6 +46,11 @@ class Lifecycle:
     # executor turn (set by api.py to DeveloperManager.snapshot_block). Lets the
     # executor see its in-flight autonomous developer jobs. None = omit.
     developers_snapshot_provider: Callable[[], str] | None = None
+    # The owner's standing memory rows (set by api.py to
+    # OperatorMemory.standing_rows). Prepended to every task prompt here, at
+    # the one place all spawn paths meet, because relevance retrieval never
+    # returns them. None = omit.
+    standing_provider: Callable[[], Awaitable[list[Memory]]] | None = None
     running: dict[UUID, RunningTask] = field(default_factory=dict)
     _queue: "asyncio.Queue[Task] | None" = field(default=None, init=False, repr=False)
     _worker_task: "asyncio.Task[None] | None" = field(default=None, init=False, repr=False)
@@ -69,7 +75,7 @@ class Lifecycle:
         only need the lightweight dict response."""
         task = Task(
             session_id=str(uuid4()),  # per-row id for DB tracking only
-            prompt=prompt,
+            prompt=await self._with_standing(prompt),
             dispatched_by_chat_session=chat_session_id,
             restricted_to_chat=restricted_to_chat,
             model=model,
@@ -80,6 +86,24 @@ class Lifecycle:
         assert self._queue is not None
         await self._queue.put(task)
         return task
+
+    async def _with_standing(self, prompt: str) -> str:
+        if self.standing_provider is None:
+            return prompt
+        try:
+            rows = await self.standing_provider()
+        except Exception:
+            log.exception("standing memory read failed; task spawns without it")
+            return prompt
+        if not rows:
+            return prompt
+        bullets = "\n".join(
+            f"- [id={m.id}] {m.text.replace(chr(10), ' ').strip()}" for m in rows
+        )
+        return (
+            "# Standing instructions (from the owner; they apply to every "
+            f"task until the owner withdraws them)\n{bullets}\n\n{prompt}"
+        )
 
     async def enqueue_executor(
         self, *, prompt: str, chat_session_id: str | None = None,
