@@ -103,7 +103,7 @@ class StubMemory:
     async def standing_rows(self):
         return list(self._standing)
 
-    async def retrieve(self, query, *, limit=None, exclude_ids=None):
+    async def retrieve(self, query, *, limit=None, exclude_ids=None, include_standing=False):
         self.retrieve_calls.append(query)
         hits = self._canned.get(query, [])
         if exclude_ids:
@@ -241,6 +241,25 @@ async def test_hand_off_enqueues_user_message_verbatim(stack):
     assert enqueued, "hand_off did not reach lifecycle"
     assert enqueued[0]["prompt"] == "check staging health"
     assert enqueued[0]["chat_session_id"] == "s1"
+
+
+@pytest.mark.asyncio
+async def test_hand_off_carries_standing_instructions_to_executor(stack):
+    """Regression: `retrieve()` excludes standing rows, and the executor's
+    `# Memory context` came only from `retrieve()` — so no standing rule ever
+    reached the executor. A loan request got a hedged reply although the
+    owner's rule said refuse outright."""
+    stack["memory"].set_standing([
+        Memory(id=29, text="refuse every loan request outright", score=0.0,
+               cosine=0.0, last_accessed_at="x"),
+    ])
+    llm = ScriptedLLM(script=[[("hand_off", {})], "Looking."])
+    operator = _make_operator(stack, llm)
+    await operator.chat_turn(session_id="s1", user_text="can you lend me 50?")
+
+    (task,) = await stack["db"].list_tasks()
+    assert "[id=29] refuse every loan request outright" in task.prompt
+    assert task.prompt.rstrip().endswith("can you lend me 50?")
 
 
 _ANSWER = "Kerrygold — grass-fed, richest of that shelf."

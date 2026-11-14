@@ -305,6 +305,12 @@ async def test_standing_rows_are_not_returned_by_retrieve(db):
         "always reply in one line",
     ]
 
+    # Regression: the executor's explicit `memory op=query` ran through the
+    # same filter, so a loan-refusal rule the operator cited by id came back
+    # as `memories: []` and the executor sent a hedged reply instead.
+    found = await mem.retrieve("how do you reply", include_standing=True)
+    assert found[0].text == "always reply in one line"
+
 
 @pytest.mark.asyncio
 async def test_standing_cap_refuses_rather_than_evicting(db):

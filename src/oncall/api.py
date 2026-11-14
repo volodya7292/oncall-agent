@@ -2037,7 +2037,9 @@ def _register_routes(app: FastAPI) -> None:
             if not q:
                 raise HTTPException(400, "query required")
             try:
-                hits = await mem.retrieve(q, limit=body.limit)
+                hits = await mem.retrieve(
+                    q, limit=body.limit, include_standing=True,
+                )
             except Exception as e:
                 log.exception("memory query failed")
                 raise HTTPException(500, f"{type(e).__name__}: {e}")

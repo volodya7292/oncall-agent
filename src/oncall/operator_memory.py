@@ -117,6 +117,7 @@ class MemoryStore(Protocol):
     async def retrieve(
         self, query: str, *, limit: int | None = None,
         exclude_ids: set[int] | None = None,
+        include_standing: bool = False,
     ) -> list[Memory]: ...
     async def standing_rows(self) -> list[Memory]: ...
     async def get_by_id(self, memory_id: int) -> Memory | None: ...
@@ -224,6 +225,7 @@ class OperatorMemory:
     async def retrieve(
         self, query: str, *, limit: int | None = None,
         exclude_ids: set[int] | None = None,
+        include_standing: bool = False,
     ) -> list[Memory]:
         """Hybrid retrieval. Returns up to `limit` (default `max_inject`)
         memories with score ≥ `relevance_floor`, ordered by score desc.
@@ -258,11 +260,15 @@ class OperatorMemory:
         if not q:
             return []
         lim = limit if limit is not None else self._max_inject
-        # Standing rows are injected wholesale every session, so scoring them
-        # here would only let a topic-matching instruction be injected twice —
-        # and worse, a standing row landing at the peak would drag the
-        # relative gate up and squeeze out the facts this query was for.
-        rows = [r for r in await self._all_rows() if not r["standing"]]
+        # Auto-injection callers get standing rows wholesale through their own
+        # note, so scoring them here would inject a topic-matching instruction
+        # twice and, at the peak, drag the relative gate up over the facts.
+        # An explicit lookup (`include_standing=True`) has no such note: the
+        # searcher must be able to find an instruction it was only told about.
+        rows = [
+            r for r in await self._all_rows()
+            if include_standing or not r["standing"]
+        ]
         if not rows:
             return []
 

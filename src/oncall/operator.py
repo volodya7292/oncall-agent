@@ -1300,6 +1300,15 @@ class Operator:
         parts.extend(reversed(context))
         return "\n".join(p for p in parts if p)
 
+    async def _standing_for_task(self, where: str) -> list[Memory]:
+        """Standing rows for a spawned executor task; empty on read failure
+        so a memory hiccup never blocks the spawn."""
+        try:
+            return await self._memory.standing_rows()
+        except Exception:
+            log.exception("standing memory read failed for %s", where)
+            return []
+
     async def _inject_session_memory(
         self, session_id: str, query: str | None,
     ) -> str | None:
@@ -2251,7 +2260,10 @@ class Operator:
         recent = _format_recent_context(
             await self._db.load_chat_history(row["chat_session_id"], limit=40)
         )
-        augmented_prompt = _inject_memory_context(row["prompt"], hits)
+        augmented_prompt = _inject_memory_context(
+            row["prompt"], hits,
+            await self._standing_for_task(f"approved dispatch {dispatch_id}"),
+        )
         if recent:
             augmented_prompt = recent + "\n\n" + augmented_prompt
         task = await self._lifecycle.submit_task(
@@ -2662,7 +2674,10 @@ class Operator:
                     "hand_off: memory retrieve failed for chat %s", chat_session_id,
                 )
                 hits = []
-            forwarded = _inject_memory_context(forwarded, hits)
+            forwarded = _inject_memory_context(
+                forwarded, hits,
+                await self._standing_for_task(f"hand_off chat {chat_session_id}"),
+            )
             try:
                 outcome = await self._lifecycle.enqueue_executor(
                     prompt=forwarded, chat_session_id=chat_session_id,
@@ -2776,7 +2791,9 @@ class Operator:
                 limit = int(limit_raw) if limit_raw is not None else 5
             except (TypeError, ValueError):
                 limit = 5
-            memories = await self._memory.retrieve(q, limit=limit)
+            memories = await self._memory.retrieve(
+                q, limit=limit, include_standing=True,
+            )
             return {
                 "query": q,
                 "memories": [
@@ -2866,21 +2883,34 @@ def _format_recent_context(history: list[dict[str, Any]], max_chars: int = 1024)
     return "# Recent context (operator<->user, newest last)\n" + "\n".join(lines)
 
 
-def _inject_memory_context(prompt: str, hits: list[Memory]) -> str:
-    """Prepend a `# Memory context` block to a spawned task's prompt
-    listing the top-N relevant operator memories. The executor sees these
-    inline, no extra tool call needed for the common case. Entries may
-    include irrelevant matches — the executor is told so explicitly."""
-    if not hits:
+def _inject_memory_context(
+    prompt: str, hits: list[Memory], standing: list[Memory],
+) -> str:
+    """Prepend the owner's standing instructions and a `# Memory context`
+    block of the top-N relevant operator memories to a spawned task's
+    prompt. `retrieve()` never returns standing rows, so this is the only
+    way they reach the executor; they get their own heading because the
+    relevance block's "may include irrelevant entries" is the opposite of
+    what an instruction means."""
+    if not hits and not standing:
         return prompt
-    lines = [
-        "# Memory context (auto-loaded from operator memory; may include "
-        "irrelevant entries — use your judgement)",
-    ]
-    for m in hits:
-        text = m.text.replace("\n", " ").strip()
-        lines.append(f"- [id={m.id}] {text}")
-    lines.append("")
+    lines: list[str] = []
+    if standing:
+        lines.append(
+            "# Standing instructions (from the owner; they apply to every "
+            "task until the owner withdraws them)",
+        )
+        for m in standing:
+            lines.append(f"- [id={m.id}] {m.text.replace(chr(10), ' ').strip()}")
+        lines.append("")
+    if hits:
+        lines.append(
+            "# Memory context (auto-loaded from operator memory; may include "
+            "irrelevant entries — use your judgement)",
+        )
+        for m in hits:
+            lines.append(f"- [id={m.id}] {m.text.replace(chr(10), ' ').strip()}")
+        lines.append("")
     lines.append("# Task")
     lines.append(prompt)
     return "\n".join(lines)
