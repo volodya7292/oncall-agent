@@ -1742,8 +1742,16 @@ class CallService:
         # TTS engine. Idempotent, so paths that sanitized upstream are
         # unaffected.
         spoken = to_voice_text(text)
-        # Gemini TTS takes delivery direction in the prompt itself.
-        prompt = f"{self._tts_instructions}:\n{spoken}" if self._tts_instructions else spoken
+        # Gemini TTS takes delivery direction in the prompt itself. A bare
+        # "<direction>:\n<text>" got the direction spoken aloud on short
+        # replies and the text translated into the direction's language;
+        # Google's sectioned layout keeps the two apart.
+        prompt = (
+            f"### DIRECTOR'S NOTES\n{self._tts_instructions}\n"
+            "Speak only the transcript, word for word, in its own language.\n\n"
+            f"#### TRANSCRIPT\n{spoken}"
+            if self._tts_instructions else spoken
+        )
         body = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {

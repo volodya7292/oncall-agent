@@ -451,11 +451,10 @@ class Settings(BaseSettings):
     # piece, seconds after the request.
     voice_tts_model: str = "gemini-3.8-flash-tts"
     voice_tts_voice: str = "Charon"
-    # Delivery direction, sent ahead of the text as "<this>:\n<text>";
-    # empty sends the bare text.
-    voice_tts_instructions: str = (
-        "Read this aloud casually and warmly, like a friend on the phone"
-    )
+    # Delivery direction (tone, pace). Empty sends the bare text, the only
+    # form the model can't read aloud or translate: Gemini TTS has no system
+    # instruction, so a direction shares the prompt with the words to speak.
+    voice_tts_instructions: str = ""
     # Continuous low-level "office" ambience mixed under the call (keyboard
     # foley + a brown-noise floor). Doubles as comfort noise: it keeps the
     # WebRTC channel from going fully silent, which otherwise makes Telegram
