@@ -498,7 +498,10 @@ class TelegramService:
         plain substring against `@username`. Falls back to Telegram's
         server-side `contacts.SearchRequest`, which handles transliteration
         (e.g. "Alex" -> "Алекс") and surfaces contacts not yet in local
-        dialogs. Returns rows with a `source` field ("dialog" or "contact").
+        dialogs. Only the owner's own contacts come back from it: the same
+        request also returns a global search over every public Telegram
+        user, and strangers must not be findable through the agent.
+        Returns rows with a `source` field ("dialog" or "contact").
         """
         q_raw = query.strip()
         if not q_raw:
@@ -546,9 +549,13 @@ class TelegramService:
         except Exception:
             log.exception("contacts.search fallback failed")
             return out
+        contact_ids = {
+            str(uid) for peer in (getattr(res, "my_results", None) or [])
+            if (uid := getattr(peer, "user_id", None))
+        }
         for user in (getattr(res, "users", None) or []):
             uid = str(getattr(user, "id", "") or "")
-            if not uid or uid in seen_ids:
+            if not uid or uid in seen_ids or uid not in contact_ids:
                 continue
             full_name = " ".join(
                 p for p in (

@@ -53,7 +53,9 @@ class FakeTelegramClient:
         # search_chats tests.
         self._dialogs = dialogs or []
         # contact_search_users: rows the fake returns when the service issues
-        # a contacts.SearchRequest via `client(request)`.
+        # a contacts.SearchRequest via `client(request)`. A row with
+        # "global": True is a stranger from Telegram's global search
+        # (`results`); the rest are the owner's contacts (`my_results`).
         self._contact_search_users = contact_search_users or []
         self.contact_search_calls: list[str] = []
 
@@ -70,7 +72,14 @@ class FakeTelegramClient:
                 )
                 for u in self._contact_search_users
             ]
-            return SimpleNamespace(users=users, chats=[])
+            def peers(is_global: bool):
+                return [
+                    SimpleNamespace(user_id=u["id"]) for u in self._contact_search_users
+                    if bool(u.get("global")) is is_global
+                ]
+            return SimpleNamespace(
+                my_results=peers(False), results=peers(True), users=users, chats=[],
+            )
         return SimpleNamespace(users=[], chats=[])
 
     async def connect(self) -> None:
@@ -679,6 +688,28 @@ async def test_search_chats_contact_fallback_for_transliterated_name(db):
     assert rows[0]["chat_id"] == "1"
     assert rows[0]["source"] == "contact"
     assert rows[0]["name"] == "Алекс Смит"
+
+
+@pytest.mark.asyncio
+async def test_search_chats_never_surfaces_global_search_strangers(db):
+    """contacts.SearchRequest answers with the owner's contacts AND a global
+    search over all public Telegram users, with every user of both in one
+    `users` list. Taking that list whole let the agent find and offer
+    strangers who merely share a first name."""
+    client = FakeTelegramClient(
+        contact_search_users=[
+            {"id": 11, "first_name": "Alex", "last_name": "Known", "username": None},
+            {"id": 12, "first_name": "Alex", "username": "alex", "global": True},
+            {"id": 13, "first_name": "Alex", "username": "alex_k", "global": True},
+        ],
+    )
+    s = TelegramService(db=db, client=client)
+    await s.start()
+    try:
+        rows = await s.search_chats("Alex")
+    finally:
+        await s.stop()
+    assert [r["chat_id"] for r in rows] == ["11"]
 
 
 @pytest.mark.asyncio
