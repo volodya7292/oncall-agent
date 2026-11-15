@@ -43,15 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# 1a) CPU-only torch. silero-vad (voice VAD) depends on torch; the default
-#     PyPI torch wheel on Linux is the CUDA build and drags in ~2-3 GB of
-#     unusable nvidia-cuda-*/cudnn/cublas/triton libraries. Pre-install the
-#     CPU wheels from PyTorch's CPU index so the dependency resolver below
-#     finds torch/torchaudio already satisfied and never pulls the GPU stack.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
-
-# 1b) Dependency layer — cache-keyed on pyproject.toml ONLY. Source-only
+# 1) Dependency layer — cache-keyed on pyproject.toml ONLY. Source-only
 #     changes (the common case) keep this a cache hit, so the heavy dependency
 #     set is NOT reinstalled every build. Extract the PEP 508 deps from
 #     pyproject and install them without the project. The pip cache mount

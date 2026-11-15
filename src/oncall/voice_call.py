@@ -6,19 +6,20 @@ is shared with this service; py-tgcalls binds to that same client to accept
 
 Per call, three asyncio tasks run for the call's lifetime:
 
-  * inbound — pull PCM16 @ 48 kHz from py-tgcalls's stream_frame filter, run
-    silero-vad to segment utterances, hand each utterance to STT then to
+  * inbound — stream PCM16 from py-tgcalls's stream_frame filter to OpenAI's
+    Realtime transcription session ([realtime_stt.py](realtime_stt.py)),
+    whose server VAD segments turns; each transcript goes to
     operator.chat_turn.
-  * outbound — pull text items from a queue, POST TTS, decode Opus, send_frame
-    PCM back into the call at 10 ms cadence.
+  * outbound — pull text items from a queue, POST OpenAI TTS, decode Opus,
+    send_frame PCM back into the call at 10 ms cadence.
   * chat-reply — subscribe to operator's chat.reply events (same shape as
     [telegram_agent._chat_reply_subscriber](telegram_agent.py)) and push their
     text into the outbound queue. This is how follow-up replies from the
     executor reach the caller mid-call.
 
-Barge-in: when the inbound VAD detects user speech for ≥150 ms while the
-outbound loop is playing audio, the outbound loop cancels its in-flight TTS
-HTTP request and drops queued audio. The user always wins.
+Barge-in: when the server VAD reports speech start while the outbound loop
+is playing audio, the outbound loop cancels its in-flight TTS HTTP request
+and drops queued audio. The user always wins.
 
 Voice and text chat share the same `chat_sessions` row (agent_session_id),
 so a voice call continues the same conversation the user had in text and
@@ -36,7 +37,6 @@ import ctypes.util
 import io
 import logging
 import re
-import struct
 import sys
 import time
 from dataclasses import dataclass, field
@@ -89,8 +89,12 @@ from .events import EventBus
 from .metrics import timed
 from .models import TaskState
 from .operator import Operator, summarize_llm_error
+from .realtime_stt import (
+    STT_RATE, RealtimeTranscriber, SpeechStarted, SpeechStopped, Transcript,
+    TranscriptFailed,
+)
 from .telegram_agent import agent_session_id
-from .voice import strip_expression_tag_backticks, to_voice_text
+from .voice import to_voice_text
 
 log = logging.getLogger(__name__)
 
@@ -104,44 +108,24 @@ FRAME_MS = 10
 SAMPLES_PER_FRAME = PCM_RATE * FRAME_MS // 1000  # 480
 BYTES_PER_FRAME = SAMPLES_PER_FRAME * 2          # 960
 
-# Silero VAD wants 16 kHz mono PCM in 32 ms (512-sample) chunks.
-VAD_RATE = 16_000
-VAD_CHUNK_SAMPLES = 512
-VAD_CHUNK_BYTES = VAD_CHUNK_SAMPLES * 2
-
-# Turn-taking thresholds, tuned to pipecat's Silero VAD defaults.
-#
-# pipecat gates VAD speech-start behind `start_secs` (0.2 s) of sustained
-# voice, and triggers barge-in off that SAME speech-start event (its default
-# VADUserTurnStartStrategy) — there is no separate, looser barge-in path:
-# interrupting the bot needs the same ~200 ms of real speech as starting a
-# turn does. We mirror that with one `VAD_START_MS` gate driving both
-# utterance-start and barge-in, which also makes a cough / one-syllable
-# backchannel / brief TTS echo (all < 200 ms) too short to cut the bot off.
-# We keep a probability hysteresis band (enter at START_PROB, stay in at the
-# lower END_PROB) instead of pipecat's single confidence + stop-frame count;
-# the long end-silence below already debounces the tail.
-VAD_START_PROB = 0.6        # prob to begin counting toward speech-start
-VAD_END_PROB = 0.35         # prob floor to stay "in speech" once started
-VAD_START_MS = 200          # sustained voice before speech-start / barge-in
-                            #   (pipecat VADParams.start_secs = 0.2 s; with
-                            #   32 ms chunks this fires on the 7th chunk)
-# Silence that ends a turn. pipecat's timeout fallback waits
-# user_speech_timeout (0.6 s) AFTER its VAD stop_secs (0.2 s) — an effective
-# ~0.8 s of real silence — and conversation-analysis corpora put intra-turn
-# hesitation pauses commonly in the 0.5–0.8 s range, so much under that clips
-# people mid-thought. 700 ms sits at the top of that band while staying snappy
-# for a terse on-call assistant. (Raise toward 800 for full pipecat parity /
-# fewer cut-offs; lower toward 500 for snappier replies.)
+# Silence that ends a turn (server VAD silence_duration_ms). Conversation-
+# analysis corpora put intra-turn hesitation pauses commonly in the 0.5–0.8 s
+# range, so much under that clips people mid-thought. 700 ms sits at the top of
+# that band while staying snappy for a terse on-call assistant.
 VAD_SILENCE_END_MS = 700
-# Utterances shorter than this (post-endpoint, pre-STT) are treated as noise.
-VAD_MIN_UTT_MS = 200
-# Silero VAD is a recurrent net carrying hidden state across calls; pipecat
-# resets it every 5 s so accumulated drift / noise can't skew detection. We do
-# the same between utterances (see _inbound_loop), plus once at call attach.
-VAD_STATE_RESET_S = 5.0
+# Telegram's WebRTC APM delivers very quiet PCM (peaks ~1% of full scale), and
+# the server VAD stops firing somewhere below that (silent at 0.3%). A
+# peak-tracking gain lifts recent speech toward INPUT_TARGET_PEAK, capped at
+# INPUT_MAX_GAIN so silence is never boosted into something the VAD hears.
+INPUT_TARGET_PEAK = 0.3
+INPUT_MAX_GAIN = 15.0
+INPUT_PEAK_DECAY = 0.9995   # per 10 ms frame: ~14 s half-life
+# Consecutive failed transcription sessions before the inbound side gives up.
+STT_MAX_FAILURES = 3
 
-# HTTP timeouts. TTS can return seconds of audio; STT can do long files.
+OPENAI_API = "https://api.openai.com/v1"
+
+# HTTP timeouts. TTS can return seconds of audio.
 HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=60.0)
 
 # `send_frame` watchdog. A single 10 ms PCM frame should round-trip into
@@ -297,11 +281,11 @@ class CallService:
         events: EventBus,
         broker: Broker,
         owner_user_id: int,
-        tts_base_url: str,
-        tts_api_key: str,
+        openai_api_key: str,
+        tts_model: str,
         tts_voice: str,
-        stt_base_url: str,
-        stt_api_key: str,
+        tts_instructions: str,
+        stt_model: str,
         language: str = "",
         llm: Any = None,                   # operator's LLMClient for paraphrase
         llm_model: str = "",
@@ -318,11 +302,11 @@ class CallService:
         self._llm = llm
         self._llm_model = llm_model
         self._owner_user_id = int(owner_user_id)
-        self._tts_base_url = tts_base_url.rstrip("/")
-        self._tts_api_key = tts_api_key
+        self._openai_api_key = openai_api_key
+        self._tts_model = tts_model
         self._tts_voice = tts_voice
-        self._stt_base_url = stt_base_url.rstrip("/")
-        self._stt_api_key = stt_api_key
+        self._tts_instructions = tts_instructions
+        self._stt_model = stt_model
         self._language = language
         # Owner's shared session: voice ↔ text continuity for inbound calls.
         # Outbound calls to non-owners use a fresh per-call ephemeral id.
@@ -335,12 +319,9 @@ class CallService:
         self._call_py_primary: Any | None = None
         self._started = False
         self._active: _ActiveCall | None = None
-        self._vad: Any | None = None
-        # Resample state for 48k → 16k.
-        self._resample_state: Any = None
-        # TTS-health probe cache. Calls (in/outbound) hit a tiny TTS endpoint
-        # before connecting; a healthy result stays valid for this many
-        # seconds so back-to-back checks don't add latency.
+        # TTS-health probe cache. Calls (in/outbound) check the TTS model is
+        # reachable before connecting; a healthy result stays valid for this
+        # many seconds so back-to-back checks don't add latency.
         self._tts_health_until: float = 0.0
         self._tts_health_ttl_s: float = 10.0
         # Strong refs for fire-and-forget post-call brief tasks. Without
@@ -464,7 +445,7 @@ class CallService:
     async def start(self) -> None:
         if self._started:
             return
-        # Lazy import — these pull native deps (libopus, torch) that only
+        # Lazy import — these pull native deps (libopus, ntgcalls) that only
         # matter when voice is enabled.
         from pytgcalls import PyTgCalls, filters as fl  # type: ignore[import-not-found]
         from pytgcalls.types import (  # type: ignore[import-not-found]
@@ -474,7 +455,6 @@ class CallService:
         from pytgcalls.types.raw.audio_parameters import (  # type: ignore[import-not-found]
             AudioParameters,
         )
-        from silero_vad import load_silero_vad  # type: ignore[import-not-found]
 
         self._fl = fl
         self._ChatUpdate = ChatUpdate
@@ -486,7 +466,6 @@ class CallService:
         self._StreamFrames = StreamFrames
         self._AudioParameters = AudioParameters
 
-        self._vad = load_silero_vad()
         self._load_ambient_bed()
 
         # --- Agent client: receives INBOUND owner calls. ---
@@ -660,14 +639,6 @@ class CallService:
             call_py=call_py,
         )
         self._active = active
-        self._resample_state = None  # reset audioop ratecv state for new call
-        # Clear any Silero VAD hidden state left over from a previous call so
-        # its first chunks aren't judged against stale context.
-        if self._vad is not None:
-            try:
-                self._vad.reset_states()
-            except Exception:
-                log.warning("voice: VAD reset_states at attach failed", exc_info=True)
 
         active.tasks = [
             asyncio.create_task(self._inbound_loop(active), name="voice-inbound"),
@@ -917,41 +888,26 @@ class CallService:
     # ---- TTS health probe ----
 
     async def _tts_health_ok(self) -> bool:
-        """Quick check that TTS is reachable. Returns True if a recent
-        probe succeeded (within `_tts_health_ttl_s`) or if a fresh probe
-        succeeds now; False otherwise. A call without working TTS is
-        useless — the operator can think but can't speak."""
+        """Quick check that the TTS model is reachable with our key. True if
+        a recent probe succeeded (within `_tts_health_ttl_s`) or a fresh one
+        succeeds now. A call without working TTS is useless — the operator
+        can think but can't speak. The model lookup synthesizes nothing, so
+        the probe is free and fast."""
         now = time.monotonic()
         if now < self._tts_health_until:
             return True
-        url = f"{self._tts_base_url}/v1/audio/speech"
-        body = {
-            "model": "tts-1",
-            "voice": self._tts_voice,
-            "input": " ",
-            "response_format": "opus",
-        }
         try:
-            # `read` covers the actual TTS synthesis — even input=" " takes
-            # 2–3 s on a healthy provider, occasionally up to ~4. 5 s gives
-            # headroom for normal variance without letting the daemon hang
-            # if the provider is truly stuck.
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=2.0, read=5.0, write=2.0, pool=5.0),
+                timeout=httpx.Timeout(connect=2.0, read=3.0, write=2.0, pool=3.0),
             ) as client:
-                r = await client.post(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {self._tts_api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=body,
+                r = await client.get(
+                    f"{OPENAI_API}/models/{self._tts_model}",
+                    headers={"Authorization": f"Bearer {self._openai_api_key}"},
                 )
-                ok = 200 <= r.status_code < 300
         except Exception as exc:
             log.warning("voice: TTS health probe failed: %r", exc)
             return False
-        if not ok:
+        if not 200 <= r.status_code < 300:
             log.warning("voice: TTS health probe returned status=%d", r.status_code)
             return False
         self._tts_health_until = time.monotonic() + self._tts_health_ttl_s
@@ -1004,109 +960,92 @@ class CallService:
     # ---- inbound loop ----
 
     async def _inbound_loop(self, active: _ActiveCall) -> None:
-        import numpy as np  # local import; numpy is already a top-level dep
-        import torch        # silero-vad pulls torch; keep the model on CPU
-
-        vad_buf = bytearray()        # 16 kHz PCM, fed to silero in 512-sample chunks
-        utt_buf = bytearray()        # 48 kHz PCM, what we send to STT
-        speaking = False
-        silent_ms = 0
-        voiced_ms = 0
-        last_log_t = 0.0
-        last_vad_reset = time.monotonic()
-
-        try:
-            while True:
-                frame_48k = await active.inbound_frames.get()
-                utt_buf += frame_48k
-                resampled, self._resample_state = audioop.ratecv(
-                    frame_48k, 2, PCM_CHANNELS, PCM_RATE, VAD_RATE,
-                    self._resample_state,
+        """Run transcription sessions for the call's lifetime. A dropped
+        session (network, the server's session-length cap) is reopened; audio
+        in the gap is lost, which costs at most the turn in progress.
+        STT_MAX_FAILURES short-lived sessions in a row end the inbound side —
+        the idle watchdog then hangs up rather than leaving a deaf call."""
+        gain = _InputGain()
+        failures = 0
+        while True:
+            opened = time.monotonic()
+            try:
+                await self._stt_session(active, gain)
+                log.info("voice: transcription session closed by server; reopening")
+                failures = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A session that ran a while before failing was healthy; only
+                # a run of quick failures means the service is really down.
+                failures = 1 if time.monotonic() - opened > 30 else failures + 1
+                log.exception(
+                    "voice: transcription session failed (%d/%d)",
+                    failures, STT_MAX_FAILURES,
                 )
-                vad_buf += resampled
-                # Run VAD on as many 512-sample (32 ms) chunks as we have.
-                while len(vad_buf) >= VAD_CHUNK_BYTES:
-                    chunk = bytes(vad_buf[:VAD_CHUNK_BYTES])
-                    del vad_buf[:VAD_CHUNK_BYTES]
-                    pcm = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
-                    with torch.no_grad():
-                        prob = float(self._vad(torch.from_numpy(pcm), VAD_RATE).item())
-                    chunk_ms = (VAD_CHUNK_SAMPLES * 1000) // VAD_RATE  # 32 ms
-                    if speaking:
-                        if prob >= VAD_END_PROB:
-                            silent_ms = 0
-                        else:
-                            silent_ms += chunk_ms
-                            if silent_ms >= VAD_SILENCE_END_MS:
-                                pcm_bytes = bytes(utt_buf)
-                                utt_buf.clear()
-                                speaking = False
-                                active.user_speaking = False
-                                silent_ms = 0
-                                voiced_ms = 0
-                                # Trim trailing silence we already accumulated.
-                                trim = (VAD_SILENCE_END_MS * PCM_RATE // 1000) * 2
-                                if len(pcm_bytes) > trim:
-                                    pcm_bytes = pcm_bytes[:-trim]
-                                log.info(
-                                    "voice: utterance end %.2fs",
-                                    len(pcm_bytes) / 2 / PCM_RATE,
-                                )
-                                asyncio.create_task(
-                                    self._handle_utterance(active, pcm_bytes),
-                                    name="voice-handle-utt",
-                                )
-                    else:
-                        if prob >= VAD_START_PROB:
-                            voiced_ms += chunk_ms
-                            if voiced_ms >= VAD_START_MS:
-                                speaking = True
-                                active.user_speaking = True
-                                log.info("voice: utterance start")
-                                # Barge-in fires off the same speech-start gate
-                                # (pipecat's VADUserTurnStartStrategy): once the
-                                # user has produced VAD_START_MS of real voice,
-                                # that's enough signal they mean to talk over
-                                # the bot, so cancel outbound TTS.
-                                if active.is_speaking:
-                                    log.info("voice: barge-in detected")
-                                    # Flag the source as the user (not an
-                                    # approval) so the outbound loop drops
-                                    # stale chitchat and records the cut-off.
-                                    active.barge_in_by_user = True
-                                    active.barge_in.set()
-                        else:
-                            voiced_ms = 0
-                            # Drop pre-speech buffer so utt_buf doesn't grow
-                            # unboundedly while user is silent.
-                            if len(utt_buf) > BYTES_PER_FRAME * 50:
-                                del utt_buf[:-BYTES_PER_FRAME * 50]
-                    now = time.monotonic()
-                    # Reset the recurrent VAD's hidden state during silence so
-                    # drift can't accumulate across a long call (pipecat resets
-                    # every VAD_STATE_RESET_S). Only when idle — never mid-
-                    # utterance, where we want state continuity.
-                    if not speaking and now - last_vad_reset >= VAD_STATE_RESET_S:
-                        last_vad_reset = now
-                        try:
-                            self._vad.reset_states()
-                        except Exception:
-                            log.warning("voice: periodic VAD reset failed", exc_info=True)
-                    if now - last_log_t > 5:
-                        last_log_t = now
-                        log.debug(
-                            "voice vad: p=%.2f speaking=%s silent_ms=%d voiced_ms=%d",
-                            prob, speaking, silent_ms, voiced_ms,
-                        )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("voice inbound loop crashed")
-        finally:
-            # Don't leave the flag stuck if the loop dies mid-utterance —
-            # the watchdog would then never idle the call out.
-            active.user_speaking = False
-            raise
+                if failures >= STT_MAX_FAILURES:
+                    raise
+                await asyncio.sleep(1.0)
+            finally:
+                # Don't leave the flag stuck on a turn whose end we'll never
+                # hear — the watchdog would then never idle the call out.
+                active.user_speaking = False
+
+    async def _stt_session(self, active: _ActiveCall, gain: _InputGain) -> None:
+        async with RealtimeTranscriber(
+            api_key=self._openai_api_key, model=self._stt_model,
+            language=self._language, silence_ms=VAD_SILENCE_END_MS,
+        ) as stt:
+            pump = asyncio.create_task(self._pump_audio(active, stt, gain), name="voice-stt-pump")
+            listen = asyncio.create_task(self._listen_stt(active, stt), name="voice-stt-listen")
+            try:
+                done, _ = await asyncio.wait({pump, listen}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                pump.cancel()
+                listen.cancel()
+            for task in done:
+                task.result()
+
+    async def _pump_audio(
+        self, active: _ActiveCall, stt: RealtimeTranscriber, gain: _InputGain,
+    ) -> None:
+        """Resample the call's 48 kHz frames to the session rate and send
+        them, batching whatever has queued up since the last send."""
+        state = None
+        while True:
+            batch = bytearray(await active.inbound_frames.get())
+            while not active.inbound_frames.empty():
+                batch += active.inbound_frames.get_nowait()
+            pcm, state = audioop.ratecv(bytes(batch), 2, PCM_CHANNELS, PCM_RATE, STT_RATE, state)
+            await stt.send(gain.apply(pcm))
+
+    async def _listen_stt(self, active: _ActiveCall, stt: RealtimeTranscriber) -> None:
+        async for ev in stt.events():
+            if isinstance(ev, SpeechStarted):
+                active.user_speaking = True
+                log.info("voice: utterance start")
+                # Barge-in fires off the server VAD's speech start: the user
+                # talking over the bot cancels outbound TTS. A cough that trips
+                # it comes back as an empty transcript, and _handle_utterance
+                # resumes the cut-off reply.
+                if active.is_speaking:
+                    log.info("voice: barge-in detected")
+                    # Flag the source as the user (not an approval) so the
+                    # outbound loop drops stale chitchat and records the cut-off.
+                    active.barge_in_by_user = True
+                    active.barge_in.set()
+            elif isinstance(ev, SpeechStopped):
+                active.user_speaking = False
+                log.info("voice: utterance end")
+            elif isinstance(ev, Transcript):
+                asyncio.create_task(
+                    self._handle_utterance(active, ev.text), name="voice-handle-utt",
+                )
+            elif isinstance(ev, TranscriptFailed):
+                log.warning("voice: transcription failed for %s: %s", ev.item_id, ev.reason)
+                asyncio.create_task(
+                    self._handle_utterance(active, None), name="voice-handle-utt",
+                )
 
     def _call_start_note(self, active: _ActiveCall) -> str:
         """Procedural system note announcing the call. It must go out as a
@@ -1299,17 +1238,20 @@ class CallService:
         finally:
             active.is_speaking = False
 
-    async def _handle_utterance(self, active: _ActiveCall, pcm_bytes: bytes) -> None:
+    async def _handle_utterance(self, active: _ActiveCall, text: str | None) -> None:
+        """Act on one transcribed turn; `text` is None when transcription
+        of the turn failed."""
         # Snapshot + consume the cut-off state this utterance pairs with. The
         # outbound loop set these when the user barged in; whether it was a
-        # real interruption or a cough is decided by what STT returns below.
+        # real interruption or a cough is decided by the transcript below.
         remainder = active.interrupted_remainder
         was_interrupted = active.was_interrupted
         active.interrupted_remainder = None
         active.was_interrupted = False
 
-        if len(pcm_bytes) < PCM_RATE * 2 * VAD_MIN_UTT_MS / 1000:  # noise floor
-            log.info("voice: dropping <%dms utterance", VAD_MIN_UTT_MS)
+        if text is None:
+            # Don't strand the bot mid-sentence on a failed transcription —
+            # resume what it was saying rather than leaving dead air.
             if remainder:
                 await self._resume_after_false_barge_in(active, remainder)
             return
@@ -1320,15 +1262,6 @@ class CallService:
         active.last_activity_at = time.monotonic()
         active.last_turn_at = active.last_activity_at
         active.nudges_since_user = 0
-        try:
-            text = await self._stt(pcm_bytes)
-        except Exception:
-            log.exception("voice: STT failed; dropping utterance")
-            # Don't strand the bot mid-sentence on a transient STT error —
-            # resume what it was saying rather than leaving dead air.
-            if remainder:
-                await self._resume_after_false_barge_in(active, remainder)
-            return
         text = (text or "").strip()
         if not text:
             # The user "barged in" but said nothing intelligible (a cough, a
@@ -1804,48 +1737,24 @@ class CallService:
             )
         return any_resolved
 
-    # ---- HTTP: STT + TTS ----
-
-    async def _stt(self, pcm_bytes: bytes) -> str:
-        """Opus-encode the PCM, POST to STT, return the transcript text."""
-        # Telegram/WebRTC's APM (AGC + noise suppression) leaves us with
-        # very low-amplitude PCM (peaks ~1% of int16 full-scale in tests).
-        # Normalize each utterance so STT has actual signal to work with.
-        pcm_bytes = _normalize_pcm(pcm_bytes, target_peak=0.7)
-        ogg = _pcm_to_ogg_opus(pcm_bytes, sample_rate=PCM_RATE, channels=PCM_CHANNELS)
-        url = f"{self._stt_base_url}/v1/audio/transcriptions"
-        data = {"model": "whisper-1"}
-        if self._language:
-            data["language"] = self._language
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            r = await client.post(
-                url,
-                headers={"Authorization": f"Bearer {self._stt_api_key}"},
-                files={"file": ("utt.ogg", ogg, "audio/ogg")},
-                data=data,
-            )
-            r.raise_for_status()
-            payload = r.json()
-        return payload.get("text", "") if isinstance(payload, dict) else ""
+    # ---- HTTP: TTS ----
 
     async def _tts_http(self, text: str) -> bytes:
         # Every spoken byte flows through here, so this is the one chokepoint
         # that covers conversational, prewarm, and pub/sub voice paths alike.
         # Full markdown strip so no path (live agent turn, auto-ping, in-call
         # greeting/approval) leaks **bold**, `code`, [links](url) etc. into the
-        # TTS engine. to_voice_text leaves bare expression tags like [laughter]
-        # untouched; strip_expression_tag_backticks then mops up the asymmetric
-        # single-backtick case (`[sigh]` / [sigh]`) that the paired-backtick
-        # inline-code rule can't catch. Both are idempotent, so paths that
-        # already sanitized upstream are unaffected.
-        text = strip_expression_tag_backticks(to_voice_text(text))
-        url = f"{self._tts_base_url}/v1/audio/speech"
+        # TTS engine. Idempotent, so paths that sanitized upstream are
+        # unaffected.
+        text = to_voice_text(text)
         body = {
-            "model": "tts-1",
+            "model": self._tts_model,
             "voice": self._tts_voice,
             "input": text,
             "response_format": "opus",
         }
+        if self._tts_instructions:
+            body["instructions"] = self._tts_instructions
         # Time the synth round-trip into the "tts" latency window (surfaced in
         # /status). This is every-spoken-byte's chokepoint, so it captures
         # conversational, prewarm, and pub/sub paths alike. A raise (timeout /
@@ -1853,11 +1762,8 @@ class CallService:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
             with timed("tts"):
                 r = await client.post(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {self._tts_api_key}",
-                        "Content-Type": "application/json",
-                    },
+                    f"{OPENAI_API}/audio/speech",
+                    headers={"Authorization": f"Bearer {self._openai_api_key}"},
                     json=body,
                 )
                 r.raise_for_status()
@@ -1961,8 +1867,7 @@ class CallService:
         # Inbound (owner) calls share the owner's text session. The call-start
         # note (_call_start_note) is left in that history with NO matching
         # end-marker, so a later TEXT turn reads as if the call is still live —
-        # and the model drifts back into voice behavior, leaking spoken
-        # expression tags ([laughter], [confirmation-en]) into text replies.
+        # and the model drifts back into voice behavior in text replies.
         # Close the call out with a SILENT procedural marker: no reply, no
         # Telegram ping, just a history row the next text turn will see. We
         # await it inline (a single INSERT) so the marker is ordered after the
@@ -2139,120 +2044,20 @@ def _drain_chitchat_items(queue: "asyncio.PriorityQueue") -> int:
     return dropped
 
 
-def _normalize_pcm(pcm: bytes, *, target_peak: float = 0.7) -> bytes:
-    """Peak-normalize PCM16 mono so the loudest sample hits target_peak * INT16_MAX.
-    No-op when peak is already ≥target_peak. Caps gain at 64× to avoid amplifying
-    pure silence into noise."""
-    peak = audioop.max(pcm, 2)
-    target = int(target_peak * 32767)
-    if peak == 0 or peak >= target:
-        return pcm
-    gain = min(target / peak, 64.0)
-    return audioop.mul(pcm, 2, gain)
+class _InputGain:
+    """Peak-tracking gain for the caller's audio before it reaches the server
+    VAD (see INPUT_TARGET_PEAK). Tracks the recent peak with a slow decay and
+    scales it toward the target; never attenuates, never exceeds the cap."""
 
+    def __init__(self) -> None:
+        self._peak = 0.0
 
-def _pcm_to_ogg_opus(
-    pcm: bytes, *, sample_rate: int = PCM_RATE, channels: int = PCM_CHANNELS,
-) -> bytes:
-    """Encode PCM16 mono to an Ogg/Opus container suitable for upload to an
-    OpenAI-compatible audio.transcriptions endpoint. Frames at 20 ms (the
-    encoder's recommended packet size for speech)."""
-    from opuslib import Encoder, APPLICATION_VOIP  # type: ignore[import-not-found]
-    enc = Encoder(sample_rate, channels, APPLICATION_VOIP)
-    enc_frame_samples = sample_rate * 20 // 1000  # 20 ms
-    enc_frame_bytes = enc_frame_samples * 2 * channels
-    packets: list[bytes] = []
-    granules: list[int] = []
-    running = 0
-    for i in range(0, len(pcm), enc_frame_bytes):
-        chunk = pcm[i:i + enc_frame_bytes]
-        if len(chunk) < enc_frame_bytes:
-            chunk += b"\x00" * (enc_frame_bytes - len(chunk))
-        packets.append(enc.encode(chunk, enc_frame_samples))
-        running += enc_frame_samples
-        granules.append(running)
-    return _ogg_opus_write(packets, granules, sample_rate=sample_rate, channels=channels)
-
-
-def _ogg_opus_write(
-    packets: list[bytes], granules: list[int], *,
-    sample_rate: int, channels: int,
-) -> bytes:
-    """Wrap a list of Opus packets into a minimal Ogg container with the
-    OpusHead + OpusTags pages, per RFC 7845."""
-    import os
-    serial = struct.unpack("<I", os.urandom(4))[0]
-    head = b"OpusHead" + struct.pack(
-        "<BBHIHB",
-        1,                 # version
-        channels,
-        3840,              # pre-skip (recommended for 48k)
-        sample_rate,
-        0,                 # output gain (Q7.8)
-        0,                 # mapping family
-    )
-    tags = b"OpusTags" + struct.pack("<I", 8) + b"oncall00" + struct.pack("<I", 0)
-    pages: list[bytes] = []
-    pages.append(_ogg_page(serial, 0, 0, head, header_type=0x02))   # BOS
-    pages.append(_ogg_page(serial, 1, 0, tags, header_type=0x00))
-    seq = 2
-    for i, (pkt, gp) in enumerate(zip(packets, granules, strict=False)):
-        header_type = 0x04 if i == len(packets) - 1 else 0x00
-        pages.append(_ogg_page(serial, seq, gp, pkt, header_type=header_type))
-        seq += 1
-    return b"".join(pages)
-
-
-def _ogg_page(
-    serial: int, seq: int, granule: int, payload: bytes, *, header_type: int,
-) -> bytes:
-    """Build one Ogg page. Single-packet pages only — fine for our packet
-    sizes (≤255 bytes per Opus frame at our bitrate)."""
-    segments: list[int] = []
-    remaining = len(payload)
-    while remaining > 255:
-        segments.append(255)
-        remaining -= 255
-    segments.append(remaining)
-    if not segments:
-        segments = [0]
-    header = (
-        b"OggS"
-        + struct.pack("<B", 0)
-        + struct.pack("<B", header_type)
-        + struct.pack("<q", granule)
-        + struct.pack("<I", serial)
-        + struct.pack("<I", seq)
-        + struct.pack("<I", 0)            # CRC placeholder
-        + struct.pack("<B", len(segments))
-        + bytes(segments)
-    )
-    page = header + payload
-    crc = _ogg_crc32(page)
-    return page[:22] + struct.pack("<I", crc) + page[26:]
-
-
-_OGG_CRC_TABLE = None
-
-
-def _ogg_crc32(data: bytes) -> int:
-    """Ogg's variant of CRC-32 (polynomial 0x04c11db7, no input/output XOR
-    or reflection). Hot-path-cached table.
-    """
-    global _OGG_CRC_TABLE
-    if _OGG_CRC_TABLE is None:
-        table = [0] * 256
-        for i in range(256):
-            r = i << 24
-            for _ in range(8):
-                r = ((r << 1) ^ 0x04c11db7) & 0xFFFFFFFF if r & 0x80000000 else (r << 1) & 0xFFFFFFFF
-            table[i] = r
-        _OGG_CRC_TABLE = table
-    table = _OGG_CRC_TABLE
-    crc = 0
-    for b in data:
-        crc = ((crc << 8) & 0xFFFFFFFF) ^ table[((crc >> 24) ^ b) & 0xFF]
-    return crc
+    def apply(self, pcm: bytes) -> bytes:
+        frames = len(pcm) / (STT_RATE * 2 * FRAME_MS / 1000)
+        self._peak = max(audioop.max(pcm, 2) / 32768, self._peak * INPUT_PEAK_DECAY ** frames)
+        gain = INPUT_MAX_GAIN if self._peak <= 0 else min(INPUT_MAX_GAIN, INPUT_TARGET_PEAK / self._peak)
+        # audioop.mul saturates rather than wrapping on overflow.
+        return pcm if gain <= 1.0 else audioop.mul(pcm, 2, gain)
 
 
 def _ogg_opus_packets(ogg: bytes):

@@ -213,3 +213,85 @@ def test_mirror_upload_failure_does_not_escape_into_the_call():
     # The upload runs detached; a dead Telegram connection must not take the
     # audio path down with it.
     assert _mirror(b"OggS" + b"\x00" * 64, fail=True).sent == []
+
+
+# ---- inbound transcription session ----
+
+def _bare_call():
+    from oncall.voice_call import CallService, _ActiveCall
+
+    svc = CallService.__new__(CallService)
+    active = _ActiveCall.__new__(_ActiveCall)
+    active.user_speaking = False
+    active.is_speaking = False
+    active.barge_in_by_user = False
+    return svc, active
+
+
+def test_inbound_reopens_closed_sessions_and_gives_up_on_repeated_failures(monkeypatch):
+    """A session the server closes (its length cap) is reopened without
+    counting as a failure; only STT_MAX_FAILURES failures in a row end the
+    inbound side. Counting the clean close would let a long call die on its
+    third routine reconnect."""
+    from oncall import voice_call
+
+    svc, active = _bare_call()
+    outcomes = ["fail", "closed", "fail", "fail", "fail"]
+    calls = []
+
+    async def fake_session(_active, _gain):
+        calls.append(outcomes[len(calls)])
+        _active.user_speaking = True  # a turn in flight when the session drops
+        if calls[-1] == "fail":
+            raise RuntimeError("socket died")
+
+    async def no_sleep(_s):
+        return None
+
+    svc._stt_session = fake_session
+    monkeypatch.setattr(voice_call.asyncio, "sleep", no_sleep)
+
+    async def run():
+        try:
+            await svc._inbound_loop(active)
+        except RuntimeError:
+            return True
+        return False
+
+    assert asyncio.run(run())
+    assert calls == outcomes
+    assert active.user_speaking is False
+
+
+def test_stt_events_drive_barge_in_and_failed_turns_resume():
+    """Speech start while the bot talks is a barge-in by the user; a turn
+    whose transcription failed reaches _handle_utterance as None, which
+    resumes the cut-off reply instead of leaving dead air."""
+    from oncall.realtime_stt import SpeechStarted, SpeechStopped, Transcript, TranscriptFailed
+
+    svc, active = _bare_call()
+    active.is_speaking = True
+    active.barge_in = asyncio.Event()
+    handled = []
+
+    async def fake_handle(_active, text):
+        handled.append(text)
+
+    svc._handle_utterance = fake_handle
+
+    class FakeStt:
+        async def events(self):
+            yield SpeechStarted("a", 0)
+            assert active.user_speaking and active.barge_in.is_set()
+            assert active.barge_in_by_user
+            yield SpeechStopped("a", 900)
+            yield TranscriptFailed("a", "boom")
+            yield Transcript("b", "status bitte")
+
+    async def run():
+        await svc._listen_stt(active, FakeStt())
+        await asyncio.sleep(0)  # let the spawned handlers run
+
+    asyncio.run(run())
+    assert active.user_speaking is False
+    assert handled == [None, "status bitte"]

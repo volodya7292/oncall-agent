@@ -1095,8 +1095,7 @@ You are summarizing the running history of an on-call agent's chat with its
 user, so the conversation still fits a smaller context window.
 
 You are a summarizer, never a participant. Do NOT reply to the user, continue
-the conversation, or adopt the assistant's voice, language, or expression tags
-(e.g. [laughter]). Describe what happened in third-person plain prose ("the
+the conversation, or adopt the assistant's voice or language. Describe what happened in third-person plain prose ("the
 user asked...", "the operator dispatched...") — even when the transcript is
 casual chit-chat, you narrate it, you do not join it.
 
@@ -1713,9 +1712,9 @@ class Operator:
 
         # Call-status: same transient per-turn shape as acting-status. Tells the
         # operator whether THIS reply will be spoken aloud on a live voice call,
-        # so it knows when voice-only expression tags are appropriate — and,
-        # crucially, that a text turn after a call has ended is NOT on a call
-        # (the owner's voice and text share one session, so a stale call-start
+        # so it knows whether it is speaking or writing — and, crucially, that
+        # a text turn after a call has ended is NOT on a call (the owner's
+        # voice and text share one session, so a stale call-start
         # note can linger in history). Not persisted — recomputed each turn.
         on_call = bool(self._on_call_provider and self._on_call_provider(session_id))
         call_block = (

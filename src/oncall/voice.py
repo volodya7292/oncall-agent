@@ -14,56 +14,6 @@ from __future__ import annotations
 import re
 
 
-# Paralinguistic expression tags the TTS engine renders as sound (laughter,
-# sighs, interjections). The operator is told to write them bare, but it keeps
-# wrapping them in markdown backticks (`[laughter]`), which the engine then
-# fails to recognize — so we strip backticks hugging a known tag before synth.
-_EXPRESSION_TAG = (
-    r"laughter|sigh|confirmation-en"
-    r"|question-(?:en|ah|oh|ei|yi)"
-    r"|surprise-(?:ah|oh|wa|yo)"
-    r"|dissatisfaction-hnn"
-)
-_TAG_BACKTICK_RE = re.compile(r"`+(\[(?:" + _EXPRESSION_TAG + r")\])`*|(\[(?:" + _EXPRESSION_TAG + r")\])`+")
-
-
-def strip_expression_tag_backticks(text: str) -> str:
-    """Remove markdown backticks immediately wrapping an expression tag, so
-    `[laughter]` (or [laughter]`) becomes a bare [laughter] the TTS engine can
-    render. Leaves bare tags and unrelated backticks untouched."""
-    if "`" not in text:
-        return text
-    return _TAG_BACKTICK_RE.sub(lambda m: m.group(1) or m.group(2), text)
-
-
-# A known expression tag — bare or backtick-hugged — plus any horizontal
-# whitespace touching it. Used to PURGE voice-only tags from text-channel
-# output (Telegram), where they'd otherwise render as literal [brackets].
-# Only the known vocabulary is matched, so an unrelated [bracketed] word in a
-# text reply survives untouched.
-_EXPRESSION_TAG_STRIP_RE = re.compile(
-    r"[ \t]*`*\[(?:" + _EXPRESSION_TAG + r")\]`*[ \t]*"
-)
-
-
-def strip_expression_tags(text: str) -> str:
-    """Remove voice-only paralinguistic tags ([laughter], [sigh], …) from text
-    destined for a text channel. The TTS path keeps them (it renders each as
-    sound); text output must not, or the owner sees raw `[laughter]`. The
-    operator sometimes drifts into emitting them in text mode after a voice
-    call despite the call-end marker and prompt rule — this is the
-    deterministic backstop. Only the known tag vocabulary is stripped, so
-    unrelated [bracketed] words in a reply are preserved."""
-    if "[" not in text:
-        return text
-    out = _EXPRESSION_TAG_STRIP_RE.sub(" ", text)
-    # Tidy the whitespace a removed tag leaves behind, without disturbing
-    # blank-line (paragraph) structure.
-    out = re.sub(r"[ \t]{2,}", " ", out)
-    out = re.sub(r"(?m)^[ \t]+|[ \t]+$", "", out)
-    return out.strip()
-
-
 # Triple-backtick fenced code blocks (multi-line). Collapsed to a short marker.
 _FENCED_CODE_RE = re.compile(r"```[\s\S]*?```")
 # Inline code: `foo` — keep the contents, drop the backticks.

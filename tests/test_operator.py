@@ -523,7 +523,7 @@ async def test_acting_status_injected_as_idle_when_no_work(stack):
 async def test_call_status_reflects_active_call(stack):
     """When the CallService reports the session is live, the per-turn
     call-status flips to "on a voice call" — this is the signal the operator
-    gates voice-only expression tags on, and it's recomputed each turn (a
+    tells spoken from written replies by, and it's recomputed each turn (a
     different session stays "not on a call")."""
     llm = ScriptedLLM(script=["hi"])
     operator = _make_operator(stack, llm)
@@ -713,8 +713,8 @@ async def test_append_system_note_persists_silently(stack):
     '[system note: ...]' shape into history but must NOT run an operator turn —
     no LLM round-trip, no reply. Regression: owner voice-call teardown uses it
     to close the lingering call-start note. Inbound teardown used to write
-    nothing, so a later text turn read as still-in-call and the model leaked
-    spoken expression tags ([laughter], [confirmation-en]) into text replies."""
+    nothing, so a later text turn read as still-in-call and the model kept
+    replying in voice style in text."""
     llm = ScriptedLLM(script=[])
     operator = _make_operator(stack, llm)
     await operator.append_system_note("tg-agent-42", "the voice call just ended.")

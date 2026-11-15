@@ -25,11 +25,10 @@ dependencies = [
     "openai>=2.37,<3",      # OpenAI-compatible client; we point it at Vercel AI Gateway
     "google-genai>=2.5,<3", # native Google AI Studio / Gemini API client (operator backend)
     "qrcode>=8.2,<9",       # terminal QR rendering for `oncall telegram-login --qr`
-    "numpy>=2.4,<3",        # PCM sample math for voice-call audio
-    "py-tgcalls>=2.2,<3",   # MTProto 1:1 voice calls on the agent userbot session
-    "opuslib>=3.0,<4",      # Opus encode/decode for the OpenAI-compat STT/TTS endpoints
-    "silero-vad>=6.2,<7",   # Voice activity detection for utterance segmentation + barge-in
-    "audioop-lts>=0.2,<1; python_version >= '3.13'",  # stdlib audioop dropped in 3.13; we need ratecv for 48k→16k
+    "py-tgcalls>=3.0.1,<4", # MTProto 1:1 voice calls on the agent userbot session
+    "opuslib>=3.0,<4",      # Opus decode of OpenAI TTS output
+    "websockets>=17.4,<18", # OpenAI Realtime transcription session for voice calls
+    "audioop-lts>=0.2,<1; python_version >= '3.13'",  # stdlib audioop dropped in 3.13; we need ratecv for 48k→24k
     "anthropic>=0.49,<1",
 ]
 

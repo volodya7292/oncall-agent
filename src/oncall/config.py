@@ -438,25 +438,32 @@ class Settings(BaseSettings):
     telegram_owner_user_id: str = ""
 
     # 1:1 voice calls between owner and agent. Off by default; turn on by
-    # setting VOICE_CALL_ENABLED=1 AND providing both STT and TTS endpoints
-    # (OpenAI-compatible, Opus-only audio, bearer-token auth). The CallService
-    # binds py-tgcalls to the same telethon session as the agent text chat.
+    # setting VOICE_CALL_ENABLED=1 AND OPENAI_API_KEY, which carries both
+    # directions: speech in through a Realtime transcription session (its
+    # server VAD segments turns), speech out through the TTS endpoint. The
+    # CallService binds py-tgcalls to the same telethon session as the agent
+    # text chat.
     voice_call_enabled: bool = False
-    voice_tts_base_url: str = ""           # e.g. https://example.com/v1
-    voice_tts_voice: str = "serhii"
-    voice_tts_api_key: str = ""
-    voice_stt_base_url: str = ""           # e.g. https://example.com/v1
-    voice_stt_api_key: str = ""
+    openai_api_key: str = ""
+    # Must accept server VAD in a transcription session: gpt-transcribe or
+    # gpt-4o-transcribe (see realtime_stt.py).
+    voice_stt_model: str = "gpt-transcribe"
+    voice_tts_model: str = "gpt-4o-mini-tts"
+    voice_tts_voice: str = "cedar"
+    # Delivery direction for gpt-4o-mini-tts (tone, pace); empty sends none.
+    voice_tts_instructions: str = (
+        "Speak casually and warmly, like a friend on the phone, at a natural pace."
+    )
     # Continuous low-level "office" ambience mixed under the call (keyboard
     # foley + a brown-noise floor). Doubles as comfort noise: it keeps the
     # WebRTC channel from going fully silent, which otherwise makes Telegram
     # clip the edges of utterances. Kill-switch for a live call going wrong.
     voice_ambient_bed: bool = True
 
-    # Language the operator should respond in, and the STT language hint
-    # during voice calls. ISO-639-1 (e.g. "uk", "en", "ru"). Empty = no
-    # forcing — operator matches the user's last message language as it
-    # always has, and STT auto-detects (which is bad on short utterances).
+    # Language the operator should respond in, and the transcription
+    # language hint during voice calls. ISO-639-1 (e.g. "uk", "en", "ru").
+    # Empty = no forcing — operator matches the user's last message language
+    # as it always has, and transcription auto-detects.
     # Injected into both operator and executor system prompts at startup,
     # so changes require a daemon restart.
     operator_language: str = ""

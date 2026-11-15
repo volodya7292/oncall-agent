@@ -9,87 +9,11 @@ from __future__ import annotations
 
 import pytest
 
-from oncall.voice import (
-    strip_expression_tag_backticks,
-    strip_expression_tags,
-    to_voice_text,
-)
+from oncall.voice import to_voice_text
 
 
 def test_empty_string():
     assert to_voice_text("") == ""
-
-
-# ---- strip_expression_tag_backticks ----
-# The operator (despite the prompt) keeps wrapping expression tags in markdown
-# backticks; the conversational voice path doesn't run to_voice_text, so this
-# guards the TTS chokepoint directly.
-
-def test_strip_backticks_both_sides():
-    assert strip_expression_tag_backticks("`[laughter]` ok") == "[laughter] ok"
-
-
-def test_strip_backticks_one_sided():
-    assert strip_expression_tag_backticks("ok [sigh]`") == "ok [sigh]"
-    assert strip_expression_tag_backticks("`[surprise-ah] wow") == "[surprise-ah] wow"
-
-
-def test_strip_multiple_tags_in_one_reply():
-    got = strip_expression_tag_backticks("сміюся `[laughter]`, зітхаю `[sigh]`")
-    assert got == "сміюся [laughter], зітхаю [sigh]"
-
-
-def test_bare_tags_untouched():
-    s = "[laughter] still works [dissatisfaction-hnn]"
-    assert strip_expression_tag_backticks(s) == s
-
-
-def test_unrelated_backticks_preserved():
-    # An inline-code span that isn't an expression tag must survive intact.
-    s = "run `ls -la` then [confirmation-en]"
-    assert strip_expression_tag_backticks(s) == "run `ls -la` then [confirmation-en]"
-
-
-# ---- strip_expression_tags (text-channel backstop) ----
-# Voice-only tags must never reach a TEXT channel (Telegram). The prompt
-# forbids them off-call, but the model drifts after a voice call (its own
-# tagged in-call turns linger in the shared session history) — this is the
-# deterministic strip at the owner-text chokepoint. Regression: owner received
-# "[laughter] О так, черга в Cuore di Vetro…" as a text DM after a call ended.
-
-def test_strip_tags_leading_tag_and_emoji():
-    got = strip_expression_tags("[laughter] О так, черга — це класика! 😉")
-    assert got == "О так, черга — це класика! 😉"
-
-
-def test_strip_tags_mid_sentence_no_double_space():
-    assert strip_expression_tags("haha [laughter] good") == "haha good"
-
-
-def test_strip_tags_backtick_wrapped():
-    assert strip_expression_tags("text with `[sigh]` wrapped") == "text with wrapped"
-
-
-def test_strip_tags_only_tag_becomes_empty():
-    # A reply that is nothing but a tag yields empty → the send chokepoint
-    # then suppresses the message entirely (correct: it was voice-only).
-    assert strip_expression_tags("[laughter]") == ""
-
-
-def test_strip_tags_preserves_unknown_brackets():
-    # Only the known expression vocabulary is stripped; legit bracketed text
-    # in a reply survives.
-    s = "a legit [TODO] item and [note] stay"
-    assert strip_expression_tags(s) == s
-
-
-def test_strip_tags_multiple():
-    got = strip_expression_tags("multi [laughter] and [sigh] tags [dissatisfaction-hnn] gone")
-    assert got == "multi and tags gone"
-
-
-def test_strip_tags_no_brackets_fast_path():
-    assert strip_expression_tags("nothing to do here") == "nothing to do here"
 
 
 def test_plain_text_unchanged():

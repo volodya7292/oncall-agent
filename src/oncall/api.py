@@ -1348,18 +1348,8 @@ async def _maybe_start_voice_call(
     if not settings.voice_call_enabled:
         log.info("voice call disabled (VOICE_CALL_ENABLED unset)")
         return None
-    missing = [
-        name for name, val in (
-            ("VOICE_STT_BASE_URL", settings.voice_stt_base_url),
-            ("VOICE_STT_API_KEY", settings.voice_stt_api_key),
-            ("VOICE_TTS_BASE_URL", settings.voice_tts_base_url),
-            ("VOICE_TTS_API_KEY", settings.voice_tts_api_key),
-        ) if not val
-    ]
-    if missing:
-        log.warning(
-            "voice call disabled: required env vars empty: %s", ", ".join(missing),
-        )
+    if not settings.openai_api_key:
+        log.warning("voice call disabled: OPENAI_API_KEY is empty")
         return None
     try:
         service = CallService(
@@ -1367,11 +1357,11 @@ async def _maybe_start_voice_call(
             primary_client=(telegram._client if telegram is not None else None),
             operator=operator, events=events, broker=broker,
             owner_user_id=int(settings.telegram_owner_user_id),
-            tts_base_url=settings.voice_tts_base_url,
-            tts_api_key=settings.voice_tts_api_key,
+            openai_api_key=settings.openai_api_key,
+            tts_model=settings.voice_tts_model,
             tts_voice=settings.voice_tts_voice,
-            stt_base_url=settings.voice_stt_base_url,
-            stt_api_key=settings.voice_stt_api_key,
+            tts_instructions=settings.voice_tts_instructions,
+            stt_model=settings.voice_stt_model,
             language=settings.operator_language,
             llm=llm,
             llm_model=settings.oncall_operator_model,
