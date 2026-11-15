@@ -10,16 +10,16 @@ Per call, three asyncio tasks run for the call's lifetime:
     Realtime transcription session ([realtime_stt.py](realtime_stt.py)),
     whose server VAD segments turns; each transcript goes to
     operator.chat_turn.
-  * outbound — pull text items from a queue, POST OpenAI TTS, decode Opus,
-    send_frame PCM back into the call at 10 ms cadence.
+  * outbound — pull text items from a queue, stream OpenAI TTS PCM and
+    send_frame it into the call at 10 ms cadence while it still arrives.
   * chat-reply — subscribe to operator's chat.reply events (same shape as
     [telegram_agent._chat_reply_subscriber](telegram_agent.py)) and push their
     text into the outbound queue. This is how follow-up replies from the
     executor reach the caller mid-call.
 
 Barge-in: when the server VAD reports speech start while the outbound loop
-is playing audio, the outbound loop cancels its in-flight TTS HTTP request
-and drops queued audio. The user always wins.
+is playing audio, the outbound loop cancels its in-flight TTS stream and
+drops queued audio. The user always wins.
 
 Voice and text chat share the same `chat_sessions` row (agent_session_id),
 so a voice call continues the same conversation the user had in text and
@@ -37,6 +37,7 @@ import ctypes.util
 import io
 import logging
 import re
+import struct
 import sys
 import time
 from dataclasses import dataclass, field
@@ -86,7 +87,7 @@ from .approval_client import is_deny_phrase, phrases_match
 from .broker import Broker
 from .config import Paths
 from .events import EventBus
-from .metrics import timed
+from .metrics import LATENCY
 from .models import TaskState
 from .operator import Operator, summarize_llm_error
 from .realtime_stt import (
@@ -169,9 +170,11 @@ _CALL_END_NOTE = (
     "the voice call just ended — you are back in TEXT chat with the owner now."
 )
 
-# Sentinel returned by _await_synth when barge-in wins the race against a
-# chunk's TTS synthesis.
-_BARGE = object()
+# OpenAI TTS `pcm` output: PCM16 mono @ 24 kHz, streamed. Playback starts
+# once this much is buffered; synthesis runs ~10x faster than real time, so
+# the cushion only has to cover the first chunks' arrival jitter.
+TTS_RATE = 24_000
+TTS_PREBUFFER_MS = 200
 
 
 @dataclass
@@ -1196,8 +1199,7 @@ class CallService:
         # Synthesize while still (likely) ringing — saves seconds vs. the
         # in-line _speak path.
         try:
-            opus_bytes = await self._tts_http(text)
-            pcm = self._opus_decode(opus_bytes)
+            pcm = await self._tts_full(text)
         except Exception:
             log.exception(
                 "voice: prewarm TTS failed; falling back to enqueue path",
@@ -1223,7 +1225,7 @@ class CallService:
         # Play the prewarmed audio directly, bypassing the outbound text
         # queue. Mirrors _speak's send_frame loop with barge-in support
         # but without TTS synthesis.
-        self._mirror_voice_note(opus_bytes, len(pcm), text)
+        self._mirror_voice_note(pcm, text)
         await self._play_pcm(active, pcm, label="prewarm")
 
     async def _play_pcm(
@@ -1234,7 +1236,7 @@ class CallService:
         active.barge_in.clear()
         active.is_speaking = True
         try:
-            await self._emit_pcm_frames(active, pcm, label=label)
+            await self._emit_pcm_frames(active, _TtsStream.complete(pcm), label=label)
         finally:
             active.is_speaking = False
 
@@ -1376,38 +1378,45 @@ class CallService:
             log.info("voice: dropped %d queued line(s) after user barge-in", dropped)
 
     async def _speak(self, active: _ActiveCall, text: str) -> str | None:
-        """Synthesize the *entire* reply in ONE TTS request and play it as a
-        single continuous PCM stream, interruptible by barge-in. Returns the
+        """Speak the *entire* reply from ONE streamed TTS request, playing
+        audio as it arrives, interruptible by barge-in. Returns the
         still-unspoken remainder if a *user* barge-in cut it off (so the caller
         can resume or hand it to the operator), else None.
 
-        We used to synthesize sentence-by-sentence (pipelined) for faster
-        time-to-first-audio. But the provider wraps every request in ~200ms of
-        leading/trailing silence, so streaming chunks back-to-back injected
-        ~360ms of dead air at every sentence boundary, and the live jitter
-        buffer underran on each resume — sentences came out audibly torn apart.
-        One request = one seamless stream. We pay the whole reply's synth
-        latency up front; the prewarm path keeps the first line snappy."""
+        One request per reply, not one per sentence: providers pad every
+        request with leading/trailing silence, and back-to-back sentence
+        requests once put ~360 ms of dead air at every boundary and underran
+        the live jitter buffer. Streaming the single request gets the
+        time-to-first-audio win without the seams."""
         text = text.strip()
         if not text:
             return None
-        log.info(
-            "voice: TTS speaking %d chars (single request): %r", len(text), text[:80],
-        )
-        synth = asyncio.create_task(self._tts_to_pcm(text), name="voice-tts-synth")
-        active.in_flight_tts = synth
-        pcm = await self._await_synth(active, synth)
-        if pcm is _BARGE:
-            # Barged in during synthesis — nothing was heard, so the whole
-            # reply is still unspoken.
-            return text if active.barge_in_by_user else None
-        if pcm is None:  # synth failed (already logged in _await_synth)
+        log.info("voice: TTS speaking %d chars: %r", len(text), text[:80])
+        stream = _TtsStream()
+        producer = asyncio.create_task(self._synthesize(text, stream), name="voice-tts-synth")
+        active.in_flight_tts = producer
+        try:
+            prebuffer = TTS_PREBUFFER_MS * PCM_RATE // 1000 * 2
+            if not await stream.wait_for(prebuffer, active.barge_in):
+                # Barged in before any audio played — the whole reply is
+                # still unspoken.
+                return text if active.barge_in_by_user else None
+            if stream.error is not None and not stream.pcm:
+                return None  # synth failed outright (logged in _synthesize)
+            status, frames_sent = await self._emit_pcm_frames(active, stream, label="tts")
+            if status == "barge":
+                # The remainder maps played audio onto the whole reply, so it
+                # needs the reply's full length; synthesis is far ahead of
+                # playback and nearly always done by now.
+                await asyncio.wait({producer}, timeout=2.0)
+                return self._remainder(active, text, frames_sent, len(stream.pcm))
+            log.info("voice: TTS reply complete (%d frames)", frames_sent)
             return None
-        status, frames_sent = await self._emit_pcm_frames(active, pcm, label="tts")
-        if status == "barge":
-            return self._remainder(active, text, frames_sent, len(pcm))
-        log.info("voice: TTS reply complete (%d frames)", frames_sent)
-        return None
+        finally:
+            if not producer.done():
+                producer.cancel()
+            elif stream.error is None:
+                self._mirror_voice_note(bytes(stream.pcm), text)
 
     def _remainder(
         self, active: _ActiveCall, text: str, frames_sent: int, total_bytes: int,
@@ -1435,64 +1444,30 @@ class CallService:
                 return " ".join(chunks[i:])
         return None  # effectively all of it played
 
-    async def _await_synth(self, active: _ActiveCall, synth_task: asyncio.Task):
-        """Wait for one chunk's PCM, racing barge-in. Returns the PCM bytes,
-        None on synth failure, or the _BARGE sentinel if interrupted first."""
-        barge = asyncio.create_task(active.barge_in.wait())
-        try:
-            done, _pending = await asyncio.wait(
-                {synth_task, barge}, return_when=asyncio.FIRST_COMPLETED,
-            )
-            if barge in done:
-                # Drain the synth task's result/exception if it also finished,
-                # so we don't leak an unretrieved-exception warning.
-                if synth_task.done() and not synth_task.cancelled():
-                    exc = synth_task.exception()
-                    if exc is not None:
-                        log.debug("voice: synth discarded after barge-in: %r", exc)
-                return _BARGE
-            try:
-                return synth_task.result()
-            except Exception:
-                log.exception("voice: chunk TTS synth failed")
-                return None
-        finally:
-            if not synth_task.done():
-                synth_task.cancel()
-            if not barge.done():
-                barge.cancel()
-
-    async def _tts_to_pcm(self, text: str) -> bytes:
-        """Synthesize one text chunk to PCM16 @ 48 kHz."""
-        opus_bytes = await self._tts_http(text)
-        pcm = self._opus_decode(opus_bytes)
-        self._mirror_voice_note(opus_bytes, len(pcm), text)
-        log.debug(
-            "voice: chunk synth %d chars -> %d opus -> %.0fms PCM",
-            len(text), len(opus_bytes), len(pcm) / 2 / PCM_RATE * 1000,
-        )
-        return pcm
-
     async def _emit_pcm_frames(
-        self, active: _ActiveCall, pcm: bytes, *, label: str,
+        self, active: _ActiveCall, stream: _TtsStream, *, label: str,
     ) -> tuple[str, int]:
-        """Send a PCM buffer out as 10 ms frames, polling barge-in each frame.
-        Returns (status, frames_sent) where status is 'done', 'barge'
-        (interrupted), or 'abort' (send error / call gone). frames_sent lets the
-        caller map a barge-in back to a playback position. Does NOT touch
-        is_speaking / barge_in — the caller owns those."""
+        """Send PCM out as 10 ms frames as fast as the stream supplies it,
+        polling barge-in each frame. Returns (status, frames_sent) where status
+        is 'done', 'barge' (interrupted), or 'abort' (send error / call gone).
+        frames_sent lets the caller map a barge-in back to a playback position.
+        Does NOT touch is_speaking / barge_in — the caller owns those."""
         active.last_activity_at = time.monotonic()
         sent = 0
-        for off in range(0, len(pcm), BYTES_PER_FRAME):
-            if active.barge_in.is_set():
+        off = 0
+        while True:
+            if not await stream.wait_for(off + BYTES_PER_FRAME, active.barge_in):
                 log.info(
                     "voice: %s barge-in after %d frames (%.0fms)",
                     label, sent, sent * FRAME_MS,
                 )
                 return "barge", sent
+            if off >= len(stream.pcm):
+                return "done", sent
             if self._active is not active:
                 return "abort", sent
-            chunk = pcm[off:off + BYTES_PER_FRAME]
+            chunk = bytes(stream.pcm[off:off + BYTES_PER_FRAME])
+            off += BYTES_PER_FRAME
             if len(chunk) < BYTES_PER_FRAME:
                 chunk += b"\x00" * (BYTES_PER_FRAME - len(chunk))
             # Mix the ambience bed under the speech (saturating add). Advancing
@@ -1524,7 +1499,6 @@ class CallService:
                     log.exception("voice: %s send_frame failed at frame %d", label, sent)
                 return "abort", sent
             await asyncio.sleep(FRAME_MS / 1000)
-        return "done", sent
 
     # ---- chat.reply subscriber ----
 
@@ -1739,59 +1713,98 @@ class CallService:
 
     # ---- HTTP: TTS ----
 
-    async def _tts_http(self, text: str) -> bytes:
+    async def _synthesize(self, text: str, stream: _TtsStream) -> None:
+        """Stream one reply's TTS into `stream` as PCM16 @ 48 kHz. Never
+        raises: a failure is logged and recorded on the stream, which still
+        holds whatever audio arrived before it."""
         # Every spoken byte flows through here, so this is the one chokepoint
         # that covers conversational, prewarm, and pub/sub voice paths alike.
         # Full markdown strip so no path (live agent turn, auto-ping, in-call
         # greeting/approval) leaks **bold**, `code`, [links](url) etc. into the
         # TTS engine. Idempotent, so paths that sanitized upstream are
         # unaffected.
-        text = to_voice_text(text)
         body = {
             "model": self._tts_model,
             "voice": self._tts_voice,
-            "input": text,
-            "response_format": "opus",
+            "input": to_voice_text(text),
+            "response_format": "pcm",
         }
         if self._tts_instructions:
             body["instructions"] = self._tts_instructions
-        # Time the synth round-trip into the "tts" latency window (surfaced in
-        # /status). This is every-spoken-byte's chokepoint, so it captures
-        # conversational, prewarm, and pub/sub paths alike. A raise (timeout /
-        # HTTP error) records an error sample, not a latency reading.
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            with timed("tts"):
-                r = await client.post(
-                    f"{OPENAI_API}/audio/speech",
+        # The "tts" latency window (surfaced in /status) records time to the
+        # first audio, which is what the caller waits through; a stream that
+        # fails before any audio records an error sample.
+        t0 = time.monotonic()
+        state = None
+        carry = b""
+        try:
+            async with (
+                httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client,
+                client.stream(
+                    "POST", f"{OPENAI_API}/audio/speech",
                     headers={"Authorization": f"Bearer {self._openai_api_key}"},
                     json=body,
-                )
+                ) as r,
+            ):
                 r.raise_for_status()
-            return r.content
+                async for chunk in r.aiter_bytes():
+                    # A chunk can end mid-sample; hold the odd byte back for
+                    # the next one.
+                    data = carry + chunk
+                    whole = len(data) - len(data) % 2
+                    carry = data[whole:]
+                    if not whole:
+                        continue
+                    pcm, state = audioop.ratecv(
+                        data[:whole], 2, PCM_CHANNELS, TTS_RATE, PCM_RATE, state,
+                    )
+                    if not stream.pcm:
+                        LATENCY.record("tts", (time.monotonic() - t0) * 1000)
+                    stream.feed(pcm)
+        except asyncio.CancelledError:
+            stream.finish(RuntimeError("cancelled"))
+            raise
+        except Exception as exc:
+            log.exception("voice: TTS stream failed after %d bytes", len(stream.pcm))
+            if not stream.pcm:
+                LATENCY.record("tts", (time.monotonic() - t0) * 1000, ok=False)
+            stream.finish(exc)
+            return
+        stream.finish()
+
+    async def _tts_full(self, text: str) -> bytes:
+        """Synthesize a whole reply up front (the prewarm path); raises on
+        failure."""
+        stream = _TtsStream()
+        await self._synthesize(text, stream)
+        if stream.error is not None:
+            raise stream.error
+        return bytes(stream.pcm)
 
     # ---- voice-note mirror ----
 
-    def _mirror_voice_note(self, ogg_bytes: bytes, pcm_len: int, text: str) -> None:
+    def _mirror_voice_note(self, pcm: bytes, text: str) -> None:
         """Post what the agent says on the call into the owner's Telegram chat
         as a voice message, so a call leaves the same trail a text conversation
-        does. Hangs off the TTS chokepoint, so it covers every spoken path.
+        does. Every spoken path ends here once its synthesis completed.
 
-        Fire-and-forget: the upload must never delay the audio going out on the
-        line. Nothing is re-synthesized — the bytes are the ones just spoken."""
+        Fire-and-forget: encoding runs in a thread and the upload in a task, so
+        neither delays the audio going out on the line. Nothing is
+        re-synthesized — the PCM is the audio just spoken."""
         active = self._active
-        if active is None:
+        if active is None or not pcm:
             return
-        if not ogg_bytes.startswith(b"OggS"):
-            # Telegram voice notes must carry an Ogg container. A raw-Opus TTS
-            # response (the other case _opus_decode sniffs for) has none, so
-            # there is nothing playable to send.
-            log.warning("voice: TTS response not Ogg/Opus; no voice note sent")
-            return
-        duration = max(1, round(pcm_len / 2 / PCM_RATE))
-        task = asyncio.create_task(
-            self._send_voice_note(active, ogg_bytes, duration, text),
-            name="voice-note-mirror",
-        )
+        duration = max(1, round(len(pcm) / 2 / PCM_RATE))
+
+        async def mirror() -> None:
+            try:
+                ogg = await asyncio.to_thread(_pcm_to_ogg_opus, pcm)
+            except Exception:
+                log.exception("voice: encoding the voice note failed")
+                return
+            await self._send_voice_note(active, ogg, duration, text)
+
+        task = asyncio.create_task(mirror(), name="voice-note-mirror")
         self._mirror_tasks.add(task)
         task.add_done_callback(self._mirror_tasks.discard)
 
@@ -1817,9 +1830,9 @@ class CallService:
             log.exception("voice: sending voice note to telegram failed")
 
     def _opus_decode(self, ogg_or_opus: bytes) -> bytes:
-        """Decode the TTS Opus response to PCM16 @ 48 kHz mono. Handles both
-        raw-Opus and Ogg/Opus container responses by sniffing the OggS magic.
-        """
+        """Decode Opus audio (the ambience bed asset) to PCM16 @ 48 kHz mono.
+        Handles both raw-Opus and Ogg/Opus containers by sniffing the OggS
+        magic."""
         from opuslib import Decoder  # type: ignore[import-not-found]
         if ogg_or_opus[:4] == b"OggS":
             packets = list(_ogg_opus_packets(ogg_or_opus))
@@ -2044,6 +2057,47 @@ def _drain_chitchat_items(queue: "asyncio.PriorityQueue") -> int:
     return dropped
 
 
+class _TtsStream:
+    """PCM16 @ 48 kHz of one TTS reply, filled by the synthesis task while
+    playback reads it. `error` is set if synthesis failed or was cancelled."""
+
+    def __init__(self) -> None:
+        self.pcm = bytearray()
+        self.done = False
+        self.error: BaseException | None = None
+        self._grew = asyncio.Event()
+
+    @classmethod
+    def complete(cls, pcm: bytes) -> _TtsStream:
+        stream = cls()
+        stream.feed(pcm)
+        stream.finish()
+        return stream
+
+    def feed(self, pcm: bytes) -> None:
+        self.pcm += pcm
+        self._grew.set()
+
+    def finish(self, error: BaseException | None = None) -> None:
+        self.done = True
+        self.error = error
+        self._grew.set()
+
+    async def wait_for(self, n_bytes: int, barge_in: asyncio.Event) -> bool:
+        """Wait until `n_bytes` are buffered or the stream has ended. False
+        if barge-in is (or becomes) set first."""
+        while not barge_in.is_set() and len(self.pcm) < n_bytes and not self.done:
+            self._grew.clear()
+            grew = asyncio.ensure_future(self._grew.wait())
+            barged = asyncio.ensure_future(barge_in.wait())
+            try:
+                await asyncio.wait({grew, barged}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                grew.cancel()
+                barged.cancel()
+        return not barge_in.is_set()
+
+
 class _InputGain:
     """Peak-tracking gain for the caller's audio before it reaches the server
     VAD (see INPUT_TARGET_PEAK). Tracks the recent peak with a slow decay and
@@ -2058,6 +2112,109 @@ class _InputGain:
         gain = INPUT_MAX_GAIN if self._peak <= 0 else min(INPUT_MAX_GAIN, INPUT_TARGET_PEAK / self._peak)
         # audioop.mul saturates rather than wrapping on overflow.
         return pcm if gain <= 1.0 else audioop.mul(pcm, 2, gain)
+
+
+def _pcm_to_ogg_opus(
+    pcm: bytes, *, sample_rate: int = PCM_RATE, channels: int = PCM_CHANNELS,
+) -> bytes:
+    """Encode PCM16 mono to an Ogg/Opus container (a Telegram voice note).
+    Frames at 20 ms, the encoder's recommended packet size for speech."""
+    from opuslib import Encoder, APPLICATION_VOIP  # type: ignore[import-not-found]
+    enc = Encoder(sample_rate, channels, APPLICATION_VOIP)
+    enc_frame_samples = sample_rate * 20 // 1000  # 20 ms
+    enc_frame_bytes = enc_frame_samples * 2 * channels
+    packets: list[bytes] = []
+    granules: list[int] = []
+    running = 0
+    for i in range(0, len(pcm), enc_frame_bytes):
+        chunk = pcm[i:i + enc_frame_bytes]
+        if len(chunk) < enc_frame_bytes:
+            chunk += b"\x00" * (enc_frame_bytes - len(chunk))
+        packets.append(enc.encode(chunk, enc_frame_samples))
+        running += enc_frame_samples
+        granules.append(running)
+    return _ogg_opus_write(packets, granules, sample_rate=sample_rate, channels=channels)
+
+
+def _ogg_opus_write(
+    packets: list[bytes], granules: list[int], *,
+    sample_rate: int, channels: int,
+) -> bytes:
+    """Wrap a list of Opus packets into a minimal Ogg container with the
+    OpusHead + OpusTags pages, per RFC 7845."""
+    import os
+    serial = struct.unpack("<I", os.urandom(4))[0]
+    head = b"OpusHead" + struct.pack(
+        "<BBHIHB",
+        1,                 # version
+        channels,
+        3840,              # pre-skip (recommended for 48k)
+        sample_rate,
+        0,                 # output gain (Q7.8)
+        0,                 # mapping family
+    )
+    tags = b"OpusTags" + struct.pack("<I", 8) + b"oncall00" + struct.pack("<I", 0)
+    pages: list[bytes] = []
+    pages.append(_ogg_page(serial, 0, 0, head, header_type=0x02))   # BOS
+    pages.append(_ogg_page(serial, 1, 0, tags, header_type=0x00))
+    seq = 2
+    for i, (pkt, gp) in enumerate(zip(packets, granules, strict=False)):
+        header_type = 0x04 if i == len(packets) - 1 else 0x00
+        pages.append(_ogg_page(serial, seq, gp, pkt, header_type=header_type))
+        seq += 1
+    return b"".join(pages)
+
+
+def _ogg_page(
+    serial: int, seq: int, granule: int, payload: bytes, *, header_type: int,
+) -> bytes:
+    """Build one Ogg page. Single-packet pages only — fine for our packet
+    sizes (≤255 bytes per Opus frame at our bitrate)."""
+    segments: list[int] = []
+    remaining = len(payload)
+    while remaining > 255:
+        segments.append(255)
+        remaining -= 255
+    segments.append(remaining)
+    if not segments:
+        segments = [0]
+    header = (
+        b"OggS"
+        + struct.pack("<B", 0)
+        + struct.pack("<B", header_type)
+        + struct.pack("<q", granule)
+        + struct.pack("<I", serial)
+        + struct.pack("<I", seq)
+        + struct.pack("<I", 0)            # CRC placeholder
+        + struct.pack("<B", len(segments))
+        + bytes(segments)
+    )
+    page = header + payload
+    crc = _ogg_crc32(page)
+    return page[:22] + struct.pack("<I", crc) + page[26:]
+
+
+_OGG_CRC_TABLE = None
+
+
+def _ogg_crc32(data: bytes) -> int:
+    """Ogg's variant of CRC-32 (polynomial 0x04c11db7, no input/output XOR
+    or reflection). Hot-path-cached table.
+    """
+    global _OGG_CRC_TABLE
+    if _OGG_CRC_TABLE is None:
+        table = [0] * 256
+        for i in range(256):
+            r = i << 24
+            for _ in range(8):
+                r = ((r << 1) ^ 0x04c11db7) & 0xFFFFFFFF if r & 0x80000000 else (r << 1) & 0xFFFFFFFF
+            table[i] = r
+        _OGG_CRC_TABLE = table
+    table = _OGG_CRC_TABLE
+    crc = 0
+    for b in data:
+        crc = ((crc << 8) & 0xFFFFFFFF) ^ table[((crc >> 24) ^ b) & 0xFF]
+    return crc
 
 
 def _ogg_opus_packets(ogg: bytes):

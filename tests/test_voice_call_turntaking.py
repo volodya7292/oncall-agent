@@ -7,9 +7,10 @@ These pin two non-obvious properties:
     fire a TTS round-trip per "Ok."
   * _drain_chitchat_items is a safety invariant: a user barge-in drops stale
     chitchat but must NEVER drop a queued approval prompt.
-  * _mirror_voice_note re-uses the spoken bytes and stays detached from the
-    call: an unplayable container or a dead upload must cost nothing on the
-    line.
+  * _mirror_voice_note encodes the spoken PCM and stays detached from the
+    call: a dead upload must cost nothing on the line.
+  * Streamed TTS: chunk boundaries that split a sample, and a barge-in that
+    lands before the first audio.
 """
 
 from __future__ import annotations
@@ -172,7 +173,7 @@ class _FakeClient:
         self.sent.append({"peer": peer, "data": buf.read(), **kw})
 
 
-def _mirror(ogg: bytes, *, fail: bool = False) -> _FakeClient:
+def _mirror(pcm: bytes, *, fail: bool = False) -> _FakeClient:
     """Drive _mirror_voice_note on a CallService stripped to the attributes it
     actually touches, and wait for the fire-and-forget upload task."""
     from oncall.voice_call import CallService, _ActiveCall
@@ -185,7 +186,7 @@ def _mirror(ogg: bytes, *, fail: bool = False) -> _FakeClient:
     svc._active.is_owner = True
 
     async def run():
-        svc._mirror_voice_note(ogg, 48_000 * 2 * 3, "")  # 3 s of PCM16/48k
+        svc._mirror_voice_note(pcm, "")
         for t in list(svc._mirror_tasks):
             await t
         return svc._client
@@ -193,26 +194,107 @@ def _mirror(ogg: bytes, *, fail: bool = False) -> _FakeClient:
     return asyncio.run(run())
 
 
-def test_mirror_sends_the_spoken_bytes_as_a_voice_note():
-    client = _mirror(b"OggS" + b"\x00" * 64)
+def test_mirror_sends_the_spoken_audio_as_a_voice_note():
+    from oncall.voice_call import CallService
+
+    pcm = bytes(range(256)) * 1125  # 3 s of PCM16/48k
+    client = _mirror(pcm)
     assert len(client.sent) == 1
     sent = client.sent[0]
     assert sent["peer"] == 42
-    assert sent["data"] == b"OggS" + b"\x00" * 64  # never re-synthesized
     assert sent["voice_note"] is True
     assert sent["attributes"][0].duration == 3
-
-
-def test_mirror_skips_tts_output_without_an_ogg_container():
-    # Raw-Opus TTS responses decode fine for the call but are unplayable as a
-    # Telegram voice note, so nothing is uploaded.
-    assert _mirror(b"\x78\x00raw-opus-packet").sent == []
+    # A playable Ogg/Opus container holding the same 3 s (20 ms packets).
+    decoded = CallService._opus_decode(None, sent["data"])
+    assert sent["data"].startswith(b"OggS")
+    assert len(decoded) == len(pcm)
 
 
 def test_mirror_upload_failure_does_not_escape_into_the_call():
     # The upload runs detached; a dead Telegram connection must not take the
     # audio path down with it.
-    assert _mirror(b"OggS" + b"\x00" * 64, fail=True).sent == []
+    assert _mirror(b"\x00\x00" * 48_000, fail=True).sent == []
+
+
+# ---- streamed TTS ----
+
+def _tts_service(chunks: list[bytes]):
+    """A CallService whose TTS endpoint streams `chunks` (PCM16 @ 24 kHz)."""
+    import httpx
+
+    from oncall.voice_call import CallService
+
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for c in chunks:
+                await asyncio.sleep(0)
+                yield c
+
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, stream=Stream()))
+    real = httpx.AsyncClient
+
+    svc = CallService.__new__(CallService)
+    svc._openai_api_key = "k"
+    svc._tts_model, svc._tts_voice, svc._tts_instructions = "m", "v", ""
+    svc._mirror_tasks = set()
+    svc._active = None
+    return svc, (lambda **kw: real(transport=transport, **kw))
+
+
+def test_tts_chunks_that_split_a_sample_resample_like_one_buffer(monkeypatch):
+    """HTTP chunks fall on arbitrary byte offsets. A chunk ending mid-sample
+    must carry its odd byte into the next, or every later sample is read
+    shifted by one byte — loud noise instead of speech."""
+    import audioop
+
+    from oncall import voice_call
+    from oncall.voice_call import PCM_RATE, TTS_RATE, _TtsStream
+
+    raw = bytes((i * 7) % 256 for i in range(4801 * 2))
+    svc, client = _tts_service([raw[:3], raw[3:4], raw[4:1001], raw[1001:]])
+    monkeypatch.setattr(voice_call.httpx, "AsyncClient", client)
+
+    stream = _TtsStream()
+    asyncio.run(svc._synthesize("hallo", stream))
+    expected, _ = audioop.ratecv(raw, 2, 1, TTS_RATE, PCM_RATE, None)
+    assert stream.done and stream.error is None
+    assert bytes(stream.pcm) == expected
+
+
+def test_barge_in_before_first_audio_returns_whole_reply_and_stops_synth(monkeypatch):
+    """The user can talk over the bot while the reply is still being
+    synthesized. Nothing was heard, so the whole reply is the remainder, and
+    the synthesis must not keep streaming (or reach the voice-note mirror)."""
+    from oncall import voice_call
+    from oncall.voice_call import _ActiveCall
+
+    started = asyncio.Event()
+    mirrored = []
+
+    async def slow_synth(_text, _stream):
+        started.set()
+        await asyncio.sleep(30)
+
+    svc, _ = _tts_service([])
+    svc._synthesize = slow_synth
+    svc._mirror_voice_note = lambda pcm, text: mirrored.append(text)
+    active = _ActiveCall.__new__(_ActiveCall)
+    active.barge_in_by_user = False
+
+    async def run():
+        active.barge_in = asyncio.Event()
+        speak = asyncio.create_task(svc._speak(active, "Erster Satz. Zweiter Satz."))
+        await started.wait()
+        active.barge_in_by_user = True
+        active.barge_in.set()
+        remainder = await speak
+        await asyncio.sleep(0)
+        return remainder, active.in_flight_tts
+
+    remainder, producer = asyncio.run(run())
+    assert remainder == "Erster Satz. Zweiter Satz."
+    assert producer.cancelled()
+    assert mirrored == []
 
 
 # ---- inbound transcription session ----
