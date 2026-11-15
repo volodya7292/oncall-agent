@@ -438,21 +438,23 @@ class Settings(BaseSettings):
     telegram_owner_user_id: str = ""
 
     # 1:1 voice calls between owner and agent. Off by default; turn on by
-    # setting VOICE_CALL_ENABLED=1 AND OPENAI_API_KEY, which carries both
-    # directions: speech in through a Realtime transcription session (its
-    # server VAD segments turns), speech out through the TTS endpoint. The
-    # CallService binds py-tgcalls to the same telethon session as the agent
-    # text chat.
+    # setting VOICE_CALL_ENABLED=1, OPENAI_API_KEY and GEMINI_API_KEY. Speech
+    # in goes through an OpenAI Realtime transcription session (its server
+    # VAD segments turns), speech out through Gemini TTS. The CallService
+    # binds py-tgcalls to the same telethon session as the agent text chat.
     voice_call_enabled: bool = False
     openai_api_key: str = ""
     # Must accept server VAD in a transcription session: gpt-transcribe or
     # gpt-4o-transcribe (see realtime_stt.py).
     voice_stt_model: str = "gpt-transcribe"
-    voice_tts_model: str = "gpt-4o-mini-tts"
-    voice_tts_voice: str = "alloy"
-    # Delivery direction for gpt-4o-mini-tts (tone, pace); empty sends none.
+    # Must stream: gemini-2.5-pro-preview-tts returns the whole reply in one
+    # piece, seconds after the request.
+    voice_tts_model: str = "gemini-3.8-flash-tts"
+    voice_tts_voice: str = "Charon"
+    # Delivery direction, sent ahead of the text as "<this>:\n<text>";
+    # empty sends the bare text.
     voice_tts_instructions: str = (
-        "Speak casually and warmly, like a friend on the phone, at a natural pace."
+        "Read this aloud casually and warmly, like a friend on the phone"
     )
     # Continuous low-level "office" ambience mixed under the call (keyboard
     # foley + a brown-noise floor). Doubles as comfort noise: it keeps the

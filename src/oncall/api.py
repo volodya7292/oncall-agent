@@ -1351,6 +1351,9 @@ async def _maybe_start_voice_call(
     if not settings.openai_api_key:
         log.warning("voice call disabled: OPENAI_API_KEY is empty")
         return None
+    if not settings.gemini_api_key:
+        log.warning("voice call disabled: GEMINI_API_KEY is empty")
+        return None
     try:
         service = CallService(
             client=telegram_agent._client,
@@ -1358,6 +1361,7 @@ async def _maybe_start_voice_call(
             operator=operator, events=events, broker=broker,
             owner_user_id=int(settings.telegram_owner_user_id),
             openai_api_key=settings.openai_api_key,
+            gemini_api_key=settings.gemini_api_key,
             tts_model=settings.voice_tts_model,
             tts_voice=settings.voice_tts_voice,
             tts_instructions=settings.voice_tts_instructions,

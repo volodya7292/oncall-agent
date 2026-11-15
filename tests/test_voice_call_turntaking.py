@@ -219,7 +219,11 @@ def test_mirror_upload_failure_does_not_escape_into_the_call():
 # ---- streamed TTS ----
 
 def _tts_service(chunks: list[bytes]):
-    """A CallService whose TTS endpoint streams `chunks` (PCM16 @ 24 kHz)."""
+    """A CallService whose TTS endpoint streams `chunks` (PCM16 @ 24 kHz),
+    one SSE event each, the way Gemini's streamGenerateContent does."""
+    import base64
+    import json
+
     import httpx
 
     from oncall.voice_call import CallService
@@ -228,13 +232,15 @@ def _tts_service(chunks: list[bytes]):
         async def __aiter__(self):
             for c in chunks:
                 await asyncio.sleep(0)
-                yield c
+                part = {"inlineData": {"mimeType": "audio/l16; rate=24000",
+                                       "data": base64.b64encode(c).decode()}}
+                yield f"data: {json.dumps({'candidates': [{'content': {'parts': [part]}}]})}\r\n\r\n".encode()
 
     transport = httpx.MockTransport(lambda req: httpx.Response(200, stream=Stream()))
     real = httpx.AsyncClient
 
     svc = CallService.__new__(CallService)
-    svc._openai_api_key = "k"
+    svc._gemini_api_key = "k"
     svc._tts_model, svc._tts_voice, svc._tts_instructions = "m", "v", ""
     svc._mirror_tasks = set()
     svc._active = None
@@ -242,9 +248,9 @@ def _tts_service(chunks: list[bytes]):
 
 
 def test_tts_chunks_that_split_a_sample_resample_like_one_buffer(monkeypatch):
-    """HTTP chunks fall on arbitrary byte offsets. A chunk ending mid-sample
-    must carry its odd byte into the next, or every later sample is read
-    shifted by one byte — loud noise instead of speech."""
+    """A streamed chunk ending mid-sample must carry its odd byte into the
+    next, or every later sample is read shifted by one byte — loud noise
+    instead of speech."""
     import audioop
 
     from oncall import voice_call

@@ -10,7 +10,7 @@ Per call, three asyncio tasks run for the call's lifetime:
     Realtime transcription session ([realtime_stt.py](realtime_stt.py)),
     whose server VAD segments turns; each transcript goes to
     operator.chat_turn.
-  * outbound — pull text items from a queue, stream OpenAI TTS PCM and
+  * outbound — pull text items from a queue, stream Gemini TTS PCM and
     send_frame it into the call at 10 ms cadence while it still arrives.
   * chat-reply — subscribe to operator's chat.reply events (same shape as
     [telegram_agent._chat_reply_subscriber](telegram_agent.py)) and push their
@@ -32,14 +32,17 @@ from __future__ import annotations
 
 import asyncio
 import audioop
+import base64
 import ctypes
 import ctypes.util
 import io
+import json
 import logging
 import re
 import struct
 import sys
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -124,7 +127,7 @@ INPUT_PEAK_DECAY = 0.9995   # per 10 ms frame: ~14 s half-life
 # Consecutive failed transcription sessions before the inbound side gives up.
 STT_MAX_FAILURES = 3
 
-OPENAI_API = "https://api.openai.com/v1"
+GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
 
 # HTTP timeouts. TTS can return seconds of audio.
 HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=60.0)
@@ -170,11 +173,24 @@ _CALL_END_NOTE = (
     "the voice call just ended — you are back in TEXT chat with the owner now."
 )
 
-# OpenAI TTS `pcm` output: PCM16 mono @ 24 kHz, streamed. Playback starts
-# once this much is buffered; synthesis runs ~10x faster than real time, so
-# the cushion only has to cover the first chunks' arrival jitter.
+# Gemini TTS streams PCM16 mono @ 24 kHz. Playback starts once this much is
+# buffered; synthesis runs several times faster than real time, so the
+# cushion only has to cover the first chunks' arrival jitter.
 TTS_RATE = 24_000
 TTS_PREBUFFER_MS = 200
+
+
+async def _sse_audio(response: httpx.Response) -> AsyncIterator[bytes]:
+    """Audio bytes from a Gemini `streamGenerateContent?alt=sse` response."""
+    async for line in response.aiter_lines():
+        if not line.startswith("data:"):
+            continue
+        event = json.loads(line[5:])
+        for cand in event.get("candidates") or []:
+            for part in (cand.get("content") or {}).get("parts") or []:
+                data = (part.get("inlineData") or {}).get("data")
+                if data:
+                    yield base64.b64decode(data)
 
 
 @dataclass
@@ -285,6 +301,7 @@ class CallService:
         broker: Broker,
         owner_user_id: int,
         openai_api_key: str,
+        gemini_api_key: str,
         tts_model: str,
         tts_voice: str,
         tts_instructions: str,
@@ -306,6 +323,7 @@ class CallService:
         self._llm_model = llm_model
         self._owner_user_id = int(owner_user_id)
         self._openai_api_key = openai_api_key
+        self._gemini_api_key = gemini_api_key
         self._tts_model = tts_model
         self._tts_voice = tts_voice
         self._tts_instructions = tts_instructions
@@ -904,8 +922,8 @@ class CallService:
                 timeout=httpx.Timeout(connect=2.0, read=3.0, write=2.0, pool=3.0),
             ) as client:
                 r = await client.get(
-                    f"{OPENAI_API}/models/{self._tts_model}",
-                    headers={"Authorization": f"Bearer {self._openai_api_key}"},
+                    f"{GEMINI_API}/models/{self._tts_model}",
+                    headers={"x-goog-api-key": self._gemini_api_key},
                 )
         except Exception as exc:
             log.warning("voice: TTS health probe failed: %r", exc)
@@ -1723,14 +1741,18 @@ class CallService:
         # greeting/approval) leaks **bold**, `code`, [links](url) etc. into the
         # TTS engine. Idempotent, so paths that sanitized upstream are
         # unaffected.
+        spoken = to_voice_text(text)
+        # Gemini TTS takes delivery direction in the prompt itself.
+        prompt = f"{self._tts_instructions}:\n{spoken}" if self._tts_instructions else spoken
         body = {
-            "model": self._tts_model,
-            "voice": self._tts_voice,
-            "input": to_voice_text(text),
-            "response_format": "pcm",
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {"voiceConfig": {
+                    "prebuiltVoiceConfig": {"voiceName": self._tts_voice},
+                }},
+            },
         }
-        if self._tts_instructions:
-            body["instructions"] = self._tts_instructions
         # The "tts" latency window (surfaced in /status) records time to the
         # first audio, which is what the caller waits through; a stream that
         # fails before any audio records an error sample.
@@ -1741,15 +1763,18 @@ class CallService:
             async with (
                 httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client,
                 client.stream(
-                    "POST", f"{OPENAI_API}/audio/speech",
-                    headers={"Authorization": f"Bearer {self._openai_api_key}"},
+                    "POST",
+                    f"{GEMINI_API}/models/{self._tts_model}:streamGenerateContent?alt=sse",
+                    headers={"x-goog-api-key": self._gemini_api_key},
                     json=body,
                 ) as r,
             ):
-                r.raise_for_status()
-                async for chunk in r.aiter_bytes():
-                    # A chunk can end mid-sample; hold the odd byte back for
-                    # the next one.
+                if r.is_error:
+                    await r.aread()
+                    raise RuntimeError(f"TTS HTTP {r.status_code}: {r.text[:300]}")
+                async for chunk in _sse_audio(r):
+                    # Nothing promises a chunk holds whole samples; hold an
+                    # odd byte back for the next one.
                     data = carry + chunk
                     whole = len(data) - len(data) % 2
                     carry = data[whole:]
@@ -1761,6 +1786,9 @@ class CallService:
                     if not stream.pcm:
                         LATENCY.record("tts", (time.monotonic() - t0) * 1000)
                     stream.feed(pcm)
+            if not stream.pcm:
+                # Gemini TTS occasionally ends a stream without audio.
+                raise RuntimeError("TTS stream ended without audio")
         except asyncio.CancelledError:
             stream.finish(RuntimeError("cancelled"))
             raise
