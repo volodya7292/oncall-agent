@@ -449,7 +449,7 @@ class Settings(BaseSettings):
     # gpt-4o-transcribe (see realtime_stt.py).
     voice_stt_model: str = "gpt-transcribe"
     voice_tts_model: str = "gpt-4o-mini-tts"
-    voice_tts_voice: str = "cedar"
+    voice_tts_voice: str = "onyx"
     # Delivery direction for gpt-4o-mini-tts (tone, pace); empty sends none.
     voice_tts_instructions: str = (
         "Speak casually and warmly, like a friend on the phone, at a natural pace."
