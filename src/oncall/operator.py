@@ -24,7 +24,6 @@ from uuid import UUID, uuid4
 from .audit import fmt, operator_log
 from .broker import Broker
 from .config import Paths, Settings
-from . import memory_extractor
 from .db import Database, iso
 from .events import EventBus
 from .lifecycle import Lifecycle
@@ -849,9 +848,11 @@ OPERATOR_TOOLS: list[dict[str, Any]] = [
                 "guess to stand alone, save the narrower stated fact or "
                 "save nothing and ask. "
                 "Phrase the fact as one self-contained declarative sentence "
-                "≤200 chars in third person about the user. Idempotent — "
-                "near-duplicate facts merge into the existing memory entry "
-                "instead of creating a new row. The system writes a "
+                "≤200 chars in third person about the user. Facts the user "
+                "states are also extracted from each of their turns "
+                "automatically, so call this only for a standing instruction "
+                "or when the user asks you to remember something. The system "
+                "writes a "
                 "`_Remembered: ..._` breadcrumb to chat automatically; "
                 "don't echo the fact in your own reply."
             ),
@@ -896,14 +897,14 @@ OPERATOR_TOOLS: list[dict[str, Any]] = [
                 "to find the candidate id(s); if multiple plausible matches, "
                 "list them to the user and ask which one — do NOT pick "
                 "silently. NEVER call autonomously, never as housekeeping. "
-                "Memory storage is otherwise auto-managed (extraction + LRU); "
+                "Memory storage is otherwise auto-managed (extraction + consolidation); "
                 "this is the user's escape hatch for a specific wrong entry."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "memory_id": {
-                        "type": "integer",
+                        "type": "string",
                         "description": "id from `query_memory` of the row to delete.",
                     },
                 },
@@ -1136,8 +1137,6 @@ class Operator:
         telegram: TelegramService | None = None,
         events: EventBus | None = None,
         ask_futures: dict[str, asyncio.Future[str]] | None = None,
-        extract_llm: LLMClient | None = None,
-        extract_model: str | None = None,
         max_history: int = 60,
         # 16 leaves headroom for multi-step drain flows (query_memory ×N +
         # dispatch_task + tool_status polls + read_chat_style + reply_to_dm +
@@ -1154,20 +1153,11 @@ class Operator:
         self._llm = llm
         self._telegram = telegram
         self._memory = memory
-        # Exposed so api.py can probe stale_count() / trigger rebuild
-        # without breaking the existing _memory private convention.
+        # Exposed for api.py (the executor's memory endpoint, shutdown).
         self.memory: MemoryStore = memory
         self._events = events
         self._ask_futures: dict[str, asyncio.Future[str]] = (
             ask_futures if ask_futures is not None else {}
-        )
-        # When extract_llm is None, auto-extraction is disabled (memory still
-        # works for retrieval — it just never grows from conversation).
-        self._extract_llm = extract_llm
-        self._extract_model = (
-            extract_model
-            or settings.oncall_memory_extract_model
-            or settings.oncall_operator_model
         )
         self._max_history = max_history
         self._max_tool_rounds = max_tool_rounds
@@ -1186,21 +1176,15 @@ class Operator:
         # against auto-ping calls so chat_messages append in a consistent order
         # and the LLM never sees an interleaved state.
         self._session_locks: dict[str, asyncio.Lock] = {}
-        # Strong references to in-flight extraction tasks so they aren't
+        # Strong references to in-flight memory-ingest tasks so they aren't
         # garbage-collected while running.
-        self._extraction_tasks: set[asyncio.Task[Any]] = set()
+        self._ingest_tasks: set[asyncio.Task[Any]] = set()
         # Same, for background history compression (see _schedule_compression),
         # plus the set of session_ids with a compression already in flight —
         # the over-budget trigger persists until the summary lands, so without
         # this every turn in between would spawn a duplicate opus one-shot.
         self._compression_tasks: set[asyncio.Task[Any]] = set()
         self._compressing: set[str] = set()
-        # Per-turn buffer of facts the operator saved via `save_memory`
-        # during the in-flight turn. Drained at extraction time so the
-        # candidate-suggester can dedup against what's already committed.
-        # Keyed by session_id; the session lock guarantees one in-flight
-        # turn at a time per key, so writes here don't race.
-        self._turn_saves: dict[str, list[str]] = {}
         # Returns True if the given session is currently on a live voice call.
         # Injected by the CallService at startup (None when voice is disabled →
         # always "not on a call"). Drives the per-turn <call-status> line so the
@@ -1383,13 +1367,22 @@ class Operator:
         self, session_id: str, user_text: str, *,
         language: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        ingest_memory: bool = True,
     ) -> OperatorTurnResult:
+        """One owner turn. `ingest_memory=False` keeps the text out of memory
+        extraction — required whenever the speaker is not the owner (a voice
+        call to a third party), since extracted facts are stored as the
+        owner's own without any further review."""
         # Capture the previous assistant turn BEFORE acquiring the lock —
         # under the lock we'll append the user row first, after which "the
         # previous assistant turn" would no longer be the right thing to
         # show the extractor. Reading outside the lock is safe: the lock
         # only serializes writes via _run_turn / auto_ping.
-        prev_assistant_text = await self._latest_assistant_text(session_id)
+        prev_assistant_text = (
+            await self._latest_assistant_text(session_id) if ingest_memory else None
+        )
+        # The owner's own words, before an ask-relay swaps in a system note.
+        owner_text = user_text
         # If a `presented` ask is open for this chat, the user's message is
         # the answer — relay to the waiting executor, then run the operator
         # turn on a synthetic `[system note: relayed your answer ...]`
@@ -1406,26 +1399,19 @@ class Operator:
                 session_id, user_text, language=language,
                 attachments=attachments,
             )
-            # Capture the operator's saves from THIS turn while still under
-            # the lock — otherwise a fast follow-up turn could clobber
-            # `_turn_saves[session_id]` before we read it.
-            already_saved_this_turn = list(
-                self._turn_saves.pop(session_id, [])
-            )
-        # Fire-and-forget extraction. Skipped if disabled, or if this was
-        # an auto-ping (those don't reach chat_turn anyway).
-        if self._extract_llm is not None:
+        # Fire-and-forget: extraction runs on Mem0's side and takes seconds.
+        # Auto-pings never reach chat_turn, so inbound DMs are never ingested.
+        if ingest_memory:
             task = asyncio.create_task(
-                self._extract_and_propose(
+                self._ingest_turn(
                     session_id=session_id,
-                    user_text=user_text,
+                    user_text=owner_text,
                     prev_assistant_text=prev_assistant_text,
-                    already_saved=already_saved_this_turn,
                 ),
-                name=f"extract-{session_id}",
+                name=f"memory-ingest-{session_id}",
             )
-            self._extraction_tasks.add(task)
-            task.add_done_callback(self._extraction_tasks.discard)
+            self._ingest_tasks.add(task)
+            task.add_done_callback(self._ingest_tasks.discard)
         return result
 
     async def _maybe_relay_ask_answer(
@@ -1522,10 +1508,8 @@ class Operator:
         history needs a procedural marker the model should see on its NEXT turn,
         but which must not itself generate a reply or a user-facing ping (e.g.
         closing out a just-ended voice call so later text turns don't read as
-        still-in-call). Same `[system note: ...]` wrapping as auto_ping, so the
-        operator and the memory extractor treat it identically — the note text
-        MUST therefore be procedural, never a user-attributed preference, or the
-        extractor will paraphrase it into memory (see `_call_start_note`)."""
+        still-in-call). Same `[system note: ...]` wrapping as auto_ping; like it,
+        never ingested into memory."""
         await self._db.ensure_chat_session(session_id)
         await self._db.append_chat_message(
             session_id, "user", f"{AUTO_PING_PREFIX}{note}]",
@@ -2044,7 +2028,7 @@ class Operator:
 
         task = asyncio.create_task(_run())
         # Strong ref so the task isn't GC'd mid-flight (same reason as
-        # _extraction_tasks).
+        # _ingest_tasks).
         self._compression_tasks.add(task)
         task.add_done_callback(self._compression_tasks.discard)
 
@@ -2431,84 +2415,34 @@ class Operator:
                     return text
         return None
 
-    # Note used to wrap citation suggestions for the silent auto-ping that
-    # follows a user turn. The operator's prompt has a matching rule —
-    # derive a clean memory from each citation worth keeping, then call
-    # `save_memory` with the DERIVED text; never save the citation verbatim,
-    # never narrate.
-    _CITATIONS_NOTE_PREFIX = "extractor flagged citations from the user"
-
-    async def _extract_and_propose(
-        self,
-        *,
-        session_id: str,
-        user_text: str,
+    async def _ingest_turn(
+        self, *, session_id: str, user_text: str,
         prev_assistant_text: str | None,
-        already_saved: list[str],
     ) -> None:
-        """Run the candidate-suggester off the hot path. The operator (not
-        this function) owns memory writes — we just route suggestions back
-        to it via a SILENT auto-ping. The operator may then call
-        `save_memory` for any candidates it judges worth keeping; if not,
-        nothing happens.
-
-        `already_saved` is the list of facts the operator committed via
-        `save_memory` during THIS user turn — captured by chat_turn before
-        the scheduling so a fast follow-up turn can't clobber it. The
-        suggester uses it to skip near-duplicates.
-
-        Failures stay visible — we emit a `_Memory extraction failed: ..._`
-        breadcrumb so the user knows when the suggester is broken (LRU
-        otherwise hides the absence)."""
-        assert self._extract_llm is not None  # checked by caller
+        """Hand the owner's turn to memory extraction off the hot path and
+        report the outcome in chat: a `Remembered:` breadcrumb for each fact
+        Mem0 added, or a failure breadcrumb, so a broken extractor is visible
+        rather than silently remembering nothing."""
         try:
-            candidates = await memory_extractor.extract_candidates(
-                self._extract_llm,
-                model=self._extract_model,
-                user_text=user_text,
+            added = await self._memory.ingest_turn(
+                user_text,
                 prev_assistant_text=prev_assistant_text,
-                already_saved=already_saved,
+                source_turn=session_id,
             )
         except Exception as e:
-            text = f"SYSTEM: Memory extraction failed: {summarize_llm_error(e)}"
-            operator_log.exception("memory extraction failed for session %s", session_id)
-            await self._emit_breadcrumb(session_id, text)
-            return
-
-        if not candidates:
-            return
-        # SILENT suggestion auto-ping: the operator gets the candidates as
-        # a system note and may call `save_memory` for any it wants kept.
-        # We do NOT publish chat.reply for the operator's reply text on
-        # this turn — only `save_memory` calls (which emit their own
-        # breadcrumbs via the tool handler) reach the user. The operator
-        # prompt has a matching rule telling it to emit empty content.
-        # The `behavioral` marker is the extractor's read, not a verdict —
-        # it rides along as a suggestion so the operator can weigh it while
-        # choosing `standing`, which stays the operator's call.
-        bullets = "\n".join(
-            f"  • {c.text}" + (" [reads as behavioral]" if c.behavioral else "")
-            for c in candidates
-        )
-        note = (
-            f"{self._CITATIONS_NOTE_PREFIX}. These are RAW QUOTES, not "
-            f"memory text. For any worth keeping, derive a clean, specific, "
-            f"self-contained memory from the citation (resolve names, "
-            f"identifiers, roles into a declarative sentence) and call "
-            f"`save_memory` with the DERIVED text — not the citation "
-            f"verbatim. Ignore citations not worth keeping. Emit empty "
-            f"assistant content — no text reply.\n"
-            f"{bullets}"
-        )
-        try:
-            await self.auto_ping(
-                session_id=session_id, note=note, retrieval_query=None,
+            operator_log.exception("memory ingest failed for session %s", session_id)
+            await self._emit_breadcrumb(
+                session_id, f"SYSTEM: Memory extraction failed: {summarize_llm_error(e)}",
             )
-        except Exception:
-            operator_log.exception(
-                "candidate-suggestion auto-ping failed for session %s",
-                session_id,
-            )
+            return
+        added = [a for a in added if a]
+        if not added:
+            return
+        operator_log.info("memory ingest " + fmt(chat=session_id, added=added))
+        joined = ", ".join(added)
+        if len(joined) > 400:
+            joined = joined[:397] + "…"
+        await self._emit_breadcrumb(session_id, f"SYSTEM: Remembered: {joined}")
 
     async def _emit_breadcrumb(self, session_id: str, text: str) -> None:
         """Append the breadcrumb to chat history (so future turns and
@@ -2715,9 +2649,6 @@ class Operator:
             written = await self._memory.store(
                 [text], source_turn=chat_session_id, standing=standing,
             )
-            # Track for the extractor pass so it doesn't re-suggest a
-            # near-duplicate of what we just wrote.
-            self._turn_saves.setdefault(chat_session_id, []).extend(written)
             operator_log.info("save_memory " + fmt(
                 chat=chat_session_id, written=len(written), text=text,
                 standing=standing,
@@ -2751,10 +2682,9 @@ class Operator:
             return {"saved": written}
 
         if name == "forget_memory":
-            try:
-                memory_id = int(args.get("memory_id"))
-            except (TypeError, ValueError):
-                return {"error": "memory_id (integer) required"}
+            memory_id = str(args.get("memory_id") or "").strip()
+            if not memory_id:
+                return {"error": "memory_id required"}
             # Fetch the text BEFORE delete so the audit log records what was
             # forgotten — otherwise we'd just see a bare id with no context.
             existing = await self._memory.get_by_id(memory_id)

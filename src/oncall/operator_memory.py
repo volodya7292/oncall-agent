@@ -1,773 +1,406 @@
-"""SQLite-backed operator memory with semantic retrieval and LRU eviction.
+"""Operator memory, hosted on the Mem0 Platform.
 
-One row per short declarative fact extracted from a user turn (see
-`memory_extractor.py`). Each row holds the fact text plus a packed-float32
-embedding; retrieval scores all rows with `alpha * cosine + beta *
-token_overlap` and returns the top-K above a relevance floor. Picked rows
-have their `last_accessed_at` bumped — frequently-retrieved entries survive
-LRU eviction at capacity.
+Mem0 owns extraction, deduplication, contradiction handling (its "Dream"
+merge/supersede pass) and storage. This module is a thin async REST client
+plus the two policies Mem0 has no notion of:
 
-This module never decides WHAT to remember (that's the extractor's job) and
-never decides what to forget (LRU does that automatically). The two writes
-are `store(facts)` and the implicit `_maybe_evict()` it triggers when over
-capacity.
+- **Standing instructions** — behavioral rules flagged `standing` in
+  metadata, injected into every session instead of retrieved by topic, and
+  hard-capped. Only an explicit `store(..., standing=True)` sets the flag;
+  automatic extraction never does, so nothing the owner merely mentioned can
+  become a rule the agent obeys unasked.
+- **Per-session exclusion** — rows already shown in a session are excluded
+  inside the search request, not filtered from its output (filtering after
+  the fact spends the whole top-k on shown rows and injects nothing).
+
+Write paths: `ingest_turn` hands one owner turn to Mem0's extractor
+(`infer=True`, asynchronous on Mem0's side — we poll the event so failures
+and results stay visible); `store` writes a fact verbatim (`infer=False`).
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-import numpy as np
+import httpx
 
-from .audit import fmt, operator_log
-from .db import Database
-from .embeddings import (
-    EmbeddingClient,
-    cosine_matrix,
-    hybrid_score,
-    unpack,
-)
 from .metrics import timed
 
 
 log = logging.getLogger(__name__)
 
-# Hard upper bound on a single fact's text length. The extractor's prompt
-# tells it to keep facts short; this is a defense-in-depth ceiling so a
-# misbehaving extractor — or the dedup LLM combining several long facts —
-# can't bloat the prompt budget.
+# Ceiling on one stored fact. Explicit saves are asked to stay ≤200 chars;
+# this is defense in depth against a runaway tool argument.
 MAX_ENTRY_CHARS = 512
+# Bounded extractor inputs so a pasted log can't make every turn expensive.
+_PREV_ASSISTANT_CHAR_CAP = 2000
+_USER_CHAR_CAP = 4000
+# Mem0 rejects longer search queries; the retrieval key puts the turn first,
+# so truncating the tail only drops the oldest borrowed context.
+_QUERY_CHAR_CAP = 4000
 
 
-def _candidate_pairs(
-    cos: np.ndarray, *, alpha: float, beta: float, threshold: float,
-) -> list[tuple[int, int]]:
-    """Upper-triangle (i, j) index pairs whose hybrid score could reach
-    `threshold`. Everything else is provably below it and needs no scoring.
-
-    hybrid = alpha*cos + beta*jaccard and jaccard ≤ 1, so alpha*cos + beta is
-    an upper bound on what a pair can score. A pair already under the gate
-    there cannot cross it once the real Jaccard is known, so pruning on that
-    bound skips work without ever dropping an edge.
-
-    The Jaccard half is what costs — it tokenizes both texts — and the pair
-    count is quadratic in the store size. At the row capacity, scoring every
-    pair is seconds of CPU blocking the event loop inside the dedup task,
-    while the pairs that can actually cluster are a small fraction.
-    """
-    i, j = np.triu_indices(len(cos), k=1)
-    # float64 so the bound is never tightened by float32 rounding at the
-    # exact threshold — the prune must not decide knife-edge pairs.
-    ceiling = alpha * cos[i, j].astype(np.float64) + beta
-    return [
-        (int(i[k]), int(j[k])) for k in np.flatnonzero(ceiling >= threshold)
-    ]
-
-
-def _pick_subcluster(
-    sim: np.ndarray, reviewed: np.ndarray, size: int,
-) -> list[int]:
-    """Choose `size` members of an oversized cluster to show the arbiter.
-
-    Seeds on the strongest pair not yet reviewed, then grows by similarity to
-    the members chosen so far, preferring unreviewed pairs. Every component
-    holds at least one unreviewed edge (reviewed ones never join the graph),
-    so every pass reviews something new.
-
-    Ranking by plain total similarity ignored `reviewed`: once the densest
-    members were all judged, the same subset was picked and re-asked on every
-    pass while the rest of the component was never shown at all.
-    """
-    fresh = np.where(reviewed, 0.0, sim)
-    np.fill_diagonal(fresh, -1.0)
-    a, b = np.unravel_index(int(np.argmax(fresh)), fresh.shape)
-    chosen = [int(a), int(b)]
-    rest = [k for k in range(len(sim)) if k not in chosen]
-    while rest and len(chosen) < size:
-        best = max(rest, key=lambda k: (
-            fresh[k, chosen].sum(), sim[k, chosen].sum(),
-        ))
-        chosen.append(best)
-        rest.remove(best)
-    return chosen
+class MemoryUnavailable(RuntimeError):
+    """Memory is not configured, or Mem0 answered with an error."""
 
 
 @dataclass
 class Memory:
-    id: int
+    id: str
     text: str
-    score: float
-    cosine: float
-    last_accessed_at: str
+    score: float = 0.0
 
 
 class MemoryStore(Protocol):
-    """The slice of OperatorMemory the Operator actually depends on. Tests
-    can substitute any object that satisfies these methods."""
+    """The slice of memory the Operator depends on. Tests substitute any
+    object that satisfies these methods."""
 
     async def store(
         self, facts: list[str], *, source_turn: str | None = None,
         standing: bool = False,
     ) -> list[str]: ...
+    async def ingest_turn(
+        self, user_text: str, *, prev_assistant_text: str | None = None,
+        source_turn: str | None = None,
+    ) -> list[str]: ...
     async def retrieve(
         self, query: str, *, limit: int | None = None,
-        exclude_ids: set[int] | None = None,
+        exclude_ids: set[str] | None = None,
         include_standing: bool = False,
     ) -> list[Memory]: ...
     async def standing_rows(self) -> list[Memory]: ...
-    async def get_by_id(self, memory_id: int) -> Memory | None: ...
-    async def delete_by_id(self, memory_id: int) -> bool: ...
-    async def for_prompt(self, query: str | None) -> str: ...
+    async def get_by_id(self, memory_id: str) -> Memory | None: ...
+    async def delete_by_id(self, memory_id: str) -> bool: ...
     async def entries_count(self) -> int: ...
 
 
-class OperatorMemory:
+def _truncate(text: str, limit: int) -> str:
+    """Keep head and tail: identifiers cluster at either end of a paste."""
+    if len(text) <= limit:
+        return text
+    half = (limit - 5) // 2
+    return f"{text[:half]}\n…\n{text[-half:]}"
+
+
+def _is_standing(metadata: Any) -> bool:
+    # The list endpoint returns metadata booleans as the string "True" while
+    # search and get return a real bool; accept both.
+    value = (metadata or {}).get("standing") if isinstance(metadata, dict) else None
+    return value is True or str(value).lower() == "true"
+
+
+def _valid_id(memory_id: str) -> bool:
+    # Ids reach URL paths from model tool arguments; only real UUIDs pass.
+    try:
+        uuid.UUID(str(memory_id))
+    except ValueError:
+        return False
+    return True
+
+
+class Mem0Memory:
     def __init__(
         self,
-        db: Database,
-        embedder: EmbeddingClient,
         *,
-        embed_model: str,
-        capacity: int,
+        api_key: str,
+        user_id: str,
         max_inject: int,
-        relevance_floor: float,
-        hybrid_alpha: float,
-        hybrid_beta: float,
-        relative_gate: float = 0.6,
-        standing_cap: int = 30,
+        search_threshold: float,
+        standing_cap: int,
+        custom_instructions: str = "",
+        host: str = "https://api.mem0.ai",
+        client: httpx.AsyncClient | None = None,
+        timeout_seconds: float = 20.0,
+        event_poll_seconds: float = 2.0,
+        event_timeout_seconds: float = 120.0,
+        standing_ttl_seconds: float = 60.0,
     ) -> None:
-        self._db = db
-        self._embed = embedder
-        # Standing rows enter EVERY session's context, so they are bounded
-        # independently of `capacity` (which governs the retrieved pool) and
-        # by a much smaller number.
-        self._standing_cap = standing_cap
-        # Name tag written to each row's `model` column. Retrieval filters
-        # to rows whose model matches this; rows from older models are
-        # invisible until `rebuild_stale_embeddings()` re-embeds them.
-        # Tests pass a sentinel string here — production threads the real
-        # model id from settings.oncall_memory_embed_model.
-        self._embed_model = embed_model
-        self._capacity = capacity
+        self._user_id = user_id
         self._max_inject = max_inject
-        self._floor = relevance_floor
-        self._alpha = hybrid_alpha
-        self._beta = hybrid_beta
-        self._relative_gate = relative_gate
+        self._threshold = search_threshold
+        self._standing_cap = standing_cap
+        self._instructions = custom_instructions.strip()
+        self._event_poll = event_poll_seconds
+        self._event_timeout = event_timeout_seconds
+        self._client = client or httpx.AsyncClient(
+            base_url=host,
+            timeout=timeout_seconds,
+            transport=httpx.AsyncHTTPTransport(retries=2),
+        )
+        self._client.headers["Authorization"] = f"Token {api_key}"
+        # Standing rows are read on every turn and every task spawn. Cached so
+        # that is not an HTTP round-trip each time; our own writes invalidate
+        # it, and the TTL bounds staleness for edits made in Mem0's dashboard.
+        self._standing_ttl = standing_ttl_seconds
+        self._standing_cache: tuple[float, list[Memory]] | None = None
+        self._standing_lock = asyncio.Lock()
 
-    # ---- writes ------------------------------------------------------------
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    # ---- transport -----------------------------------------------------------
+
+    async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        try:
+            resp = await self._client.request(method, path, **kwargs)
+        except httpx.HTTPError as e:
+            raise MemoryUnavailable(f"mem0 {method} {path}: {type(e).__name__}: {e}") from e
+        if resp.status_code >= 400 and resp.status_code != 404:
+            raise MemoryUnavailable(
+                f"mem0 {method} {path}: HTTP {resp.status_code}: {resp.text[:300]}"
+            )
+        return resp
+
+    def _scope(self, *extra: dict[str, Any]) -> dict[str, Any]:
+        return {"AND": [{"user_id": self._user_id}, *extra]}
+
+    async def health(self) -> str | None:
+        """None when Mem0 accepts the key, else a one-line reason."""
+        try:
+            resp = await self._request("GET", "/v1/ping/")
+        except MemoryUnavailable as e:
+            return str(e)
+        return None if resp.status_code == 200 else f"HTTP {resp.status_code}"
+
+    # ---- writes ----------------------------------------------------------------
+
+    async def add_verbatim(
+        self, text: str, *, metadata: dict[str, Any] | None = None,
+        immutable: bool = False, timestamp: int | None = None,
+    ) -> str:
+        """Store `text` as-is (no extraction). Returns the new memory id.
+        Synchronous on Mem0's side, unlike `infer=True`."""
+        body: dict[str, Any] = {
+            "messages": [{"role": "user", "content": text}],
+            "user_id": self._user_id,
+            "infer": False,
+        }
+        if metadata:
+            body["metadata"] = metadata
+        if immutable:
+            body["immutable"] = True
+        if timestamp is not None:
+            body["timestamp"] = timestamp
+        resp = await self._request("POST", "/v3/memories/add/", json=body)
+        results = resp.json().get("results") or []
+        if resp.status_code != 200 or not results:
+            raise MemoryUnavailable(f"mem0 add returned no memory: {resp.text[:300]}")
+        return str(results[0]["id"])
 
     async def store(
         self, facts: list[str], *, source_turn: str | None = None,
         standing: bool = False,
     ) -> list[str]:
-        """Embed each fact and INSERT it as a new row; evict by LRU until
-        count ≤ capacity.
+        """Write each fact verbatim. Returns the texts actually written; a
+        standing write past the cap is refused (not evicted — "least recently
+        used" means nothing for rows that are never retrieved), so callers see
+        a shorter list."""
+        written: list[str] = []
+        try:
+            for fact in facts:
+                text = fact.strip()[:MAX_ENTRY_CHARS]
+                if not text:
+                    continue
+                if standing:
+                    current = await self.standing_rows(refresh=True)
+                    if len(current) >= self._standing_cap:
+                        log.warning(
+                            "standing memory cap (%d) reached; refused: %r",
+                            self._standing_cap, text[:80],
+                        )
+                        break
+                metadata: dict[str, Any] = {}
+                if standing:
+                    metadata["standing"] = True
+                if source_turn:
+                    metadata["source_turn"] = source_turn
+                await self.add_verbatim(text, metadata=metadata, immutable=standing)
+                written.append(text)
+        finally:
+            if standing:
+                self._standing_cache = None
+        return written
 
-        `standing=True` marks the row as an instruction about how the agent
-        should behave, which is injected into every session rather than
-        retrieved by relevance. Standing writes past `_standing_cap` are
-        refused (and logged) rather than silently dropping the oldest: these
-        rows are in every context window, so unbounded growth is a prompt-size
-        problem, and an instruction the owner gave should not disappear
-        without a trace.
-
-        No write-time dedup — clusters of near-duplicates are reconciled by
-        the periodic `dedup_pass()` background job, which uses the LLM to
-        tell paraphrase merges from same-template-different-entity cases
-        that embeddings alone confuse.
-
-        Returns the texts that were actually written (in input order).
-        Empty/whitespace/over-length facts are skipped silently. Embedding
-        failures raise — the caller surfaces extraction errors.
-        """
-        cleaned = []
-        for f in facts:
-            s = (f or "").strip().replace("\n", " ")
-            if s and len(s) <= MAX_ENTRY_CHARS:
-                cleaned.append(s)
-        if not cleaned:
+    async def ingest_turn(
+        self, user_text: str, *, prev_assistant_text: str | None = None,
+        source_turn: str | None = None,
+    ) -> list[str]:
+        """Hand one owner turn to Mem0's extractor and wait for the verdict.
+        Returns the facts Mem0 added (empty when it found nothing new). The
+        preceding assistant turn rides along as context so references like
+        "that one" can be resolved; the custom instructions forbid treating
+        it as a source of facts."""
+        text = user_text.strip()
+        if not text:
             return []
+        messages: list[dict[str, str]] = []
+        if prev_assistant_text and prev_assistant_text.strip():
+            messages.append({
+                "role": "assistant",
+                "content": _truncate(prev_assistant_text.strip(), _PREV_ASSISTANT_CHAR_CAP),
+            })
+        messages.append({"role": "user", "content": _truncate(text, _USER_CHAR_CAP)})
+        body: dict[str, Any] = {
+            "messages": messages, "user_id": self._user_id, "infer": True,
+        }
+        if self._instructions:
+            body["custom_instructions"] = self._instructions
+        if source_turn:
+            body["metadata"] = {"source_turn": source_turn}
+        resp = await self._request("POST", "/v3/memories/add/", json=body)
+        event_id = resp.json().get("event_id")
+        if not event_id:
+            raise MemoryUnavailable(f"mem0 add returned no event_id: {resp.text[:300]}")
 
-        if standing:
-            room = self._standing_cap - await self._db.memory_standing_count()
-            if room < len(cleaned):
-                operator_log.info("memory_standing_full " + fmt(
-                    cap=self._standing_cap, refused=len(cleaned) - max(room, 0),
-                ))
-                cleaned = cleaned[:max(room, 0)]
-                if not cleaned:
-                    return []
+        deadline = time.monotonic() + self._event_timeout
+        while True:
+            ev = (await self._request("GET", f"/v1/event/{event_id}/")).json()
+            status = ev.get("status")
+            if status == "SUCCEEDED":
+                return [
+                    str((r.get("data") or {}).get("memory") or "").strip()
+                    for r in ev.get("results") or []
+                    if r.get("event") == "ADD"
+                ]
+            if status == "FAILED":
+                raise MemoryUnavailable(f"mem0 extraction failed: {ev.get('error')}")
+            if time.monotonic() >= deadline:
+                raise MemoryUnavailable(
+                    f"mem0 extraction still {status} after {self._event_timeout:.0f}s"
+                )
+            await asyncio.sleep(self._event_poll)
 
-        vecs = await self._embed.embed(cleaned, kind="document")
-        out: list[str] = []
-        for text, vec in zip(cleaned, vecs):
-            qvec = np.asarray(vec, dtype=np.float32)
-            await self._insert_row(
-                text=text, embedding=qvec, source_turn=source_turn,
-                standing=standing,
-            )
-            out.append(text)
-            await self._maybe_evict()
+    async def delete_by_id(self, memory_id: str) -> bool:
+        if not _valid_id(memory_id):
+            return False
+        resp = await self._request("DELETE", f"/v1/memories/{memory_id}/")
+        self._standing_cache = None
+        return resp.status_code == 200
 
-        operator_log.info("memory_store " + fmt(
-            stored=len(out), capacity=self._capacity, standing=standing,
-        ))
-        return out
-
-    # ---- reads -------------------------------------------------------------
+    # ---- reads -----------------------------------------------------------------
 
     async def retrieve(
         self, query: str, *, limit: int | None = None,
-        exclude_ids: set[int] | None = None,
+        exclude_ids: set[str] | None = None,
         include_standing: bool = False,
     ) -> list[Memory]:
-        """Hybrid retrieval. Returns up to `limit` (default `max_inject`)
-        memories with score ≥ `relevance_floor`, ordered by score desc.
-        Bumps `last_accessed_at` for the returned rows (and only those —
-        below-floor candidates do NOT extend their LRU lifetime).
-
-        `exclude_ids` are dropped BEFORE the top-`limit` cut, so a caller
-        that filters afterwards can't be left with nothing: the callers
-        that exclude (session-injection dedup) want the best `limit`
-        *eligible* memories, not whatever survives of the best `limit`
-        overall. Excluded rows also skip the LRU bump — they were never
-        served.
-
-        Two gates, and they do different jobs. `relevance_floor` is an
-        absolute garbage guard. `relative_gate` is the one that decides
-        relevance: a candidate must score within that fraction of the BEST
-        score this query achieved. Measured on the live 109-row store, an
-        answerable query is spiky — its answer lands at rank 1 with the
-        runner-up far below (0.390 / 0.223 / 0.159 …) — so scaling against
-        the peak separates the answer from the tail without knowing the
-        model's absolute score scale. Across ten known-answer bilingual
-        queries the true positive scored ≥0.98 of the peak, so a 0.6 gate
-        cost nothing while cutting injected counts like 24→5, 31→2, 37→10.
-
-        The peak is taken over ALL rows, deliberately including excluded
-        ones. That is what stops a long-lived session from going blind in
-        reverse: once it has been shown the good matches, the leftovers
-        would otherwise be scaled against each other and the best remaining
-        noise row would always look like a hit. Judged against the query's
-        real peak, it is correctly dropped."""
-        q = (query or "").strip()
+        """Top matches for `query` above the score threshold. Standing rows
+        are excluded unless asked for: they reach every session through
+        `standing_rows`, and surfacing them here too would show them twice
+        under wording that calls them optional."""
+        q = (query or "").strip()[:_QUERY_CHAR_CAP]
         if not q:
             return []
-        lim = limit if limit is not None else self._max_inject
-        # Auto-injection callers get standing rows wholesale through their own
-        # note, so scoring them here would inject a topic-matching instruction
-        # twice and, at the peak, drag the relative gate up over the facts.
-        # An explicit lookup (`include_standing=True`) has no such note: the
-        # searcher must be able to find an instruction it was only told about.
-        rows = [
-            r for r in await self._all_rows()
-            if include_standing or not r["standing"]
-        ]
-        if not rows:
-            return []
-
-        # Rolling "memory" window (surfaced in /status). Scoped to the real
-        # retrieval work — embed + score + LRU bump. The empty-query/no-rows
-        # exits above are deliberately outside it: they return in ~0ms and
-        # would drag the percentiles toward zero.
-        with timed("memory") as t:
-            embed_start = time.monotonic()
-            try:
-                qvec_list = (await self._embed.embed([q], kind="query"))[0]
-            except Exception:
-                log.exception("embedding call failed in retrieve()")
-                t.ok = False
-                return []
-            embed_s = time.monotonic() - embed_start
-            score_start = time.monotonic()
-            qvec = np.asarray(qvec_list, dtype=np.float32)
-            matrix = np.vstack([unpack(r["embedding"]) for r in rows])
-            cosines = cosine_matrix(qvec, matrix)
-
-            all_scored: list[tuple[float, float, dict[str, Any]]] = []
-            for r, c in zip(rows, cosines):
-                score = hybrid_score(
-                    float(c), q, r["text"],
-                    alpha=self._alpha, beta=self._beta,
-                )
-                all_scored.append((score, float(c), r))
-            # Peak over everything, excluded rows included — see docstring.
-            peak = max((s for s, _, _ in all_scored), default=0.0)
-            cut = max(self._floor, self._relative_gate * peak)
-            scored = [
-                t for t in all_scored
-                if t[0] >= cut
-                and not (exclude_ids and int(t[2]["id"]) in exclude_ids)
-            ]
-            scored.sort(key=lambda t: t[0], reverse=True)
-            picked = scored[:lim]
-            score_s = time.monotonic() - score_start
-
-            if picked:
-                await self._bump_access(*(int(p[2]["id"]) for p in picked))
-
-        operator_log.info("memory_retrieve " + fmt(
-            candidates=len(rows),
-            picked=len(picked),
-            max_score=round(picked[0][0], 3) if picked else 0.0,
-            embed_ms=int(embed_s * 1000),
-            score_ms=int(score_s * 1000),
-        ))
-        return [
-            Memory(
-                id=int(r["id"]),
-                text=r["text"],
-                score=score,
-                cosine=cos_val,
-                last_accessed_at=r["last_accessed_at"],
-            )
-            for score, cos_val, r in picked
-        ]
-
-    async def standing_rows(self) -> list[Memory]:
-        """The agent's standing behavioral instructions, in insertion order.
-
-        No query, no scoring, no LRU bump: these are selected by flag, so
-        they are returned whole and identically on every call — which is what
-        lets the injected note stay byte-stable across turns."""
-        rows = await self._db.memory_standing_rows(self._standing_cap)
-        return [
-            Memory(
-                id=int(r["id"]),
-                text=str(r["text"]),
-                score=0.0,
-                cosine=0.0,
-                last_accessed_at=str(r["last_accessed_at"]),
-            )
-            for r in rows
-        ]
-
-    async def for_prompt(self, query: str | None) -> str:
-        """Render the memory section for the system prompt. `None` skips
-        retrieval entirely (used for auto-ping turns whose synthetic note
-        isn't a meaningful retrieval key)."""
-        if query is None:
-            return "(no relevant entries this turn)"
-        memories = await self.retrieve(query)
-        if not memories:
-            return "(no relevant entries this turn)"
-        return "\n".join(f"- {m.text}" for m in memories)
-
-    async def get_by_id(self, memory_id: int) -> Memory | None:
-        """Look up a memory by its primary key. Used by the operator's
-        `reply_to_dm` tool to verify that an `authority_memory_id` actually
-        resolves to an existing row before sending an autonomous reply.
-        Returns None if the id doesn't exist (or has been LRU-evicted)."""
-        row = await self._db.memory_get(memory_id, self._embed_model)
-        if row is None:
-            return None
-        return Memory(
-            id=int(row["id"]),
-            text=str(row["text"]),
-            score=0.0,
-            cosine=0.0,
-            last_accessed_at=str(row["last_accessed_at"]),
-        )
-
-    async def delete_by_id(self, memory_id: int) -> bool:
-        """Hard-delete one memory by id. Returns True if a row was deleted,
-        False if no row matched (already evicted, wrong id, or wrong model).
-        Used by the operator's `forget_memory` tool when the user explicitly
-        asks to drop a memory. We filter on `model` so a stale-but-pending-
-        rebuild row can't be deleted via a different model's id namespace."""
-        return await self._db.memory_delete(memory_id, self._embed_model)
-
-    async def dedup_pass(
-        self,
-        llm: Any,
-        *,
-        model: str,
-        reasoning_effort: str | None = "medium",
-        cluster_threshold: float = 0.60,
-        max_cluster_size: int = 8,
-    ) -> dict[str, int]:
-        """Background dedup pass. Finds connected components in the cosine
-        graph (edges ≥ `cluster_threshold`), then for each multi-row cluster
-        asks the LLM to either consolidate into one entry or keep separate.
-
-        The LLM is the arbiter, not heuristics — write-time dedup catches only
-        near-identical phrasing; this pass picks up the harder cases (templates
-        that swap one detail) and treats them correctly by reading the texts.
-
-        `cluster_threshold` is calibrated to the embed model's score scale and
-        does NOT transfer across models — re-measure it on real data if you
-        change the embedder. It cannot simply be lowered to catch more: edges
-        here are transitive (union-find), so a gate below the point where the
-        graph goes sparse fuses the whole store into one component, which
-        `max_cluster_size` then truncates — silently dropping the rest. On the
-        real 95-row store under embeddinggemma: gate 0.60 gives 11 clusters,
-        largest 11, 3 rows dropped; gate 0.30 gives ONE cluster of 93 and
-        drops 85. Lower is not safer, it is blinder.
-
-        Cross-language duplicates are out of reach for any gate: the same fact
-        in Ukrainian and English scores ~0.30, below anything that keeps the
-        graph sparse. Merging those would need pairwise candidates instead of
-        connected components.
-
-        Returns counts for logging. Failures only log; the pass is idempotent
-        so the next run retries."""
-        rows = await self._all_rows()
-        if len(rows) < 2:
-            return {"clusters_found": 0, "merged": 0, "kept": 0, "failed": 0}
-        matrix = np.vstack([unpack(r["embedding"]) for r in rows])
-        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        normed = matrix / norms
-        cos = normed @ normed.T
-
-        # Pairs the LLM has previously reviewed and decided NOT to merge.
-        # Skipping these as edges avoids burning LLM calls re-asking every
-        # 5 min about the same John-vs-Jane situations. id_a < id_b.
-        skip = await self._load_skip_pairs()
-
-        n = len(rows)
-
-        def _build_clusters() -> list[list[int]]:
-            """Connected components of the hybrid-similarity graph. Hybrid
-            (the same formula retrieval uses) is alpha*cos + beta*Jaccard
-            token overlap: identifier-rich texts that embeddings rank low get
-            a fuzzy boost, and pure-template paraphrases still cluster on
-            cosine. Only candidate pairs are scored — see _candidate_pairs."""
-            parent = list(range(n))
-
-            def find(x: int) -> int:
-                while parent[x] != x:
-                    parent[x] = parent[parent[x]]
-                    x = parent[x]
-                return x
-
-            for i, j in _candidate_pairs(
-                cos, alpha=self._alpha, beta=self._beta,
-                threshold=cluster_threshold,
-            ):
-                a = int(rows[i]["id"])
-                b = int(rows[j]["id"])
-                if (min(a, b), max(a, b)) in skip:
-                    continue
-                h = hybrid_score(
-                    float(cos[i, j]), rows[i]["text"], rows[j]["text"],
-                    alpha=self._alpha, beta=self._beta,
-                )
-                if h < cluster_threshold:
-                    continue
-                ra, rb = find(i), find(j)
-                if ra != rb:
-                    parent[ra] = rb
-            groups: dict[int, list[int]] = {}
-            for i in range(n):
-                groups.setdefault(find(i), []).append(i)
-            return [g for g in groups.values() if len(g) >= 2]
-
-        # Off the event loop. Pair count is quadratic in the store size, and
-        # the Jaccard half is pure Python: at capacity this is seconds of CPU
-        # while the same loop is serving chat turns. A thread does not make it
-        # cheaper, only preemptible.
-        clusters = await asyncio.to_thread(_build_clusters)
-        if not clusters:
-            return {"clusters_found": 0, "merged": 0, "kept": 0, "failed": 0}
-
-        merged_n = kept_n = failed_n = 0
-        for indices in clusters:
-            if len(indices) > max_cluster_size:
-                # Scored here, over one cluster, rather than read out of a
-                # full pairwise matrix we deliberately never build.
-                m = len(indices)
-                sub = np.zeros((m, m), dtype=np.float64)
-                reviewed = np.zeros((m, m), dtype=bool)
-                for a in range(m):
-                    for b in range(a + 1, m):
-                        ia, ib = indices[a], indices[b]
-                        sub[a, b] = sub[b, a] = hybrid_score(
-                            float(cos[ia, ib]),
-                            rows[ia]["text"], rows[ib]["text"],
-                            alpha=self._alpha, beta=self._beta,
-                        )
-                        x, y = int(rows[ia]["id"]), int(rows[ib]["id"])
-                        reviewed[a, b] = reviewed[b, a] = (
-                            (min(x, y), max(x, y)) in skip
-                        )
-                indices = [
-                    indices[k]
-                    for k in _pick_subcluster(sub, reviewed, max_cluster_size)
-                ]
-            cluster_rows = [rows[i] for i in indices]
-            cluster_ids = {int(r["id"]) for r in cluster_rows}
-            try:
-                decision = await self._dedup_decide(
-                    llm, model=model, reasoning_effort=reasoning_effort,
-                    cluster_rows=cluster_rows,
-                )
-            except Exception:
-                log.exception("memory_dedup: LLM call failed for cluster %s",
-                              sorted(cluster_ids))
-                failed_n += 1
-                continue
-            raw_groups = (decision or {}).get("merge_groups") or []
-            if not isinstance(raw_groups, list):
-                raw_groups = []
-            # Validate. Each group: ids ⊆ cluster_ids, |ids| ≥ 2, text non-empty
-            # and within MAX_ENTRY_CHARS. Skip silently anything malformed —
-            # the rest of the cluster is untouched.
-            valid_groups: list[tuple[list[int], str]] = []
-            for g in raw_groups:
-                if not isinstance(g, dict):
-                    continue
-                raw_ids = g.get("ids") or []
-                if not isinstance(raw_ids, list):
-                    continue
-                try:
-                    gids = [int(i) for i in raw_ids if int(i) in cluster_ids]
-                except (TypeError, ValueError):
-                    continue
-                if len(gids) < 2:
-                    continue
-                text = (g.get("text") or "").strip()
-                if not text or len(text) > MAX_ENTRY_CHARS:
-                    operator_log.info("memory_dedup_bad_merge " + fmt(
-                        ids=sorted(gids), reason="empty-or-overlong",
-                    ))
-                    failed_n += 1
-                    continue
-                valid_groups.append((gids, text))
-            merged_ids = {i for gids, _ in valid_groups for i in gids}
-            if not valid_groups:
-                kept_n += 1
-                operator_log.info("memory_dedup_keep " + fmt(
-                    ids=sorted(cluster_ids),
-                ))
-            else:
-                for gids, text in valid_groups:
-                    try:
-                        vec = (await self._embed.embed(
-                            [text], kind="document",
-                        ))[0]
-                    except Exception:
-                        log.exception("memory_dedup: embed failed for merged text")
-                        failed_n += 1
-                        continue
-                    # The survivor inherits standing from ANY member of the
-                    # group. A behavioral instruction merged with a plain
-                    # paraphrase of itself must not come back as a
-                    # relevance-gated row — that would silently un-pin an
-                    # instruction the owner never withdrew.
-                    await self._insert_row(
-                        text=text,
-                        embedding=np.asarray(vec, dtype=np.float32),
-                        source_turn="dedup",
-                        standing=any(
-                            bool(r["standing"]) for r in cluster_rows
-                            if int(r["id"]) in set(gids)
-                        ),
-                    )
-                    for rid in gids:
-                        await self.delete_by_id(rid)
-                    merged_n += 1
-                    operator_log.info("memory_dedup_merge " + fmt(
-                        ids=sorted(gids), text=text,
-                    ))
-            # Record skip pairs for every surviving id-pair the LLM saw and
-            # did NOT merge. Survivors = cluster ids minus anything that
-            # ended up in a merge group (those rows are deleted; recording
-            # pairs that reference them is moot and would just clutter the
-            # table).
-            survivors = sorted(cluster_ids - merged_ids)
-            new_skip_pairs: list[tuple[int, int]] = []
-            for ai in range(len(survivors)):
-                for bi in range(ai + 1, len(survivors)):
-                    new_skip_pairs.append((survivors[ai], survivors[bi]))
-            if new_skip_pairs:
-                await self._record_skip_pairs(new_skip_pairs)
-        operator_log.info("memory_dedup " + fmt(
-            clusters_found=len(clusters),
-            merged=merged_n, kept=kept_n, failed=failed_n,
-        ))
-        return {
-            "clusters_found": len(clusters),
-            "merged": merged_n,
-            "kept": kept_n,
-            "failed": failed_n,
+        extra: list[dict[str, Any]] = []
+        if not include_standing:
+            extra.append({"metadata": {"standing": {"ne": True}}})
+        excluded = sorted(i for i in (exclude_ids or ()) if _valid_id(i))
+        if excluded:
+            extra.append({"NOT": [{"memory_ids": excluded}]})
+        body = {
+            "query": q,
+            "filters": self._scope(*extra),
+            "top_k": limit or self._max_inject,
+            "threshold": self._threshold,
+            "latest_only": True,
         }
+        # Rolling "memory" window surfaced in /status.
+        with timed("memory"):
+            resp = await self._request("POST", "/v3/memories/search/", json=body)
+        return [
+            Memory(id=str(r["id"]), text=str(r.get("memory") or ""),
+                   score=float(r.get("score") or 0.0))
+            for r in resp.json().get("results") or []
+        ]
 
-    async def _load_skip_pairs(self) -> set[tuple[int, int]]:
-        return await self._db.memory_load_skip_pairs()
+    async def standing_rows(self, *, refresh: bool = False) -> list[Memory]:
+        """Every standing row, oldest first."""
+        async with self._standing_lock:
+            cached = self._standing_cache
+            if (not refresh and cached is not None
+                    and time.monotonic() - cached[0] < self._standing_ttl):
+                return list(cached[1])
+            resp = await self._request(
+                "POST", "/v3/memories/",
+                params={"page_size": 200},
+                json={
+                    "filters": self._scope({"metadata": {"standing": True}}),
+                    "latest_only": True,
+                },
+            )
+            rows = sorted(
+                (r for r in resp.json().get("results") or []
+                 if _is_standing(r.get("metadata"))),
+                key=lambda r: str(r.get("created_at") or ""),
+            )
+            memories = [Memory(id=str(r["id"]), text=str(r.get("memory") or "")) for r in rows]
+            self._standing_cache = (time.monotonic(), memories)
+            return list(memories)
 
-    async def _record_skip_pairs(self, pairs: list[tuple[int, int]]) -> None:
-        await self._db.memory_record_skip_pairs(pairs)
-
-    async def _dedup_decide(
-        self,
-        llm: Any,
-        *,
-        model: str,
-        reasoning_effort: str | None,
-        cluster_rows: list[dict[str, Any]],
-    ) -> dict[str, Any] | None:
-        """One LLM call: decide merge-or-keep for one cluster. Returns the
-        parsed JSON dict or None on parse/empty response (caller logs)."""
-        # `recorded_at` is what lets the arbiter tell a paraphrase from a fact
-        # that CHANGED. Without it, "lives in Berlin" and "lives in Munich"
-        # look like a contradiction it must keep both of — and the operator is
-        # left holding two mutually exclusive memories with no way to know
-        # which one is current.
-        items = json.dumps(
-            [
-                {
-                    "id": int(r["id"]),
-                    "text": str(r["text"]),
-                    "recorded_at": str(r["created_at"]),
-                }
-                for r in sorted(cluster_rows, key=lambda r: str(r["created_at"]))
-            ],
-            ensure_ascii=False,
-        )
-        system = (
-            "You deduplicate stored memories. Return STRICT JSON, no prose.\n"
-            "Schema:\n"
-            '  {"merge_groups": [\n'
-            '    {"ids": [<int>, <int>, ...], "text": "<consolidated text '
-            "preserving every detail from each member, ≤512 chars>\"},\n"
-            "    ...\n"
-            "  ]}\n"
-            "Each entry is a SUBSET of the input memories you want to "
-            "consolidate into one new entry. Memories are listed oldest-first "
-            "and each carries `recorded_at`.\n"
-            "Merge a group when its members either:\n"
-            "  (a) state the SAME fact (paraphrases of one another), or\n"
-            "  (b) state the same attribute of the SAME entity, but the value "
-            "CHANGED over time — the user moved, renamed something, switched "
-            "tools. Here the NEWEST `recorded_at` wins: write the consolidated "
-            "text as the current fact. Keep the superseded value only if it "
-            "still carries usable signal (e.g. 'uses Postgres, migrated from "
-            "MySQL in 2024'), and never phrase it so the stale value could be "
-            "mistaken for current.\n"
-            "Memories that refer to DIFFERENT entities (person, host, "
-            "version, identifier, scope, occasion, etc.) MUST NOT share a "
-            "group — a newer memory about a different entity supersedes "
-            "nothing.\n"
-            "(b) covers standing attributes only. A record of something that "
-            "happened is not an attribute that can change — records of two "
-            "different occasions supersede each other never, however alike "
-            "they read. Two records of the SAME occasion are ordinary "
-            "paraphrases and merge under (a).\n"
-            "A preference or opinion that merely differs is NOT automatically "
-            "superseded; people hold several at once. Supersede only when the "
-            "newer memory is genuinely incompatible with the older.\n"
-            "Memories not listed in any group are kept as-is.\n"
-            "If nothing should be merged, return {\"merge_groups\": []}.\n"
-            "When in doubt, omit — losing information is worse than keeping "
-            "a duplicate."
-        )
-        resp = await llm.chat(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": "Memories:\n" + items},
-            ],
-            tools=[],
-            max_tokens=2048,
-            reasoning_effort=reasoning_effort,
-        )
-        content = (resp.get("content") or "").strip()
-        if not content:
+    async def get_by_id(self, memory_id: str) -> Memory | None:
+        if not _valid_id(memory_id):
             return None
-        if content.startswith("```"):
-            stripped = content.strip("`").strip()
-            if stripped.lower().startswith("json"):
-                stripped = stripped[4:].lstrip()
-            content = stripped
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError:
-            log.warning("memory_dedup: non-JSON response %r", content[:200])
+        resp = await self._request("GET", f"/v1/memories/{memory_id}/")
+        if resp.status_code != 200:
             return None
-        return parsed if isinstance(parsed, dict) else None
+        row = resp.json()
+        # One API key covers the whole Mem0 project; only this owner's rows count.
+        if row.get("user_id") != self._user_id:
+            return None
+        return Memory(id=str(row["id"]), text=str(row.get("memory") or ""))
 
     async def entries_count(self) -> int:
-        """Count of rows usable for retrieval — i.e., embedded with the
-        currently-configured model. Rows pending a rebuild are excluded
-        (`stale_count()` exposes that bucket separately)."""
-        return await self._db.memory_entries_count(self._embed_model)
-
-    # ---- internals ---------------------------------------------------------
-
-    async def _all_rows(self) -> list[dict[str, Any]]:
-        """Returns rows embedded with the CURRENT model only. Rows from older
-        models are invisible to retrieval + dedup until rebuilt — that's the
-        invariant `rebuild_stale_embeddings()` restores."""
-        return await self._db.memory_all_rows(self._embed_model)
-
-    async def _insert_row(
-        self,
-        *,
-        text: str,
-        embedding: np.ndarray,
-        source_turn: str | None,
-        standing: bool = False,
-    ) -> int:
-        return await self._db.memory_insert(
-            text=text,
-            embedding=embedding.tobytes(),
-            model=self._embed_model,
-            source_turn=source_turn,
-            standing=standing,
+        resp = await self._request(
+            "POST", "/v3/memories/", params={"page_size": 1},
+            json={"filters": {"user_id": self._user_id}},
         )
+        return int(resp.json().get("count") or 0)
 
-    # ---- rebuild on model change ------------------------------------------
-
-    async def stale_count(self) -> int:
-        """Rows whose `model` doesn't match the configured embedder. These
-        are skipped by retrieval until `rebuild_stale_embeddings()` runs."""
-        return await self._db.memory_stale_count(self._embed_model)
-
-    async def rebuild_stale_embeddings(self, *, batch: int = 32) -> dict[str, int]:
-        """Re-embed every row whose stored model differs from the configured
-        one. Walks in batches so a long-running call doesn't load the whole
-        table into memory and so a partial failure leaves the unconverted
-        tail recoverable on next startup. Returns counts for the notifier.
-        """
-        rebuilt = 0
-        failed = 0
+    async def list_all(self) -> list[dict[str, Any]]:
+        """Every row for this owner, raw. Used by the legacy import."""
+        out: list[dict[str, Any]] = []
+        page = 1
         while True:
-            stale = await self._db.memory_select_stale_batch(
-                self._embed_model, batch,
+            resp = await self._request(
+                "POST", "/v3/memories/", params={"page": page, "page_size": 200},
+                json={"filters": {"user_id": self._user_id}},
             )
-            if not stale:
-                break
-            texts = [r["text"] for r in stale]
-            try:
-                vecs = await self._embed.embed(texts, kind="document")
-            except Exception:
-                log.exception("rebuild_stale_embeddings: embed call failed (batch of %d)", len(texts))
-                failed += len(texts)
-                # Don't loop forever on a persistent failure — bail and let
-                # the next startup retry.
-                break
-            updates = [
-                (int(r["id"]), np.asarray(v, dtype=np.float32).tobytes())
-                for r, v in zip(stale, vecs)
-            ]
-            await self._db.memory_update_embeddings(updates, self._embed_model)
-            rebuilt += len(updates)
-        operator_log.info(
-            "memory_rebuild " + fmt(
-                rebuilt=rebuilt, failed=failed, model=self._embed_model,
-            )
-        )
-        return {"rebuilt": rebuilt, "failed": failed}
+            data = resp.json()
+            out.extend(data.get("results") or [])
+            if not data.get("next"):
+                return out
+            page += 1
 
-    async def _bump_access(self, *row_ids: int) -> None:
-        await self._db.memory_bump_access(list(row_ids))
 
-    async def _maybe_evict(self) -> None:
-        await self._db.memory_evict_over_capacity(self._capacity, self._embed_model)
+class DisabledMemory:
+    """Stand-in when MEM0_API_KEY is unset: the operator still runs, reads
+    come back empty, and explicit writes fail loudly instead of pretending."""
+
+    async def aclose(self) -> None:
+        return None
+
+    async def store(self, facts, *, source_turn=None, standing=False) -> list[str]:
+        raise MemoryUnavailable("memory is disabled: MEM0_API_KEY is not set")
+
+    async def ingest_turn(self, user_text, *, prev_assistant_text=None, source_turn=None) -> list[str]:
+        return []
+
+    async def retrieve(self, query, *, limit=None, exclude_ids=None, include_standing=False) -> list[Memory]:
+        return []
+
+    async def standing_rows(self) -> list[Memory]:
+        return []
+
+    async def get_by_id(self, memory_id) -> Memory | None:
+        return None
+
+    async def delete_by_id(self, memory_id) -> bool:
+        return False
+
+    async def entries_count(self) -> int:
+        return 0

@@ -11,11 +11,9 @@
 #     docker exec -it oncall claude login
 # The credential persists on the mounted /root/.claude volume.
 #
-# Run (single container; Ollama already on the host, no compose):
+# Run (single container, no compose):
 #     docker run -d --name oncall --restart unless-stopped \
 #       -e ONCALL_BIND_HOST=0.0.0.0 \
-#       -e ONCALL_OLLAMA_HOST=http://host.docker.internal:11434 \
-#       --add-host host.docker.internal:host-gateway \
 #       -v oncall_state:/root/.oncall -v oncall_claude:/root/.claude \
 #       --expose 8765 \
 #       ghcr.io/<owner>/oncall-agent:latest

@@ -45,61 +45,29 @@ Write tests when they capture:
 
 When in doubt, lean toward fewer, denser tests. A 200-line test file that proves 5 hard properties beats a 1000-line file that re-asserts the source code.
 
-## Operator memory: cosine proposes, the LLM decides
+## Operator memory: hosted on Mem0
 
-The pipeline is therefore deliberately shaped:
+Memory lives on the Mem0 Platform ([operator_memory.py](src/oncall/operator_memory.py), a thin REST client on `httpx`). Mem0 owns extraction, deduplication and consolidation (its "Dream" merge/supersede pass), so there is no local dedup, eviction or embedder to tune. We deliberately do not use the `mem0ai` SDK: it sends PostHog telemetry on every call (aliased to the account e-mail) unless `MEM0_TELEMETRY=False` is set before import, blocks the event loop with a `requests` ping in its constructor, and pulls qdrant-client/sqlalchemy into the image.
 
-1. **Write time always INSERTs** (`OperatorMemory.store`). Near-duplicates are
-   expected to exist transiently — that is not a bug.
-2. **`dedup_pass()` (periodic, `_memory_dedup_loop` in [api.py](src/oncall/api.py))**
-   builds clusters from the cosine graph at `cluster_threshold=0.60`. Cosine is
-   only a *candidate generator* here; it is never the verdict.
+What stays ours, because Mem0 has no notion of it:
 
-   That threshold is calibrated to `embeddinggemma:300m` and does not survive an
-   embedder swap — re-measure it on real rows if you change models. It also
-   cannot just be lowered to "catch more": edges are transitive (union-find), so
-   a gate below the sparsity point fuses the whole store into one component that
-   `max_cluster_size` then truncates, silently dropping the remainder. Measured
-   on the live 95-row store: gate 0.60 → 11 clusters, largest 11, 3 rows dropped;
-   gate 0.30 → ONE cluster of 93, 85 dropped. Lower is blinder, not safer.
-3. **An LLM arbitrates each cluster**, reading the actual texts and returning
-   merge groups. Its prompt says entities that differ (person, host, version,
-   identifier) MUST NOT merge, and "when in doubt, omit".
-4. **Keep-separate verdicts persist to `memory_dedup_skip_pairs`** so the next
-   pass doesn't re-litigate the same cluster (and doesn't re-burn LLM calls) —
-   which is why a high-cosine pair still sitting in `operator_memories` is
-   usually *evidence the system worked*, not evidence it failed.
+1. **Standing instructions.** Flagged `standing` in metadata, injected into every session and every executor task, and hard-capped (`oncall_memory_standing_cap`). Only an explicit `save_memory(standing=true)` sets the flag; automatic extraction never does, so nothing the owner merely mentioned becomes a rule the agent obeys unasked.
+2. **Per-session exclusion.** Rows already shown in a session are excluded *inside* the search request (`NOT memory_ids`). Filtering the top-k afterwards is how the old store went memory-blind.
+3. **Who gets ingested.** Only owner turns through `Operator.chat_turn`. Auto-pings (inbound DMs, task results) never reach it, and voice calls to third parties pass `ingest_memory=False`. Mem0 stores what it extracts as the owner's facts with no review, so this gate is the safety boundary.
 
-Corollary for anyone auditing memory health: a pile of cosine-similar rows
-proves nothing on its own. Check `memory_dedup_skip_pairs` before concluding
-dedup is broken — the pair has probably already been judged.
+Extraction rules sent with every ingested turn live in [prompts/memory_extraction.md](src/oncall/prompts/memory_extraction.md) — the same editing rules as the other prompts apply.
 
-Retrieval note: memories are injected as `[memory note: ...]` **user-role
-messages**, not into the system prompt (see `Operator._build_system_prompt`),
-so the system-prompt + history prefix stays byte-stable and the provider's KV
-cache keeps hitting across turns.
+Observed API quirks the code relies on (re-verify with the live test after any Mem0 change): `infer=True` adds are asynchronous (poll `/v1/event/{id}/`), `infer=False` adds are synchronous; the list endpoint returns metadata booleans as the string `"True"` while search returns real bools; filters reject an `id` key, exclusion goes through `memory_ids`.
+
+`oncall_memory_search_threshold` is on Mem0's combined score scale (semantic + BM25 + entity), not the old embedder's. Re-measure it on real rows before moving it.
 
 ## Memory testing
 
-`tests/test_operator_memory.py` includes live integration tests against a local Ollama daemon running `embeddinggemma:300m`. They skip unless `ONCALL_RUN_EMBEDDING_TESTS=1` is set. To run them locally:
+`tests/test_operator_memory.py` drives `Mem0Memory` against an in-process fake of Mem0's endpoints, plus a live test against the real platform under a throwaway `user_id` that is deleted afterwards. The live test skips unless enabled:
 
 ```sh
-ollama pull embeddinggemma:300m   # one-time
-ONCALL_RUN_EMBEDDING_TESTS=1 uv run pytest tests/test_operator_memory.py -v
+ONCALL_RUN_MEM0_TESTS=1 MEM0_API_KEY=... uv run --extra dev pytest tests/test_operator_memory.py -v
 ```
-
-The embedder **must be multilingual** — memories are stored in whichever language
-the user spoke, so the store is bilingual and queries arrive in either language.
-The previous default (`nomic-embed-text`, English-only) encoded *language* rather
-than meaning: measured on the live 95-row store, a Ukrainian query retrieved the
-English fact it asked for at rank 89/95, and identical facts in different
-languages scored *lower* (cos 0.40) than random unrelated same-language pairs
-(0.59). Cross-language recall@10 was 11%; under `embeddinggemma:300m` it is 100%.
-Same 768 dims, so the stored blob format is unchanged.
-
-`relevance_floor` and `cluster_threshold` are both calibrated to the live model's
-score scale and do NOT transfer across embedders — re-measure both on real rows
-before changing the model, and expect nothing about the old numbers to hold.
 
 ## Exception handling
 
@@ -125,7 +93,7 @@ The image ships **no `sqlite3` binary** — reach the DB through the stdlib `sql
 docker exec root-oncall-agent-1 python -c "
 import sqlite3
 c = sqlite3.connect('file:/root/.oncall/state.db?mode=ro', uri=True)
-for r in c.execute('SELECT id, text, last_accessed_at FROM operator_memories ORDER BY last_accessed_at DESC'):
+for r in c.execute('SELECT id, state, created_at FROM tasks ORDER BY created_at DESC LIMIT 20'):
     print(r)
 "
 

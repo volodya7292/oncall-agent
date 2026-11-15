@@ -254,57 +254,31 @@ class Settings(BaseSettings):
     # wait could flip presence to offline at the boundary.
     oncall_developer_wait_seconds: int = 45
 
-    # Operator memory — semantic, LRU-evicted. Stored in SQLite alongside the
-    # rest of state. Capacity caps the number of rows; when extraction would
-    # exceed it, the least-recently-retrieved rows are dropped. Hybrid score
-    # at retrieval time is `alpha * cosine + beta * token_overlap`, candidates
-    # below `relevance_floor` are not injected.
-    #
-    # Headroom for the user's own history (what they did, where they were),
-    # which memory now keeps as a record. It accrues faster than standing
-    # facts and is retrieved less often, so it is what LRU comes for first.
-    # Raising the cap buys time; it does not change that order.
-    oncall_memory_capacity: int = 1000
-    # Local Ollama embedder. Picked over hosted gateways for ~30× lower
-    # latency (~12ms median vs ~1.8s) and no rate limits. With
-    # OLLAMA_KEEP_ALIVE=4h on the embed calls, the model stays resident in
-    # Ollama across our daemon restarts — first user message after
-    # `oncall service start` skips the cold load. Pull first:
-    #     ollama pull embeddinggemma:300m
-    #
-    # MUST be multilingual: the store is bilingual (facts are written in
-    # whichever language the user spoke) and queries arrive in either. The
-    # previous default, nomic-embed-text, is English-only and encoded language
-    # rather than meaning — measured on the real 95-row store, a Ukrainian
-    # query retrieved the English fact it was asking for at rank 89/95 (11%
-    # cross-language recall@10). Under embeddinggemma the same eval scores
-    # 100%. Same 768 dims, so the stored blob format is unchanged.
-    #
-    # `relevance_floor` and dedup's `cluster_threshold` are calibrated to this
-    # model's score scale and do NOT transfer — re-measure both if you swap it.
-    oncall_memory_embed_model: str = "embeddinggemma:300m"
-    # Where to find the Ollama daemon.
-    oncall_ollama_host: str = "http://localhost:11434"
-    # Cheap conversational model for extracting facts from the user's turn.
-    # Empty string disables auto-extraction (operator memory still works for
-    # retrieval, just never grows). Defaults to the operator model.
-    oncall_memory_extract_model: str = ""
+    # Operator memory lives on the Mem0 Platform (see operator_memory.py):
+    # Mem0 extracts, deduplicates and consolidates; we only keep standing
+    # instructions and per-session exclusion. Without a key memory is
+    # disabled — the operator runs, but remembers nothing.
+    mem0_api_key: str = ""
+    oncall_mem0_host: str = "https://api.mem0.ai"
+    # Mem0 entity every memory is scoped to. One owner, one id; changing it
+    # makes every existing memory invisible.
+    oncall_mem0_user_id: str = "owner"
+    # Minimum Mem0 search score for a memory to be injected — a garbage guard;
+    # `max_inject` does the real limiting. Mem0's combined score (semantic +
+    # BM25 + entity) is not on the old embedder's scale. Probed on synthetic
+    # rows: true matches 0.23–0.45 (a paraphrased question scored lowest),
+    # unrelated rows 0.08–0.13. Re-measure on the real store before moving it.
+    oncall_memory_search_threshold: float = 0.15
     # Model that judges readonly-vs-mutating for every shell command the
     # executor runs (see classifier.py). It sits on the hot path of each Bash
     # call, so a cheap fast model is the intent — judgment, not knowledge, is
-    # what it needs. Empty falls back to the extract model, then the operator
-    # model. Whatever is set here must be valid for ONCALL_OPERATOR_BACKEND:
-    # the classifier shares the operator's LLM client, not a separate one.
+    # what it needs. Empty falls back to the operator model. Whatever is set
+    # here must be valid for ONCALL_OPERATOR_BACKEND: the classifier shares
+    # the operator's LLM client, not a separate one.
     #
     # Unreachable or misconfigured means every shell command escalates to an
     # approval prompt rather than auto-allowing — noisy, never unsafe.
     oncall_classifier_model: str = ""
-    # Model for the periodic memory-dedup arbiter. Empty falls back to the
-    # operator model; like the classifier, it shares the operator's LLM
-    # client, so it must be valid for ONCALL_OPERATOR_BACKEND. The "google/"
-    # slug works on gemini (prefix stripped), openrouter and vercel alike.
-    oncall_memory_dedup_model: str = "google/gemini-3.5-flash-lite"
-    oncall_memory_dedup_reasoning_effort: str | None = "minimal"
     # Owner-style rewriting (see owner_style.py): `/infer-style` learns how
     # the owner writes from their own replies in their DMs, then every chat
     # reply to them is rewritten in that style before sending. Shares the
@@ -320,31 +294,6 @@ class Settings(BaseSettings):
     oncall_owner_style_messages_per_chat: int = 60
     # The rewrite sits on the reply hot path; past this the original is sent.
     oncall_owner_style_rewrite_timeout_seconds: float = 10.0
-    oncall_memory_hybrid_alpha: float = 0.7
-    oncall_memory_hybrid_beta: float = 0.3
-    # Below the worst true-positive score measured on the real store under
-    # embeddinggemma (0.172 across a bilingual query set). The floor is a
-    # garbage guard for when nothing is relevant, not the main filter —
-    # `max_inject` does the real limiting. Raising it back to nomic's 0.30
-    # would silently drop half the true positives, since the two models'
-    # score scales are unrelated. Note the beta term can only ever fire on
-    # same-language pairs (token overlap across scripts is ~0), so it drags
-    # cross-language scores toward 0.7*cosine — hence the low floor.
-    oncall_memory_relevance_floor: float = 0.15
-    # Fraction of the BEST score this query achieved that a candidate must
-    # reach to be injected. Unlike the floor, this is scale-free: it asks
-    # "close to the best match?" rather than "above some absolute number",
-    # so it survives an embedder swap far better than the two calibrated
-    # constants around it. It is what actually filters — the floor only
-    # catches queries where nothing scores at all.
-    #
-    # Calibrated on the live 109-row store: ten known-answer bilingual
-    # queries put their answer at ≥0.98 of the peak (9 of 10 at rank 1), so
-    # 0.6 loses none of them, while the noise that was reaching the operator
-    # sat at 0.17–0.58 of the peak. Raising it toward 1.0 starts demanding
-    # the answer be the single best row; dropping it toward 0 restores the
-    # tail. Re-measure on real rows before moving it.
-    oncall_memory_relative_gate: float = 0.6
     # Memories injected per turn as a `[memory note: ...]` message. Each is a
     # one-line fact, so 20 costs a few hundred tokens and is paid once per
     # memory per context window (the note is appended to history, not rebuilt
@@ -357,9 +306,7 @@ class Settings(BaseSettings):
     # in every context window rather than only when they match the turn.
     #
     # It is a hard refusal, not an eviction: over-cap writes are rejected and
-    # reported to the model. LRU cannot arbitrate here — a standing row is
-    # never retrieved, so its access time never advances and "least recently
-    # used" would just mean "oldest instruction", which is backwards.
+    # reported to the model, which can ask the owner what to drop.
     oncall_memory_standing_cap: int = 30
     # Operator model. Default is glm-5.2 via OpenRouter, pinned to Fireworks.
     # Switch models by pairing ONCALL_OPERATOR_BACKEND with the right id:
@@ -541,6 +488,8 @@ class Paths:
         self.settings_json = _PACKAGE_DIR / "executor" / "settings.json"
         self.executor_prompt = _PACKAGE_DIR / "prompts" / "executor_system.md"
         self.operator_prompt = _PACKAGE_DIR / "prompts" / "operator_system.md"
+        # Extraction rules sent to Mem0 with every ingested owner turn.
+        self.memory_instructions = _PACKAGE_DIR / "prompts" / "memory_extraction.md"
         # Autonomous-developer Claude CLI settings (catastrophic deny list) and
         # system prompt. Spawned on the laptop by `invoke_developer`.
         self.developer_settings_json = _PACKAGE_DIR / "developer" / "settings.json"

@@ -17,11 +17,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-
-import httpx
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
@@ -35,7 +32,6 @@ from .classifier import Classifier
 from .config import get_paths, get_settings
 from .db import Database
 from .developer_manager import DeveloperManager
-from .embeddings import OllamaEmbeddingClient
 from .events import EventBus
 from .laptop_bridge import LaptopBridge
 from .lifecycle import Lifecycle
@@ -48,7 +44,7 @@ from .operator import (
     OpenRouterLLMClient,
     Operator,
 )
-from .operator_memory import OperatorMemory
+from .operator_memory import DisabledMemory, Mem0Memory, MemoryStore
 from .owner_style import OwnerStyle
 from .result_delivery import deliver_executor_result
 from .telegram_agent import TelegramAgentService
@@ -300,7 +296,7 @@ def create_app() -> FastAPI:
         # The operator is only set up if the backend's auth is configured;
         # otherwise /chat returns a clear 503.
         operator: Operator | None = None
-        memory: OperatorMemory | None = None
+        memory: Mem0Memory | DisabledMemory | None = None
         llm: (
             OpenRouterLLMClient | AnthropicLLMClient | GenAILLMClient
             | GatewayLLMClient | None
@@ -374,7 +370,6 @@ def create_app() -> FastAPI:
         # with no LLM has no working operator either.
         classifier_model = (
             settings.oncall_classifier_model
-            or settings.oncall_memory_extract_model
             or settings.oncall_operator_model
         )
         if llm is None:
@@ -409,37 +404,25 @@ def create_app() -> FastAPI:
         # context compression and by the auto-ping loop for per-task summaries.
         # Single instance: it's a fresh subprocess per call, no shared state.
         cli_runner = ClaudeCliRunner()
-        # Operator construction requires (a) an LLM client and (b) an
-        # embedder. Embedder backend is local Ollama — model stays
-        # resident across our restarts via keep_alive=4h in embeddings.py.
-        embedder: OllamaEmbeddingClient | None = None
+        # The operator needs an LLM client; memory is optional. Without a
+        # Mem0 key it runs memory-less (DisabledMemory) and says so at boot.
         if llm is not None:
-            embedder = OllamaEmbeddingClient(
-                host=settings.oncall_ollama_host,
-                model=settings.oncall_memory_embed_model,
-            )
-            log.info("memory embedder: ollama / %s",
-                     settings.oncall_memory_embed_model)
-            # Fire-and-forget warmup: triggers Ollama to load the model
-            # (no-op if it's already resident from keep_alive). Without
-            # this the first user message after `ollama serve` pays the
-            # one-time load latency. Failures are logged and non-fatal —
-            # the actual embed() call has its own error handling.
-            asyncio.create_task(
-                _warmup_embedder(embedder), name="embedder-warmup",
-            )
-        if embedder is not None:
-            memory = OperatorMemory(
-                db, embedder,
-                embed_model=settings.oncall_memory_embed_model,
-                capacity=settings.oncall_memory_capacity,
-                max_inject=settings.oncall_memory_max_inject,
-                relevance_floor=settings.oncall_memory_relevance_floor,
-                hybrid_alpha=settings.oncall_memory_hybrid_alpha,
-                hybrid_beta=settings.oncall_memory_hybrid_beta,
-                relative_gate=settings.oncall_memory_relative_gate,
-                standing_cap=settings.oncall_memory_standing_cap,
-            )
+            if settings.mem0_api_key:
+                memory = Mem0Memory(
+                    api_key=settings.mem0_api_key,
+                    user_id=settings.oncall_mem0_user_id,
+                    host=settings.oncall_mem0_host,
+                    max_inject=settings.oncall_memory_max_inject,
+                    search_threshold=settings.oncall_memory_search_threshold,
+                    standing_cap=settings.oncall_memory_standing_cap,
+                    custom_instructions=paths.memory_instructions.read_text(
+                        encoding="utf-8",
+                    ),
+                )
+                log.info("memory: mem0 (user_id=%s)", settings.oncall_mem0_user_id)
+            else:
+                memory = DisabledMemory()
+                log.warning("memory: disabled — MEM0_API_KEY is not set")
             lifecycle.standing_provider = memory.standing_rows
             ask_futures: dict[str, asyncio.Future[str]] = {}
             operator = Operator(
@@ -449,8 +432,6 @@ def create_app() -> FastAPI:
                 telegram=telegram,
                 events=events,
                 ask_futures=ask_futures,
-                extract_llm=llm,  # share the gateway client; extractor uses
-                                  # the configured cheap model via Settings
                 runner=cli_runner,
             )
         # Telegram agent userbot (user-facing surface — separate account
@@ -558,27 +539,6 @@ def create_app() -> FastAPI:
                 name="inbox-drain",
             )
             _supervise_bg_task(inbox_drain_task, events, notify_sid, "inbox-drain")
-        # Memory dedup: write time always INSERTs (no heuristic merge).
-        # Every 5 minutes we ask the operator LLM to consolidate clusters
-        # of near-duplicates so paraphrase merges and same-template-
-        # different-entity cases are decided by reading the texts, not by
-        # cosine alone.
-        memory_dedup_task: asyncio.Task | None = None
-        if operator is not None and operator.memory is not None and llm is not None:
-            memory_dedup_task = asyncio.create_task(
-                _memory_dedup_loop(
-                    memory=operator.memory, llm=llm,
-                    model=(
-                        settings.oncall_memory_dedup_model
-                        or settings.oncall_operator_model
-                    ),
-                    reasoning_effort=settings.oncall_memory_dedup_reasoning_effort,
-                    events=events,
-                    notify_session_id=notify_sid,
-                ),
-                name="memory-dedup",
-            )
-            _supervise_bg_task(memory_dedup_task, events, notify_sid, "memory-dedup")
         # Scheduling: fire due `scheduled_checks` rows (the executor's
         # `schedule` tool). Firing spawns a fresh executor task per check whose
         # result is delivered by the result-delivery loop — so it's gated on
@@ -594,31 +554,6 @@ def create_app() -> FastAPI:
                 name="scheduling",
             )
             _supervise_bg_task(scheduling_task, events, notify_sid, "scheduling")
-        # Memory-embedding rebuild: if the configured embed model differs
-        # from what stored rows were last embedded with, kick off a
-        # background re-embed pass. Retrieval is already filtering stale
-        # rows out, so the operator just sees fewer memories until this
-        # task completes — no data loss either way.
-        stale_before = 0
-        if operator is not None and operator.memory is not None:
-            stale_before = await operator.memory.stale_count()
-            if stale_before > 0:
-                log.info(
-                    "scheduling memory rebuild: %d row(s) embedded with a "
-                    "different model than the configured %s",
-                    stale_before, settings.oncall_memory_embed_model,
-                )
-                # Fire-and-forget — the task notifies on completion via the
-                # agent; nothing in the lifespan waits on it.
-                asyncio.create_task(
-                    _rebuild_memory_then_notify(
-                        operator.memory, telegram_agent,
-                        stale=stale_before,
-                        model=settings.oncall_memory_embed_model,
-                    ),
-                    name="memory-rebuild",
-                )
-
         # Startup notification to the owner — single message summarizing what
         # came up cleanly and what's degraded. Sent only if the agent is up
         # (no agent → no way to notify). The probes are best-effort: a failed
@@ -628,15 +563,14 @@ def create_app() -> FastAPI:
                 settings=settings, operator=operator,
                 telegram_userbot=telegram is not None,
                 lifecycle=lifecycle,
-                stale_memories=stale_before,
+                memory=memory,
             )
             await telegram_agent.notify_owner(status)
         try:
             yield
         finally:
             for bg_task in (
-                auto_ping_task, inbox_drain_task, memory_dedup_task,
-                scheduling_task,
+                auto_ping_task, inbox_drain_task, scheduling_task,
             ):
                 if bg_task is None:
                     continue
@@ -654,6 +588,8 @@ def create_app() -> FastAPI:
                 await telegram_agent.stop()
             if telegram is not None:
                 await telegram.stop()
+            if memory is not None:
+                await memory.aclose()
             await db.close()
 
     app = FastAPI(title="oncall-agent", lifespan=lifespan)
@@ -1195,48 +1131,6 @@ async def _flush_chat(
     return any(r["chat_id"] == chat_id for r in pending_now)
 
 
-_MEMORY_DEDUP_INTERVAL_SECONDS = 300.0
-
-
-async def _memory_dedup_loop(
-    *, memory, llm, model: str,
-    reasoning_effort: str | None = None,
-    interval_seconds: float = _MEMORY_DEDUP_INTERVAL_SECONDS,
-    events: "EventBus | None" = None,
-    notify_session_id: str | None = None,
-) -> None:
-    """Periodic intelligent dedup of stored memories. Sleeps first so a
-    fresh-booted daemon doesn't fire a pass before any memory has accrued.
-    Single-tick failures log + notify and the next tick retries; 3
-    consecutive failures trip the circuit breaker and the task exits."""
-    consecutive_crashes = 0
-    while True:
-        await asyncio.sleep(interval_seconds)
-        try:
-            await memory.dedup_pass(
-                llm, model=model, reasoning_effort=reasoning_effort,
-            )
-            consecutive_crashes = 0
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            consecutive_crashes += 1
-            log.exception(
-                "memory-dedup: pass crashed (%d/%d consecutive)",
-                consecutive_crashes, _BG_LOOP_MAX_CONSECUTIVE_CRASHES,
-            )
-            if events is not None:
-                await _notify_system_error(events, notify_session_id, "memory-dedup", exc)
-            if consecutive_crashes >= _BG_LOOP_MAX_CONSECUTIVE_CRASHES:
-                log.error("memory-dedup: %d consecutive crashes — giving up", consecutive_crashes)
-                if events is not None:
-                    await _notify_system_error(
-                        events, notify_session_id, "memory-dedup",
-                        RuntimeError(f"giving up after {consecutive_crashes} consecutive crashes — fix and restart"),
-                    )
-                raise
-
-
 # How often the scheduling loop checks for due scheduled_checks rows. Firing
 # is cheap (it just enqueues an executor task), so a tight-ish poll keeps a
 # one-off "in 90 seconds" check roughly on time without busy-waiting.
@@ -1345,22 +1239,10 @@ async def _scheduling_loop(
                 raise
 
 
-async def _probe_ollama(host: str) -> str | None:
-    """Return the Ollama version string if reachable, None otherwise. Best-
-    effort, 1s timeout — used in the startup notification only."""
-    try:
-        async with httpx.AsyncClient(timeout=1.0) as c:
-            r = await c.get(f"{host.rstrip('/')}/api/version")
-            r.raise_for_status()
-            return r.json().get("version", "?")
-    except Exception:
-        return None
-
-
 async def _build_startup_status(
     *, settings, operator: Operator | None,
     telegram_userbot: bool, lifecycle: Lifecycle,
-    stale_memories: int = 0,
+    memory: "Mem0Memory | DisabledMemory | None" = None,
 ) -> str:
     """Compose the startup ping. On a fully clean boot it's just one line —
     `🔧 oncall up`. Anything degraded gets its own ⚠️ line; informational
@@ -1369,68 +1251,18 @@ async def _build_startup_status(
     lines: list[str] = ["🔧 oncall up"]
     if operator is None:
         lines.append("⚠️ operator: NOT configured (no LLM key)")
-    if await _probe_ollama(settings.oncall_ollama_host) is None:
-        lines.append(
-            f"⚠️ ollama: unreachable at {settings.oncall_ollama_host} "
-            f"(memory embedder won't work)"
-        )
+    if isinstance(memory, DisabledMemory):
+        lines.append("⚠️ memory: disabled (MEM0_API_KEY unset)")
+    elif isinstance(memory, Mem0Memory):
+        problem = await memory.health()
+        if problem is not None:
+            lines.append(f"⚠️ memory: mem0 unreachable ({problem[:120]})")
     if not telegram_userbot:
         lines.append("⚠️ telegram userbot: disabled (DM triage unavailable)")
     recovered = len(lifecycle.running)
     if recovered:
         lines.append(f"↻ recovered {recovered} in-flight task(s)")
-    if stale_memories:
-        lines.append(
-            f"↻ re-embedding {stale_memories} memory rows in the background"
-        )
     return "\n".join(lines)
-
-
-async def _warmup_embedder(embedder: OllamaEmbeddingClient) -> None:
-    """Background task: make sure Ollama has the embed model pulled, then
-    ask it to load the model now (one throwaway embed). The pull provisions
-    a fresh Ollama volume so a clean deploy needs no manual `ollama pull`;
-    the warmup means the first user message after `ollama serve` skips the
-    cold-load. Non-fatal — embed() has its own error handling, the operator
-    just sees empty memory until the model is ready."""
-    started = time.monotonic()
-    try:
-        await embedder.ensure_model()
-        await embedder.warmup()
-    except Exception as e:
-        log.warning("embedder warmup failed: %s: %s", type(e).__name__, e)
-        return
-    log.info("embedder warmup complete in %.1fs", time.monotonic() - started)
-
-
-async def _rebuild_memory_then_notify(
-    memory, telegram_agent, *, stale: int, model: str,
-) -> None:
-    """Background task: re-embed all rows whose stored model differs from
-    `model`, then ping the owner with the result. Errors are surfaced as a
-    notification so the user isn't left wondering why memory looks empty."""
-    try:
-        result = await memory.rebuild_stale_embeddings()
-    except Exception as e:
-        log.exception("memory rebuild crashed")
-        if telegram_agent is not None:
-            await telegram_agent.notify_owner(
-                f"⚠️ memory rebuild crashed: {type(e).__name__}: {e}"
-            )
-        return
-    if telegram_agent is None:
-        return
-    rebuilt = result.get("rebuilt", 0)
-    failed = result.get("failed", 0)
-    if failed:
-        await telegram_agent.notify_owner(
-            f"⚠️ memory rebuild partial: {rebuilt}/{stale} rebuilt, "
-            f"{failed} failed (model={model}). Will retry next boot."
-        )
-    else:
-        await telegram_agent.notify_owner(
-            f"🔧 memory rebuilt: {rebuilt} row(s) re-embedded with {model}"
-        )
 
 
 async def _maybe_start_telegram_agent(
@@ -2030,7 +1862,7 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.post("/internal/memory", dependencies=[Depends(verify_loopback)])
     async def memory_op(body: MemoryOpBody, request: Request) -> dict[str, Any]:
-        mem: OperatorMemory | None = request.app.state.memory
+        mem: MemoryStore | None = request.app.state.memory
         if mem is None:
             raise HTTPException(503, "memory not configured")
         if body.op == "query":

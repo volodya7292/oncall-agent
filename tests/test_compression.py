@@ -122,9 +122,9 @@ async def stack(settings, tmp_path, monkeypatch):
 class _NullMemory:
     """Tiny stand-in for tests that don't exercise memory."""
     async def store(self, facts, *, source_turn=None, standing=False): return []
+    async def ingest_turn(self, user_text, *, prev_assistant_text=None, source_turn=None): return []
     async def retrieve(self, query, *, limit=None, exclude_ids=None, include_standing=False): return []
     async def standing_rows(self): return []
-    async def for_prompt(self, query): return "(no relevant entries this turn)"
     async def entries_count(self): return 0
 
 
@@ -586,12 +586,12 @@ async def test_compression_reopens_memory_injection_for_folded_notes(stack):
 
     # Two eras, each written the way _run_turn writes one: record the ids
     # first, then append the note row they describe.
-    await db.record_memory_shown("s1", [11])
-    await db.append_chat_message("s1", "user", "[memory note: - [id=11] old fact]")
+    await db.record_memory_shown("s1", ["m11"])
+    await db.append_chat_message("s1", "user", "[memory note: - [id=m11] old fact]")
     await db.append_chat_message("s1", "user", "an old turn")
     await asyncio.sleep(0.01)
-    await db.record_memory_shown("s1", [22])
-    await db.append_chat_message("s1", "user", "[memory note: - [id=22] recent fact]")
+    await db.record_memory_shown("s1", ["m22"])
+    await db.append_chat_message("s1", "user", "[memory note: - [id=m22] recent fact]")
     await db.append_chat_message("s1", "user", "a recent turn")
 
     rows = await db.load_chat_history("s1")
@@ -602,4 +602,4 @@ async def test_compression_reopens_memory_injection_for_folded_notes(stack):
         through_message_id=through, estimated_token_count=100,
     )
 
-    assert await db.get_shown_memory_ids("s1") == {22}
+    assert await db.get_shown_memory_ids("s1") == {"m22"}

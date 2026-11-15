@@ -179,8 +179,8 @@ _INTERRUPTING_TRIGGERS = frozenset({"executor.done"})
 # Silent procedural marker appended to the OWNER's shared session when an
 # inbound call tears down, closing the lingering `_call_start_note` so a later
 # text turn doesn't read as still-in-call (see _teardown_active). Kept static
-# and procedural — it goes through the same [system note: ...] path the memory
-# extractor reads, so it must not look like a user-attributed preference.
+# and procedural — the operator reads it as a [system note: ...], so it must
+# not look like a user-attributed preference.
 _CALL_END_NOTE = (
     "the voice call just ended — you are back in TEXT chat with the owner now."
 )
@@ -1109,14 +1109,12 @@ class CallService:
             raise
 
     def _call_start_note(self, active: _ActiveCall) -> str:
-        """Procedural system note announcing the call. Phrasing matters:
-        this text is read by both the operator (to decide what to do) AND
-        the memory extractor (to decide what facts to save). It must be a
-        per-call procedural directive, never a user-attributed preference,
-        so the extractor finds nothing to keep. The previous attempt —
-        chat_turn with "[system] keep replies short and conversational" —
-        was paraphrased into memory as "user prefers short replies".
-        Don't repeat that mistake.
+        """Procedural system note announcing the call. It must go out as a
+        system note, never through chat_turn: chat_turn text is ingested into
+        memory, and the earlier attempt — chat_turn with "[system] keep
+        replies short and conversational" — was paraphrased into memory as
+        "user prefers short replies". Keep it a per-call procedural
+        directive, never a user-attributed preference.
 
         For outbound calls to non-owners, this note is also the
         load-bearing place where the operator is told who it's speaking
@@ -1366,6 +1364,8 @@ class CallService:
         try:
             result = await self._operator.chat_turn(
                 session_id=active.session_id, user_text=user_text,
+                # A third party's words must never become the owner's facts.
+                ingest_memory=active.is_owner,
             )
         except Exception as e:
             log.exception("voice: operator.chat_turn failed")

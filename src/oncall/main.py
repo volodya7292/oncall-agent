@@ -4,6 +4,7 @@
 `oncall api`            → run the FastAPI orchestrator + HTTP API.
 `oncall mcp`            → run the stdio MCP server (spawned by `claude` as a child).
 `oncall telegram-login` → one-time Telegram userbot login.
+`oncall memory-import`  → one-time copy of the pre-Mem0 SQLite memories into Mem0.
 """
 
 from __future__ import annotations
@@ -61,12 +62,9 @@ GEMINI_API_KEY=
 AI_GATEWAY_BASE_URL=https://ai-gateway.vercel.sh/v1
 AI_GATEWAY_API_KEY=
 
-# Memory embedder runs via a local Ollama daemon. Pull the model first:
-#   ollama pull embeddinggemma:300m
-# embed calls send keep_alive=4h so Ollama keeps the model resident
-# across `oncall service start` restarts.
-ONCALL_MEMORY_EMBED_MODEL=embeddinggemma:300m
-ONCALL_OLLAMA_HOST=http://localhost:11434
+# Operator memory is hosted on the Mem0 Platform. Without a key the operator
+# runs memory-less. https://app.mem0.ai/dashboard/api-keys
+MEM0_API_KEY=
 
 # Executor (Claude CLI) uses whatever auth `claude` already has on this host —
 # keychain OAuth for subscription users, or ANTHROPIC_API_KEY in your shell env
@@ -197,6 +195,40 @@ def _telegram_login(
     print("  oncall api                                     (foreground / dev)")
 
 
+def _memory_import(*, dry_run: bool) -> None:
+    from .config import get_paths, get_settings
+    from .memory_import import import_legacy, read_legacy_rows
+    from .operator_memory import Mem0Memory
+
+    settings = get_settings()
+    if not settings.mem0_api_key:
+        print("MEM0_API_KEY is not set.", file=sys.stderr)
+        sys.exit(2)
+    rows = read_legacy_rows(settings.oncall_db_path)
+    print(f"{len(rows)} legacy row(s) in {settings.oncall_db_path} "
+          f"({sum(1 for r in rows if r['standing'])} standing)")
+
+    async def run() -> dict[str, int]:
+        memory = Mem0Memory(
+            api_key=settings.mem0_api_key,
+            user_id=settings.oncall_mem0_user_id,
+            host=settings.oncall_mem0_host,
+            max_inject=settings.oncall_memory_max_inject,
+            search_threshold=settings.oncall_memory_search_threshold,
+            standing_cap=settings.oncall_memory_standing_cap,
+            custom_instructions=get_paths().memory_instructions.read_text(encoding="utf-8"),
+        )
+        try:
+            return await import_legacy(rows, memory, dry_run=dry_run)
+        finally:
+            await memory.aclose()
+
+    result = asyncio.run(run())
+    print(("dry run: " if dry_run else "") + ", ".join(f"{k}={v}" for k, v in result.items()))
+    if result["failed"]:
+        sys.exit(1)
+
+
 def _configure_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -240,6 +272,15 @@ def main() -> None:
         help="Log in the AGENT session (TELEGRAM_AGENT_SESSION_PATH) — the "
              "second account that serves as the user-facing chat surface. "
              "Without this flag, the primary userbot session is logged in.",
+    )
+    mem_imp = sub.add_parser(
+        "memory-import",
+        help="Copy the pre-Mem0 SQLite memories (operator_memories) into Mem0. "
+             "Idempotent: rows already imported are skipped.",
+    )
+    mem_imp.add_argument(
+        "--dry-run", action="store_true",
+        help="Report what would be imported without writing to Mem0.",
     )
     svc = sub.add_parser(
         "service",
@@ -286,6 +327,8 @@ def main() -> None:
             qr=getattr(args, "qr", False),
             agent=getattr(args, "agent", False),
         )
+    elif args.cmd == "memory-import":
+        _memory_import(dry_run=args.dry_run)
     elif args.cmd == "service":
         from . import service
         spec = service.WORKER if getattr(args, "worker", False) else service.AGENT

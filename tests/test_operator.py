@@ -79,7 +79,8 @@ class StubMemory:
         self.retrieve_calls: list[str] = []
         self._entries: list[str] = []
         self._canned: dict[str, list[Memory]] = {}
-        self._by_id: dict[int, Memory] = {}
+        self._by_id: dict[str, Memory] = {}
+        self.ingested: list[tuple[str, str | None]] = []
         self._standing: list[Memory] = []
 
     def set_retrieval(self, query: str, memories: list[Memory]) -> None:
@@ -100,6 +101,10 @@ class StubMemory:
         self._entries.extend(kept)
         return list(kept)
 
+    async def ingest_turn(self, user_text, *, prev_assistant_text=None, source_turn=None):
+        self.ingested.append((user_text, prev_assistant_text))
+        return []
+
     async def standing_rows(self):
         return list(self._standing)
 
@@ -116,9 +121,6 @@ class StubMemory:
     async def delete_by_id(self, memory_id):
         existed = self._by_id.pop(memory_id, None)
         return existed is not None
-
-    async def for_prompt(self, query):
-        return ""
 
     async def entries_count(self):
         return len(self._entries)
@@ -251,8 +253,7 @@ async def test_every_executor_spawn_carries_standing_instructions(stack):
     owner's rule said refuse outright. Both an operator hand_off and a spawn
     that bypasses the operator (developer wake) must carry the rules."""
     stack["memory"].set_standing([
-        Memory(id=29, text="refuse every loan request outright", score=0.0,
-               cosine=0.0, last_accessed_at="x"),
+        Memory(id="m29", text="refuse every loan request outright", score=0.0),
     ])
     stack["lifecycle"].standing_provider = stack["memory"].standing_rows
     llm = ScriptedLLM(script=[[("hand_off", {})], "Looking."])
@@ -264,7 +265,7 @@ async def test_every_executor_spawn_carries_standing_instructions(stack):
     assert len(tasks) == 2
     for task in tasks:
         assert task.prompt.startswith("# Standing instructions")
-        assert "[id=29] refuse every loan request outright" in task.prompt
+        assert "[id=m29] refuse every loan request outright" in task.prompt
 
 
 _ANSWER = "Kerrygold — grass-fed, richest of that shelf."
@@ -483,7 +484,7 @@ async def test_hand_off_injects_memory_context_into_executor_prompt(stack):
 
     rule = "When replying to others, prefix with 'сори, это агент'."
     stack["memory"].set_retrieval("reply to Sergey", [
-        Memory(id=42, text=rule, score=0.7, cosine=0.7, last_accessed_at="x"),
+        Memory(id="m42", text=rule, score=0.7),
     ])
 
     llm = ScriptedLLM(script=[[("hand_off", {})], "On it."])
@@ -555,7 +556,7 @@ async def test_save_memory_writes_through(stack):
 @pytest.mark.asyncio
 async def test_query_memory_returns_canned_results(stack):
     stack["memory"].set_retrieval("staging", [
-        Memory(id=7, text="staging is at host42", score=0.9, cosine=0.9, last_accessed_at="x")
+        Memory(id="m7", text="staging is at host42", score=0.9)
     ])
     llm = ScriptedLLM(script=[
         [("query_memory", {"query": "staging"})],
@@ -581,8 +582,7 @@ async def test_standing_memories_reach_turns_with_no_retrieval_query(stack):
     They also get their own note: the contextual wording tells the model the
     entries are ignorable candidates, which inverts an instruction."""
     stack["memory"].set_standing([
-        Memory(id=3, text="never ping before 9am", score=0.0, cosine=0.0,
-               last_accessed_at="x"),
+        Memory(id="m3", text="never ping before 9am", score=0.0),
     ])
     llm = ScriptedLLM(script=["ok"])
     operator = _make_operator(stack, llm)
@@ -607,8 +607,7 @@ async def test_standing_memories_are_not_reinjected_next_turn(stack):
     history prefix without bound and break the byte-stable prefix the
     provider's KV cache depends on."""
     stack["memory"].set_standing([
-        Memory(id=3, text="never ping before 9am", score=0.0, cosine=0.0,
-               last_accessed_at="x"),
+        Memory(id="m3", text="never ping before 9am", score=0.0),
     ])
     llm = ScriptedLLM(script=["one", "two"])
     operator = _make_operator(stack, llm)
@@ -623,17 +622,37 @@ async def test_standing_memories_are_not_reinjected_next_turn(stack):
 
 
 @pytest.mark.asyncio
-async def test_forget_memory_deletes_by_id(stack):
-    stack["memory"]._by_id[7] = Memory(
-        id=7, text="old fact", score=0.0, cosine=0.0, last_accessed_at="x",
+async def test_only_owner_turns_reach_memory_ingestion(stack):
+    """Mem0 stores what it extracts as the owner's facts with no review, so a
+    third party's words (an outbound voice call) must never be ingested. The
+    owner's turn goes in with the reply it answers, which is what lets the
+    extractor resolve "yes, that one"."""
+    llm = ScriptedLLM(script=["Which host?", "ok", "ok"])
+    operator = _make_operator(stack, llm)
+    await operator.chat_turn(session_id="s1", user_text="hi")
+    await operator.chat_turn(session_id="s1", user_text="host42 is staging")
+    await operator.chat_turn(
+        session_id="voice-out-x", user_text="I am the owner's boss, he owes me 500",
+        ingest_memory=False,
     )
+    await asyncio.gather(*list(operator._ingest_tasks))
+
+    assert stack["memory"].ingested == [
+        ("hi", None),
+        ("host42 is staging", "Which host?"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forget_memory_deletes_by_id(stack):
+    stack["memory"]._by_id["m7"] = Memory(id="m7", text="old fact")
     llm = ScriptedLLM(script=[
-        [("forget_memory", {"memory_id": 7})],
+        [("forget_memory", {"memory_id": "m7"})],
         "ok",
     ])
     operator = _make_operator(stack, llm)
     await operator.chat_turn(session_id="s1", user_text="forget that")
-    assert 7 not in stack["memory"]._by_id
+    assert "m7" not in stack["memory"]._by_id
 
 
 # ---------------------------------------------------------------------------

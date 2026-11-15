@@ -7,7 +7,7 @@ A personal on-call agent. Two tiers:
 
 User talks only to the operator. Operator dispatches tasks to the executor. Executor's tool calls go through a classifier (read-only auto-allows, mutating escalates to the user with a challenge phrase — typed as a normal message in the Telegram agent chat, or paraphrased yes/no inside a voice call). Telegram is the primary inbound messenger (read DMs, propose replies in the user's own voice, send on approval).
 
-The operator keeps a **semantic memory** in SQLite: short declarative facts extracted automatically from each user turn (hostnames, conventions, preferences, people the user names), embedded via the same gateway and retrieved by hybrid cosine + token-overlap score. Storage and forgetting are both automatic — extraction happens off the hot path after each reply, LRU evicts at capacity (default 500). The operator never manages memory by hand; it just sees the entries most relevant to the current message.
+The operator's **memory** is hosted on the [Mem0 Platform](https://mem0.ai): after each owner turn, Mem0 extracts short facts (hostnames, conventions, preferences, people the owner names) off the hot path, and deduplicates and consolidates them on its side. Before each turn the most relevant entries are injected. Standing instructions (how the agent should behave) are saved explicitly, flagged in metadata, injected into every session, and capped. Set `MEM0_API_KEY`; without it the operator runs memory-less. `oncall memory-import` copies a pre-Mem0 SQLite store over once.
 
 **Deployment is server-primary**: the full daemon (`oncall api`, `ONCALL_ROLE=server`) runs in Docker on an always-on server; the laptop runs only `oncall laptop-worker`, a capability worker that long-polls the server outbound (no inbound exposure) and executes local shell/file jobs on demand, gated by the same broker/approval path as native tools.
 
@@ -18,8 +18,6 @@ GitHub CI builds the server image on every push to `main` and publishes it to `g
 ```sh
 docker run -d --name oncall --restart unless-stopped \
   -e ONCALL_BIND_HOST=0.0.0.0 \
-  -e ONCALL_OLLAMA_HOST=http://host.docker.internal:11434 \
-  --add-host host.docker.internal:host-gateway \
   -v oncall_state:/root/.oncall -v oncall_claude:/root/.claude \
   --expose 8765 \
   ghcr.io/<owner>/oncall-agent:latest
